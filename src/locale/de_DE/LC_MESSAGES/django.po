@@ -3,7 +3,7 @@ msgstr ""
 "Project-Id-Version: paperless-ngx\n"
 "Report-Msgid-Bugs-To: \n"
 "POT-Creation-Date: 2026-05-05 01:01+0000\n"
-"PO-Revision-Date: 2026-05-05 12:38\n"
+"PO-Revision-Date: 2026-05-26 13:17\n"
 "Last-Translator: \n"
 "Language-Team: German\n"
 "Language: de_DE\n"
@@ -257,11 +257,11 @@ msgstr "Versionsindex"
 
 #: documents/models.py:326
 msgid "Index of this version within the root document."
-msgstr "Index dieser Version innerhalb des Stammdokuments."
+msgstr "Index dieser Version innerhalb des Hauptdokuments."
 
 #: documents/models.py:330
 msgid "version label"
-msgstr "Versionsbezeichnung"
+msgstr "Version"
 
 #: documents/models.py:334
 msgid "Optional short label for a document version."
@@ -634,7 +634,7 @@ msgstr "Arbeitsabläufe prüfen"
 
 #: documents/models.py:690
 msgid "Bulk Update"
-msgstr "Massenaktualisierung"
+msgstr "Massenbearbeitung"
 
 #: documents/models.py:691
 msgid "Reprocess Document"
@@ -1518,7 +1518,7 @@ msgstr "Kennwort-Rücksetzung abgeschlossen."
 
 #: documents/templates/account/password_reset_from_key_done.html:14
 msgid "Your new password has been set. You can now"
-msgstr "Ihr neues Passwort wurde gesetzt. Sie können sich jetzt"
+msgstr "Ihr neues Kennwort wurde gesetzt. Sie können sich jetzt"
 
 #: documents/templates/account/password_reset_from_key_done.html:14
 msgid "log in"

@@ -3,7 +3,7 @@ msgstr ""
 "Project-Id-Version: paperless-ngx\n"
 "Report-Msgid-Bugs-To: \n"
 "POT-Creation-Date: 2026-05-05 01:01+0000\n"
-"PO-Revision-Date: 2026-05-05 01:03\n"
+"PO-Revision-Date: 2026-05-21 13:23\n"
 "Last-Translator: \n"
 "Language-Team: Catalan\n"
 "Language: ca_ES\n"
@@ -586,19 +586,19 @@ msgstr "Pendent"
 
 #: documents/models.py:676 documents/models.py:753
 msgid "Started"
-msgstr ""
+msgstr "Iniciat"
 
 #: documents/models.py:677
 msgid "Success"
-msgstr ""
+msgstr "Èxit"
 
 #: documents/models.py:678
 msgid "Failure"
-msgstr ""
+msgstr "Error"
 
 #: documents/models.py:679
 msgid "Revoked"
-msgstr ""
+msgstr "Revocat"
 
 #: documents/models.py:682
 msgid "Consume File"
@@ -610,7 +610,7 @@ msgstr "Classificador"
 
 #: documents/models.py:684
 msgid "Sanity Check"
-msgstr ""
+msgstr "Verificador"
 
 #: documents/models.py:685
 msgid "Index Optimize"
@@ -622,31 +622,31 @@ msgstr "Recollida Correu"
 
 #: documents/models.py:687
 msgid "LLM Index"
-msgstr ""
+msgstr "LLM Index"
 
 #: documents/models.py:688
 msgid "Empty Trash"
-msgstr ""
+msgstr "Buida Paperera"
 
 #: documents/models.py:689
 msgid "Check Workflows"
-msgstr ""
+msgstr "Comprovar fluxos"
 
 #: documents/models.py:690
 msgid "Bulk Update"
-msgstr ""
+msgstr "Actualització massiva"
 
 #: documents/models.py:691
 msgid "Reprocess Document"
-msgstr ""
+msgstr "Reprocessa Document"
 
 #: documents/models.py:692
 msgid "Build Share Link"
-msgstr ""
+msgstr "Crea enllaç per compartir"
 
 #: documents/models.py:693
 msgid "Bulk Delete"
-msgstr ""
+msgstr "Esborrat massiu"
 
 #: documents/models.py:702 documents/models.py:1257
 msgid "Scheduled"
@@ -658,23 +658,23 @@ msgstr "Web UI"
 
 #: documents/models.py:704
 msgid "API Upload"
-msgstr ""
+msgstr "Pujada API"
 
 #: documents/models.py:705
 msgid "Folder Consume"
-msgstr ""
+msgstr "Consum per carpeta"
 
 #: documents/models.py:706
 msgid "Email Consume"
-msgstr ""
+msgstr "Consum per Email"
 
 #: documents/models.py:707
 msgid "System"
-msgstr ""
+msgstr "Sistema"
 
 #: documents/models.py:708
 msgid "Manual"
-msgstr ""
+msgstr "Manual"
 
 #: documents/models.py:714
 msgid "Task ID"
@@ -682,7 +682,7 @@ msgstr "ID Tasca"
 
 #: documents/models.py:715
 msgid "Celery task ID"
-msgstr ""
+msgstr "ID Tasca Celery"
 
 #: documents/models.py:721
 msgid "Task Type"
@@ -690,47 +690,47 @@ msgstr "Tipus Tasca"
 
 #: documents/models.py:722
 msgid "The kind of work being performed"
-msgstr ""
+msgstr "Tipus de treball que es realitza"
 
 #: documents/models.py:729
 msgid "Trigger Source"
-msgstr ""
+msgstr "Font desencadenant"
 
 #: documents/models.py:730
 msgid "What initiated this task"
-msgstr ""
+msgstr "Què ha iniciat la tasca"
 
 #: documents/models.py:739
 msgid "Status"
-msgstr ""
+msgstr "Estat"
 
 #: documents/models.py:759
 msgid "Completed"
-msgstr ""
+msgstr "Acabat"
 
 #: documents/models.py:767
 msgid "Duration (seconds)"
-msgstr ""
+msgstr "Durada (segons)"
 
 #: documents/models.py:768
 msgid "Elapsed time from start to completion"
-msgstr ""
+msgstr "Temps transcorregut des de l'inici a finalització"
 
 #: documents/models.py:774
 msgid "Wait Time (seconds)"
-msgstr ""
+msgstr "Temps d'Espera (segons)"
 
 #: documents/models.py:775
 msgid "Time from task creation to worker pickup"
-msgstr ""
+msgstr "Temps des de la creació de la tasca fins a la recollida del worker"
 
 #: documents/models.py:782
 msgid "Input Data"
-msgstr ""
+msgstr "Dades d'entrada"
 
 #: documents/models.py:783
 msgid "Structured input parameters for the task"
-msgstr ""
+msgstr "Paràmetres d'entrada estructurats per a la tasca"
 
 #: documents/models.py:789
 msgid "Result Data"
@@ -738,7 +738,7 @@ msgstr "Dades del resultat"
 
 #: documents/models.py:790
 msgid "Structured result data from task execution"
-msgstr ""
+msgstr "Dades estructurades de resultats de l'execució de tasques"
 
 #: documents/models.py:796
 msgid "Acknowledged"
@@ -746,11 +746,11 @@ msgstr "Reconegut"
 
 #: documents/models.py:801
 msgid "Task"
-msgstr ""
+msgstr "Tasca"
 
 #: documents/models.py:802
 msgid "Tasks"
-msgstr ""
+msgstr "Tasques"
 
 #: documents/models.py:832
 msgid "Note for the document"
@@ -1641,7 +1641,7 @@ msgstr "Invalid more_like_id"
 
 #: documents/views.py:1491
 msgid "Invalid AI configuration."
-msgstr ""
+msgstr "Configuració AI invàlida."
 
 #: documents/views.py:2266 documents/views.py:2582
 msgid "Specify only one of text, title_search, query, or more_like_id."
@@ -1746,7 +1746,7 @@ msgstr "CMYK"
 
 #: paperless/models.py:78 paperless/models.py:87
 msgid "OpenAI-compatible"
-msgstr ""
+msgstr "OpenAI-compatible"
 
 #: paperless/models.py:79
 msgid "Huggingface"

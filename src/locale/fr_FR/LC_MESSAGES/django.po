@@ -3,7 +3,7 @@ msgstr ""
 "Project-Id-Version: paperless-ngx\n"
 "Report-Msgid-Bugs-To: \n"
 "POT-Creation-Date: 2026-05-05 01:01+0000\n"
-"PO-Revision-Date: 2026-05-05 01:03\n"
+"PO-Revision-Date: 2026-06-01 14:18\n"
 "Last-Translator: \n"
 "Language-Team: French\n"
 "Language: fr_FR\n"
@@ -31,7 +31,7 @@ msgstr "Requête de champ personnalisé invalide"
 
 #: documents/filters.py:492
 msgid "Invalid expression list. Must be nonempty."
-msgstr "Liste d’expressions invalide. Doit être non vide."
+msgstr "Liste d'expressions invalide. Doit être non vide."
 
 #: documents/filters.py:513
 msgid "Invalid logical operator {op!r}"
@@ -39,7 +39,7 @@ msgstr "Opérateur logique {op!r} invalide"
 
 #: documents/filters.py:527
 msgid "Maximum number of query conditions exceeded."
-msgstr "Nombre maximum de conditions de requête dépassé."
+msgstr "Nombre maximum de conditions dans la requête dépassé."
 
 #: documents/filters.py:591
 msgid "{name!r} is not a valid custom field."
@@ -140,7 +140,7 @@ msgstr "Impossible de se définir comme parent."
 
 #: documents/models.py:126
 msgid "Cannot set parent to a descendant."
-msgstr "Impossible de défini un parent comme descendant."
+msgstr "Impossible de définir un parent comme descendant."
 
 #: documents/models.py:143 documents/models.py:186
 msgid "document type"
@@ -253,7 +253,7 @@ msgstr "document racine pour cette version"
 
 #: documents/models.py:322
 msgid "version index"
-msgstr "index de version"
+msgstr "numéro de version"
 
 #: documents/models.py:326
 msgid "Index of this version within the root document."
@@ -590,15 +590,15 @@ msgstr "Commencé"
 
 #: documents/models.py:677
 msgid "Success"
-msgstr ""
+msgstr "Succès"
 
 #: documents/models.py:678
 msgid "Failure"
-msgstr ""
+msgstr "Erreur"
 
 #: documents/models.py:679
 msgid "Revoked"
-msgstr ""
+msgstr "Révoqué"
 
 #: documents/models.py:682
 msgid "Consume File"
@@ -610,7 +610,7 @@ msgstr "Entrainer le classificateur"
 
 #: documents/models.py:684
 msgid "Sanity Check"
-msgstr ""
+msgstr "Vérification de cohérence"
 
 #: documents/models.py:685
 msgid "Index Optimize"
@@ -630,19 +630,19 @@ msgstr "Vider la corbeille"
 
 #: documents/models.py:689
 msgid "Check Workflows"
-msgstr ""
+msgstr "Processus de contrôle"
 
 #: documents/models.py:690
 msgid "Bulk Update"
-msgstr ""
+msgstr "Mise à jour groupée"
 
 #: documents/models.py:691
 msgid "Reprocess Document"
-msgstr ""
+msgstr "Procéder à nouveau à l'évaluation du document"
 
 #: documents/models.py:692
 msgid "Build Share Link"
-msgstr ""
+msgstr "Créer un lien de partage"
 
 #: documents/models.py:693
 msgid "Bulk Delete"
@@ -654,19 +654,19 @@ msgstr "Planifié"
 
 #: documents/models.py:703 documents/models.py:1263
 msgid "Web UI"
-msgstr "Web UI"
+msgstr "Interface web"
 
 #: documents/models.py:704
 msgid "API Upload"
-msgstr ""
+msgstr "Transfert de fichier par API"
 
 #: documents/models.py:705
 msgid "Folder Consume"
-msgstr ""
+msgstr "Répertoire de consommation"
 
 #: documents/models.py:706
 msgid "Email Consume"
-msgstr ""
+msgstr "Courriel de consommation"
 
 #: documents/models.py:707
 msgid "System"
@@ -682,7 +682,7 @@ msgstr "ID de tâche"
 
 #: documents/models.py:715
 msgid "Celery task ID"
-msgstr ""
+msgstr "ID de la tâche Celery"
 
 #: documents/models.py:721
 msgid "Task Type"
@@ -690,43 +690,43 @@ msgstr "Type de tâche"
 
 #: documents/models.py:722
 msgid "The kind of work being performed"
-msgstr ""
+msgstr "Le travail est en train d'être effectué"
 
 #: documents/models.py:729
 msgid "Trigger Source"
-msgstr ""
+msgstr "Source du déclenchement"
 
 #: documents/models.py:730
 msgid "What initiated this task"
-msgstr ""
+msgstr "Qui a initié cette tâche"
 
 #: documents/models.py:739
 msgid "Status"
-msgstr ""
+msgstr "État"
 
 #: documents/models.py:759
 msgid "Completed"
-msgstr ""
+msgstr "Terminé(s)"
 
 #: documents/models.py:767
 msgid "Duration (seconds)"
-msgstr ""
+msgstr "Durée (secondes)"
 
 #: documents/models.py:768
 msgid "Elapsed time from start to completion"
-msgstr ""
+msgstr "Durée d'exécution"
 
 #: documents/models.py:774
 msgid "Wait Time (seconds)"
-msgstr ""
+msgstr "Temps d'attente (secondes)"
 
 #: documents/models.py:775
 msgid "Time from task creation to worker pickup"
-msgstr ""
+msgstr "Temps de latence en file d'attente"
 
 #: documents/models.py:782
 msgid "Input Data"
-msgstr ""
+msgstr "Données d'entrée"
 
 #: documents/models.py:783
 msgid "Structured input parameters for the task"
@@ -971,7 +971,7 @@ msgstr "A ce type de document"
 
 #: documents/models.py:1357
 msgid "has one of these document types"
-msgstr ""
+msgstr "a un de ces types de documents"
 
 #: documents/models.py:1364
 msgid "does not have these document type(s)"
@@ -987,7 +987,7 @@ msgstr "n'a pas ce(s) correspondant(s)"
 
 #: documents/models.py:1386
 msgid "has one of these correspondents"
-msgstr ""
+msgstr "a un de ces correspondants"
 
 #: documents/models.py:1394
 msgid "has this storage path"
@@ -995,7 +995,7 @@ msgstr "a ce chemin de sauvegarde"
 
 #: documents/models.py:1401
 msgid "has one of these storage paths"
-msgstr ""
+msgstr "a un de ces emplacements de stockage"
 
 #: documents/models.py:1408
 msgid "does not have these storage path(s)"
@@ -1533,7 +1533,7 @@ msgstr "Vous avez déjà un compte ?"
 
 #: documents/templates/account/signup.html:19
 msgid "Note: This is the first user account for this installation and will be granted superuser privileges."
-msgstr "Remarque : ceci est le premier compte utilisateur pour cette installation et lui sera donné les privilèges de super utilisateur."
+msgstr "Remarque : ceci est le premier compte utilisateur pour cette installation et lui sera donné les privilèges de superutilisateur."
 
 #: documents/templates/account/signup.html:23
 #: documents/templates/socialaccount/signup.html:16
@@ -1636,20 +1636,20 @@ msgstr "Impossible d'analyser l'URI {value}"
 
 #: documents/views.py:288 documents/views.py:2441
 msgid "Invalid more_like_id"
-msgstr ""
+msgstr "More_like_id invalide"
 
 #: documents/views.py:1491
 msgid "Invalid AI configuration."
-msgstr ""
+msgstr "Configuration IA invalide."
 
 #: documents/views.py:2266 documents/views.py:2582
 msgid "Specify only one of text, title_search, query, or more_like_id."
-msgstr ""
+msgstr "Spécifiez seulement un texte, titre, recherche ou more_like_id."
 
 #: documents/views.py:4333
 #, python-format
 msgid "Insufficient permissions to share document %(id)s."
-msgstr ""
+msgstr "Droits d'accès insuffisant pour partager %(id)s document."
 
 #: documents/views.py:4379
 msgid "Bundle is already being processed."
@@ -1689,7 +1689,7 @@ msgstr "PDFA-3"
 
 #: paperless/models.py:39 paperless/models.py:50
 msgid "auto"
-msgstr ""
+msgstr "auto"
 
 #: paperless/models.py:40
 msgid "force"
@@ -1745,7 +1745,7 @@ msgstr "CMJN"
 
 #: paperless/models.py:78 paperless/models.py:87
 msgid "OpenAI-compatible"
-msgstr ""
+msgstr "Compatible avec OpenAI"
 
 #: paperless/models.py:79
 msgid "Huggingface"

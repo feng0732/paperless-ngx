@@ -3,7 +3,7 @@ msgstr ""
 "Project-Id-Version: paperless-ngx\n"
 "Report-Msgid-Bugs-To: \n"
 "POT-Creation-Date: 2026-05-05 01:01+0000\n"
-"PO-Revision-Date: 2026-05-05 01:03\n"
+"PO-Revision-Date: 2026-05-25 01:16\n"
 "Last-Translator: \n"
 "Language-Team: Russian\n"
 "Language: ru_RU\n"
@@ -598,7 +598,7 @@ msgstr ""
 
 #: documents/models.py:679
 msgid "Revoked"
-msgstr ""
+msgstr "Отклонено"
 
 #: documents/models.py:682
 msgid "Consume File"
