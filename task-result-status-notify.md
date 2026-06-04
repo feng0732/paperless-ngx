@@ -21,7 +21,7 @@ Celery Worker 执行 consume_file
 Celery Signal Handlers (before_task_publish / task_prerun / task_postrun / task_failure / task_revoked)
   │  更新 PaperlessTask ORM 记录 (DB 持久化)
   ▼
-前端轮询 /api/tasks/  读取 PaperlessTask 列表
+WebSocket 事件触发 /api/tasks/ reload 读取 PaperlessTask 列表
 ```
 
 ---
@@ -153,7 +153,7 @@ PENDING ──→ STARTED ──→ SUCCESS
 
 ## 四、通知触发机制
 
-通知有 **两条并行通道**：WebSocket 实时推送 + DB 持久化（前端轮询）。
+通知有 **两条并行通道**：WebSocket 实时推送 + DB 持久化（WebSocket 事件触发 HTTP reload，页面或用户动作再次查询）。
 
 ### 4.1 WebSocket 实时推送
 
@@ -291,7 +291,7 @@ status_mgr.send_documents_deleted(delete_ids)
 |---|---|---|---|---|
 | **① 成功进度** | WebSocket `status_update` | `ConsumerPlugin._send_progress(SUCCESS)` 直接推送 | **最先到达**（任务 return 前） | filename, task_id, document_id, phase=SUCCESS |
 | **② document_updated** | WebSocket `document_updated` | `document_updated` signal → `send_websocket_document_updated()` | **仅版本更新/批量更新/定时工作流时到达** | document_id, modified, owner_id |
-| **③ 任务列表** | HTTP REST `GET /api/tasks/` | Celery `task_postrun` handler 更新 DB，前端主动轮询 | **最晚到达**（任务 return 后） | PaperlessTask 完整记录 |
+| **③ 任务列表** | HTTP REST `GET /api/tasks/` | WebSocket 事件触发 `tasksService.reload()`；页面/用户动作再次查询 | 任务 return 后 DB 写入完成（存在竞态窗口） | PaperlessTask 完整记录 |
 
 ### 5.2 链路①：成功进度（status_update）
 
@@ -354,7 +354,7 @@ status_mgr.send_documents_deleted(delete_ids)
 
 #### 前端读取与触发机制：
 
-**不是单纯轮询**：`TasksService.reload()` 并非通过定时器周期性调用，而是**由 WebSocket 事件被动触发**。
+**事件驱动 reload**：`TasksService.reload()` 并非定时轮询，而是**由 WebSocket 事件被动触发** HTTP 请求，页面或用户动作也会再次查询。
 
 触发源在 [AppComponent.ngOnInit()](src-ui/src/app/app.component.ts#L76-L136) 中，订阅了三个 WebSocket Subject，每个事件到达时都调用 `tasksService.reload()`：
 
@@ -413,7 +413,7 @@ L784  return ConsumeFileSuccessResult(...)          # ← 函数返回
 
 两个组件独立工作：`AppComponent` 负责刷新任务列表，`DocumentListComponent` 负责刷新文档内容列表。
 
-**关键**：这条链路是事件驱动的"准实时"更新（而非定时轮询），但依赖于 WebSocket 消息与 DB 写入的时序竞态。它提供了最完整的状态数据（包括 result_data 中的 document_id / duplicate_of 等结构化结果）。
+**关键**：这条链路是事件驱动的准实时更新——WebSocket 事件触发 HTTP reload，页面或用户动作再次查询——但首次 reload 与 `task_postrun` DB 写入存在时序竞态。它提供了最完整的状态数据（包括 result_data 中的 document_id / duplicate_of 等结构化结果）。
 
 ### 5.5 上传流程 (UploadDocumentsService)
 
@@ -607,12 +607,12 @@ Celery Worker                                                            WebSock
 
 ## 七、关键设计要点
 
-### 7.1 事件驱动的双通道并行（非轮询）
+### 7.1 事件驱动的双通道并行
 
 - **WebSocket**：细粒度实时进度（STARTED/WORKING/SUCCESS/FAILED + 百分比），只在消费期间推送
 - **REST /api/tasks/**：粗粒度任务状态 (PENDING/STARTED/SUCCESS/FAILURE/REVOKED)，可随时查询历史
 
-**关键修正**：REST API 不是"轮询"，而是**由 WebSocket 事件被动触发**。[AppComponent.ngOnInit()](src-ui/src/app/app.component.ts#L76-L136) 订阅了三个 WebSocket Subject，每次收到事件都调用 `tasksService.reload()`。
+**触发机制**：REST `/api/tasks/` 的 reload **由 WebSocket 事件被动触发**，非定时轮询。[AppComponent.ngOnInit()](src-ui/src/app/app.component.ts#L76-L136) 订阅了三个 WebSocket Subject，每次收到事件都调用 `tasksService.reload()`；页面导航或用户操作也会再次查询。
 
 两者独立工作，WebSocket 断线不影响任务执行，用户进入 /tasks 页面时会触发 reload 获取最终状态。
 
