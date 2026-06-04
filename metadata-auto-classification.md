@@ -1,35 +1,19 @@
 # Paperless-ngx 自动分类机制深度分析
 
-基于代码分析，本文档详细阐述 Paperless-ngx 中文档自动分类的完整流程，包括匹配条件、规则命中、元数据提取、分类决策和冲突处理机制。
+本文档重点分析自动分类的**触发信号**、**重新标记命令覆盖情况**、**多匹配参数**、**规则匹配与自动预测的关联**以及**已有值冲突处理方式**。
 
 ---
 
-## 一、自动分类整体架构
+## 一、自动分类触发信号
 
-### 1.1 核心模块组成
+### 1.1 信号定义与连接
 
-自动分类系统由以下核心模块协同工作：
+自动分类通过 Django 信号机制触发，信号连接在 `src/documents/apps.py` 中配置：
 
-| 模块 | 核心文件 | 主要职责 |
-|------|---------|---------|
-| 匹配模型定义 | [models.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L46-L93) | 定义7种匹配算法和匹配数据结构 |
-| 规则匹配引擎 | [matching.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py) | 执行具体的规则匹配逻辑 |
-| 机器学习分类器 | [classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py) | 基于 MLP 神经网络的自动分类 |
-| 分类决策处理 | [handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py) | 分类结果决策和冲突处理 |
-| 消费流程触发 | [consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/consumer.py) | 文档消费时触发分类流程 |
-| AI 分类扩展 | [ai_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/paperless_ai/ai_classifier.py) | LLM 辅助分类和 RAG 增强 |
-
-### 1.2 分类触发时机
-
-自动分类通过 Django 信号机制在以下时机触发：
-
-1. **文档消费完成**：`document_consumption_finished` 信号
-2. **文档更新**：`document_updated` 信号
-3. **批量重新标记**：`document_retagger` 命令
-
-信号连接配置在 [apps.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/apps.py#L24-L33) 中定义：
+[apps.py#L24-L33](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/apps.py#L24-L33)
 
 ```python
+# 消费完成信号 - 按顺序执行以下处理器
 document_consumption_finished.connect(add_inbox_tags)
 document_consumption_finished.connect(set_correspondent)
 document_consumption_finished.connect(set_document_type)
@@ -37,604 +21,567 @@ document_consumption_finished.connect(set_tags)
 document_consumption_finished.connect(set_storage_path)
 document_consumption_finished.connect(add_to_index)
 document_consumption_finished.connect(run_workflows_added)
+document_consumption_finished.connect(add_or_update_document_in_llm_index)
+
+# 文档更新信号
+document_updated.connect(run_workflows_updated)
+document_updated.connect(send_websocket_document_updated)
 ```
 
----
+### 1.2 触发时机
 
-## 二、匹配条件详解
+#### 1.2.1 文档消费时触发
 
-### 2.1 七种匹配算法
+在 `src/documents/consumer.py` 的消费流程中，文档保存后发送信号：
 
-`MatchingModel` 在 [models.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L46-L63) 中定义了 7 种匹配算法：
-
-| 算法 | 枚举值 | 描述 | 匹配逻辑 |
-|------|--------|------|---------|
-| `MATCH_NONE` | 0 | 不匹配 | 始终返回 False |
-| `MATCH_ANY` | 1 | 任意词匹配 | 匹配字符串中任意一个词出现在文档中 |
-| `MATCH_ALL` | 2 | 全词匹配 | 匹配字符串中所有词都必须出现在文档中 |
-| `MATCH_LITERAL` | 3 | 精确匹配 | 整个匹配字符串作为整体精确匹配 |
-| `MATCH_REGEX` | 4 | 正则表达式 | 使用正则表达式进行匹配 |
-| `MATCH_FUZZY` | 5 | 模糊匹配 | 使用快速模糊匹配算法（阈值 90%） |
-| `MATCH_AUTO` | 6 | 自动分类 | 基于机器学习模型自动预测 |
-
-### 2.2 匹配参数配置
-
-每个匹配规则包含以下可配置参数（[models.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L65-L76)）：
+[consumer.py#L570-L666](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/consumer.py#L570-L666)
 
 ```python
-name = models.CharField(max_length=128)           # 规则名称
-match = models.CharField(max_length=256, blank=True)  # 匹配字符串
-matching_algorithm = models.PositiveSmallIntegerField(
-    choices=MATCHING_ALGORITHMS,
-    default=MATCH_ANY,
+# 分类器在消费流程中预加载，避免多次加载
+classifier = load_classifier()
+
+# 文档保存完成后发送信号
+document_consumption_finished.send(
+    sender=self.__class__,
+    document=document,
+    logging_group=self.logging_group,
+    classifier=classifier,              # 预加载的分类器实例
+    original_file=self.unmodified_original
+    if self.unmodified_original
+    else self.working_copy,
 )
-is_insensitive = models.BooleanField(default=True)  # 是否大小写不敏感
 ```
 
-### 2.3 可配置分类实体
+**关键设计**：分类器在信号发送前预加载，通过参数传递给所有信号处理器，避免重复加载开销。
 
-支持自动分类的元数据类型均继承自 `MatchingModel`：
+#### 1.2.2 文档更新时触发
 
-- **Correspondent**（联系人）- [models.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L96-L100)
-- **Tag**（标签）- [models.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L102-L138)
-- **DocumentType**（文档类型）- [models.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L141-L144)
-- **StoragePath**（存储路径）- [models.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L147-L154)
+通过 `document_updated` 信号触发，主要用于工作流执行：
+
+[handlers.py#L819-L829](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L819-L829)
+
+```python
+def run_workflows_updated(
+    sender,
+    document: Document,
+    logging_group: uuid.UUID | None = None,
+    **kwargs,
+) -> None:
+    run_workflows(
+        trigger_type=WorkflowTrigger.WorkflowTriggerType.DOCUMENT_UPDATED,
+        document=document,
+        logging_group=logging_group,
+    )
+```
+
+#### 1.2.3 批量更新时触发
+
+`bulk_update_documents` 任务中显式发送信号：
+
+[tasks.py#L253-L276](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/tasks.py#L253-L276)
+
+```python
+@shared_task
+def bulk_update_documents(document_ids) -> None:
+    documents = Document.objects.filter(id__in=document_ids)
+    for doc in documents:
+        clear_document_caches(doc.pk)
+        document_updated.send(
+            sender=None,
+            document=doc,
+            logging_group=uuid.uuid4(),
+        )
+        post_save.send(Document, instance=doc, created=False)
+```
+
+#### 1.2.4 手动重新标记命令
+
+通过 `document_retagger` 命令行工具手动触发，不依赖信号机制，直接调用分类函数：
+
+[document_retagger.py#L278-L328](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/management/commands/document_retagger.py#L278-L328)
+
+### 1.3 信号处理器执行顺序
+
+`document_consumption_finished` 信号的处理器按连接顺序执行：
+
+| 顺序 | 处理器 | 功能 | 代码位置 |
+|------|-------|------|---------|
+| 1 | `add_inbox_tags` | 添加收件箱标签 | [handlers.py#L80-L91](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L80-L91) |
+| 2 | `set_correspondent` | 自动分配联系人 | [handlers.py#L93-L151](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L93-L151) |
+| 3 | `set_document_type` | 自动分配文档类型 | [handlers.py#L154-L212](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L154-L212) |
+| 4 | `set_tags` | 自动分配标签 | [handlers.py#L215-L277](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L215-L277) |
+| 5 | `set_storage_path` | 自动分配存储路径 | [handlers.py#L280-L338](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L280-L338) |
+| 6 | `add_to_index` | 添加到搜索索引 | [handlers.py#L794-L800](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L794-L800) |
+| 7 | `run_workflows_added` | 运行文档添加工作流 | [handlers.py#L803-L816](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L803-L816) |
+| 8 | `add_or_update_document_in_llm_index` | 更新 LLM 索引 | - |
+
+**重要**：分类处理器（2-5）之间没有依赖关系，按顺序独立执行。
 
 ---
 
-## 三、规则命中流程
+## 二、重新标记命令的覆盖情况
 
-### 3.1 核心匹配函数
+### 2.1 命令参数概览
 
-规则匹配的核心逻辑在 [matching.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L169-L263) 的 `matches()` 函数中实现。
+`document_retagger` 命令在 `src/documents/management/commands/document_retagger.py` 中实现，支持以下覆盖相关参数：
 
-#### 匹配执行流程：
-
-```
-输入: matching_model (规则), document (文档)
-输出: True/False (是否匹配)
-
-1. 获取文档有效内容: document.get_effective_content()
-2. 检查匹配字符串是否为空，为空返回 False
-3. 根据 is_insensitive 设置正则表达式标志
-4. 根据 matching_algorithm 执行相应匹配逻辑
-5. 匹配成功时记录日志原因
-```
-
-### 3.2 各算法具体实现
-
-#### 3.2.1 MATCH_ALL（全词匹配）
-[matches() - L184-L198](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L184-L198)
+[document_retagger.py#L186-L228](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/management/commands/document_retagger.py#L186-L228)
 
 ```python
-for word in _split_match(matching_model):
-    search_result = re.search(rf"\b{word}\b", document_content, flags=search_flags)
-    if not search_result:
+def add_arguments(self, parser) -> None:
+    parser.add_argument("-c", "--correspondent", default=False, action="store_true")
+    parser.add_argument("-T", "--tags", default=False, action="store_true")
+    parser.add_argument("-t", "--document_type", default=False, action="store_true")
+    parser.add_argument("-s", "--storage_path", default=False, action="store_true")
+    parser.add_argument("-i", "--inbox-only", default=False, action="store_true")
+    parser.add_argument("--use-first", default=False, action="store_true",
+        help="By default this command will not try to assign a correspondent "
+             "if more than one matches the document. Use this flag to pick "
+             "the first match instead.")
+    parser.add_argument("-f", "--overwrite", default=False, action="store_true",
+        help="Overwrite any previously set correspondent, document type, and "
+             "remove tags that no longer match due to changed rules.")
+    parser.add_argument("--suggest", default=False, action="store_true",
+        help="Show what would be changed without applying anything.")
+    parser.add_argument("--base-url", help="Base URL for document links in suggest output.")
+    parser.add_argument("--id-range", nargs=2, type=int,
+        help="Restrict retagging to documents within this ID range (inclusive).")
+```
+
+### 2.2 参数映射与执行逻辑
+
+[document_retagger.py#L278-L328](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/management/commands/document_retagger.py#L278-L328)
+
+```python
+# 命令行参数 -> 函数参数映射
+for document in documents:
+    if do_correspondent:
+        correspondent = set_correspondent(
+            None,
+            document,
+            classifier=classifier,
+            replace=overwrite,       # --overwrite
+            use_first=use_first,     # --use-first
+            dry_run=suggest,         # --suggest
+        )
+
+    if do_document_type:
+        document_type = set_document_type(
+            None,
+            document,
+            classifier=classifier,
+            replace=overwrite,       # --overwrite
+            use_first=use_first,     # --use-first
+            dry_run=suggest,         # --suggest
+        )
+
+    if do_tags:
+        tags_to_add, tags_to_remove = set_tags(
+            None,
+            document,
+            classifier=classifier,
+            replace=overwrite,       # --overwrite
+            dry_run=suggest,         # --suggest
+            # 注意：set_tags 没有 use_first 参数
+        )
+
+    if do_storage_path:
+        storage_path = set_storage_path(
+            None,
+            document,
+            classifier=classifier,
+            replace=overwrite,       # --overwrite
+            use_first=use_first,     # --use-first
+            dry_run=suggest,         # --suggest
+        )
+```
+
+### 2.3 覆盖模式对比
+
+| 场景 | `--overwrite` | `--use-first` | 行为描述 |
+|------|--------------|--------------|---------|
+| 默认消费 | `False` | `True` | 不覆盖已有值；多匹配时取第一个 |
+| 重新标记默认 | `False` | `False` | 不覆盖已有值；多匹配时**不分配**（安全默认） |
+| 强制覆盖 | `True` | `False` | 覆盖已有值；多匹配时不分配 |
+| 强制覆盖+首选 | `True` | `True` | 覆盖已有值；多匹配时取第一个 |
+| 仅建议模式 | 任意 | 任意 | 仅计算，不写入数据库 |
+
+### 2.4 标签的特殊覆盖逻辑
+
+`set_tags` 函数在 `replace=True` 时有特殊的标签保留规则：
+
+[handlers.py#L248-L264](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L248-L264)
+
+```python
+if replace:
+    # 移除标签，但保留以下两种：
+    Document.tags.through.objects.filter(document=document).exclude(
+        Q(tag__is_inbox_tag=True),              # 1. 收件箱标签
+    ).exclude(
+        Q(tag__match="") & ~Q(tag__matching_algorithm=Tag.MATCH_AUTO),
+        # 2. 手动添加的标签（match为空且非自动分类）
+    ).delete()
+```
+
+**标签覆盖时的保留规则**：
+- ✅ 保留 `is_inbox_tag=True` 的标签（收件箱标签）
+- ✅ 保留 `match=""` 且 `matching_algorithm != MATCH_AUTO` 的标签（手动标签）
+- ❌ 删除其他所有标签（规则匹配标签和自动分类标签）
+
+---
+
+## 三、多匹配参数（use_first）
+
+### 3.1 参数定义与默认值
+
+四个分类决策函数中，三个支持 `use_first` 参数：
+
+| 函数 | 是否支持 `use_first` | 默认值 | 代码位置 |
+|------|---------------------|--------|---------|
+| `set_correspondent` | 是 | `True` | [handlers.py#L100](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L100) |
+| `set_document_type` | 是 | `True` | [handlers.py#L161](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L161) |
+| `set_storage_path` | 是 | `True` | [handlers.py#L288](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L288) |
+| `set_tags` | 否 | - | 标签支持多值，无冲突问题 |
+
+### 3.2 冲突处理实现
+
+以 `set_correspondent` 为例：
+
+[handlers.py#L128-L141](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L128-L141)
+
+```python
+potential_correspondents = matching.match_correspondents(document, classifier)
+potential_count = len(potential_correspondents)
+selected = potential_correspondents[0] if potential_correspondents else None
+
+if potential_count > 1:
+    if use_first:
+        logger.debug(
+            f"Detected {potential_count} potential correspondents, "
+            f"so we've opted for {selected}",
+            extra={"group": logging_group},
+        )
+    else:
+        logger.debug(
+            f"Detected {potential_count} potential correspondents, "
+            f"not assigning any correspondent",
+            extra={"group": logging_group},
+        )
+        return None
+```
+
+**决策逻辑**：
+```
+候选列表长度 N：
+  N == 0 → 返回 None，不分配
+  N == 1 → 返回该候选
+  N > 1  → 
+    use_first=True  → 返回候选列表第一个
+    use_first=False → 返回 None，不分配
+```
+
+### 3.3 不同调用场景的参数值
+
+| 调用场景 | `use_first` 值 | 说明 |
+|---------|---------------|------|
+| 文档消费（信号触发） | `True` | 快速分配，即使有多个匹配也选第一个 |
+| 重新标记（默认） | `False` | 保守策略，多匹配时跳过，避免错误 |
+| 重新标记（`--use-first`） | `True` | 主动选择第一个匹配 |
+
+### 3.4 "第一个"的定义
+
+候选列表的排序由匹配查询的 `order_by("name")` 决定，定义在 `MatchingModel.Meta` 中：
+
+[models.py#L79](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L79)
+
+```python
+class Meta(ModelWithOwner.Meta):
+    abstract = True
+    ordering = ("name",)  # 按名称字母排序
+```
+
+**注意**：匹配结果按名称字母顺序排序，"第一个"是名称字母顺序最靠前的那个，而非匹配质量最高的。
+
+---
+
+## 四、规则匹配与自动预测的关联
+
+### 4.1 匹配算法定义
+
+`MatchingModel` 定义了 7 种匹配算法：
+
+[models.py#L46-L63](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L46-L63)
+
+```python
+class MatchingModel(ModelWithOwner):
+    MATCH_NONE = 0     # 不匹配
+    MATCH_ANY = 1      # 任意词
+    MATCH_ALL = 2      # 全词
+    MATCH_LITERAL = 3  # 精确匹配
+    MATCH_REGEX = 4    # 正则表达式
+    MATCH_FUZZY = 5    # 模糊匹配
+    MATCH_AUTO = 6     # 自动分类
+
+    matching_algorithm = models.PositiveSmallIntegerField(
+        choices=MATCHING_ALGORITHMS,
+        default=MATCH_ANY,
+    )
+```
+
+### 4.2 核心匹配函数 `matches()`
+
+传统规则匹配在 `src/documents/matching.py` 的 `matches()` 函数中实现：
+
+[matching.py#L169-L263](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L169-L263)
+
+```python
+def matches(matching_model: MatchingModel, document: Document):
+    # 获取文档有效内容
+    document_content = document.get_effective_content() or ""
+
+    # 空匹配字符串不匹配
+    if not matching_model.match.strip():
         return False
-return True
+
+    # 根据 matching_algorithm 分发到不同匹配逻辑
+    if matching_model.matching_algorithm == MatchingModel.MATCH_NONE:
+        return False
+    elif matching_model.matching_algorithm == MatchingModel.MATCH_ALL:
+        # ... 全词匹配逻辑
+    elif matching_model.matching_algorithm == MatchingModel.MATCH_ANY:
+        # ... 任意词匹配逻辑
+    # ... 其他算法
+    elif matching_model.matching_algorithm == MatchingModel.MATCH_AUTO:
+        # this is done elsewhere.
+        return False
 ```
 
-**关键点**：
-- 使用 `_split_match()` 解析匹配字符串，支持引号分组
-- 每个词独立进行单词边界匹配（`\b`）
-- 所有词都必须匹配才返回 True
+**关键点**：`MATCH_AUTO` 在 `matches()` 中直接返回 `False`，实际匹配在 `match_*` 系列函数中完成。
 
-#### 3.2.2 MATCH_ANY（任意词匹配）
-[matches() - L200-L205](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L200-L205)
+### 4.3 组合匹配逻辑
 
-```python
-for word in _split_match(matching_model):
-    if re.search(rf"\b{word}\b", document_content, flags=search_flags):
-        return True
-return False
-```
+`match_correspondents` 等函数结合了**规则匹配**和**自动预测**，使用 **OR 关系**：
 
-**关键点**：
-- 只要有一个词匹配就返回 True
-- 支持引号分组（如 `"hello world"` 作为整体匹配）
-
-#### 3.2.3 MATCH_LITERAL（精确匹配）
-[matches() - L207-L221](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L207-L221)
+[matching.py#L47-L76](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L47-L76)
 
 ```python
-result = bool(
-    re.search(
-        rf"\b{re.escape(matching_model.match)}\b",
-        document_content,
-        flags=search_flags,
-    ),
-)
-```
+def match_correspondents(document: Document, classifier: DocumentClassifier, user=None):
+    # 1. 机器学习预测
+    pred_id = (
+        classifier.predict_correspondent(document.suggestion_content)
+        if classifier
+        else None
+    )
 
-**关键点**：
-- 使用 `re.escape()` 转义特殊字符
-- 整个匹配字符串作为整体进行单词边界匹配
+    # 2. 权限过滤
+    if user is not None:
+        correspondents = get_objects_for_user_owner_aware(
+            user, "documents.view_correspondent", Correspondent,
+        )
+    else:
+        correspondents = Correspondent.objects.all()
 
-#### 3.2.4 MATCH_REGEX（正则表达式）
-[matches() - L223-L236](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L223-L236)
-
-```python
-match = safe_regex_search(
-    matching_model.match,
-    document_content,
-    flags=search_flags,
-)
-return bool(match)
-```
-
-**关键点**：
-- 使用 `safe_regex_search()` 防止 ReDoS 攻击
-- 匹配成功时记录匹配的具体字符串
-
-#### 3.2.5 MATCH_FUZZY（模糊匹配）
-[matches() - L238-L256](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L238-L256)
-
-```python
-from rapidfuzz import fuzz
-
-match = re.sub(r"[^\w\s]", "", matching_model.match)
-text = re.sub(r"[^\w\s]", "", document_content)
-if matching_model.is_insensitive:
-    match = match.lower()
-    text = text.lower()
-if fuzz.partial_ratio(match, text, score_cutoff=90):
-    return True
-```
-
-**关键点**：
-- 使用 `rapidfuzz` 库的 `partial_ratio` 算法
-- 匹配阈值固定为 90 分
-- 匹配前移除标点符号
-
-#### 3.2.6 MATCH_AUTO（自动分类）
-[matches() - L258-L260](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L258-L260)
-
-```python
-elif matching_model.matching_algorithm == MatchingModel.MATCH_AUTO:
-    # this is done elsewhere.
-    return False
-```
-
-**关键点**：
-- `matches()` 函数中直接返回 False
-- 实际匹配由机器学习分类器在 `match_*` 系列函数中完成
-
-### 3.3 匹配字符串解析
-
-`_split_match()` 函数 ([matching.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L266-L282)) 负责解析匹配字符串：
-
-```python
-# 示例解析:
-'  some random  words "with   quotes  " and   spaces'
-=>
-["some", "random", "words", "with\\s+quotes", "and", "spaces"]
-```
-
-**解析规则**：
-1. 用正则表达式提取词或引号分组
-2. 规范化空格（多个空格替换为 `\s+`）
-3. 转义特殊正则字符
-
-### 3.4 分类匹配集合函数
-
-针对不同元数据类型，提供了独立的匹配函数，结合规则匹配和机器学习预测：
-
-#### match_correspondents()
-[matching.py - L47-L76](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L47-L76)
-
-```python
-def match_correspondents(document, classifier, user=None):
-    pred_id = classifier.predict_correspondent(document.suggestion_content) if classifier else None
-    return list(filter(
-        lambda o: matches(o, document) or (
-            o.pk == pred_id and o.matching_algorithm == MatchingModel.MATCH_AUTO
+    # 3. 组合匹配：规则匹配 OR 自动预测
+    return list(
+        filter(
+            lambda o: (
+                matches(o, document)                            # 规则匹配
+                or (
+                    o.pk == pred_id                               # ML预测ID匹配
+                    and o.matching_algorithm == MatchingModel.MATCH_AUTO
+                    # 仅当规则配置为AUTO时才接受ML预测
+                )
+            ),
+            correspondents,
         ),
-        correspondents,
-    ))
+    )
 ```
 
-**匹配逻辑（OR 关系）**：
-1. 传统规则匹配成功 (`matches(o, document)`)
-2. **或者** 机器学习预测命中且算法为 `MATCH_AUTO`
+### 4.4 匹配逻辑真值表
 
-相同的逻辑适用于：
-- `match_document_types()` - [L79-L107](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L79-L107)
-- `match_tags()` - [L110-L134](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L110-L134)
-- `match_storage_paths()` - [L137-L166](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L137-L166)
+| 规则算法 | 规则匹配结果 | ML 预测命中 | 最终结果 | 说明 |
+|---------|-------------|------------|---------|------|
+| `MATCH_ANY` | True | 任意 | True | 规则匹配优先，无需 ML |
+| `MATCH_ANY` | False | 是 | False | ML 预测仅对 `MATCH_AUTO` 有效 |
+| `MATCH_AUTO` | False (恒) | 是 | True | ML 预测命中 |
+| `MATCH_AUTO` | False (恒) | 否 | False | ML 预测未命中 |
+| 其他算法 | True | 任意 | True | 规则匹配成功 |
+| 其他算法 | False | 是 | False | 规则配置非 AUTO，ML 不生效 |
 
----
+### 4.5 四种元数据类型的匹配逻辑
 
-## 四、元数据提取
+所有 `match_*` 函数使用相同的 OR 逻辑：
 
-### 4.1 文档内容来源
+| 函数 | 代码位置 | ML 预测函数 |
+|------|---------|------------|
+| `match_correspondents` | [matching.py#L47-L76](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L47-L76) | `predict_correspondent` |
+| `match_document_types` | [matching.py#L79-L107](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L79-L107) | `predict_document_type` |
+| `match_tags` | [matching.py#L110-L134](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L110-L134) | `predict_tags` |
+| `match_storage_paths` | [matching.py#L137-L166](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L137-L166) | `predict_storage_path` |
 
-#### 4.1.1 get_effective_content()
-[models.py - L363-L400](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L363-L400)
+### 4.6 机器学习预测实现
 
-返回文档的有效内容：
-- 根文档：优先使用最新版本的内容
-- 版本文档：使用自身内容
-- 额外拼接：`{content} {archive_serial_number} {correspondent} {title}`
+以 `predict_correspondent` 为例：
 
-#### 4.1.2 suggestion_content
-[models.py - L402-L428](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L402-L428)
-
-用于分类建议的文档文本，针对大文档进行优化：
-- 内容长度 ≤ 1,200,000 字符：返回全部内容
-- 内容长度 > 1,200,000 字符：取前 800,000 字符 + 后 200,000 字符
-
-### 4.2 文本预处理
-
-`DocumentClassifier.preprocess_content()` ([classifier.py - L487-L516](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L487-L516)) 对文档内容进行预处理：
-
-#### 基础预处理（始终执行）：
-```python
-# 转小写 + 提取单词 + 规范化空格
-content = " ".join(match.group().lower() for match in RE_WORD.finditer(content))
-```
-
-#### 高级文本处理（NLTK 启用时）：
-```python
-if ADVANCED_TEXT_PROCESSING_ENABLED:
-    words = word_tokenize(content, language=settings.NLTK_LANGUAGE)
-    content = stem_and_skip_stop_words(words)
-```
-
-**高级处理包含**：
-1. **分词**：使用 NLTK `word_tokenize`
-2. **停用词过滤**：移除常见停用词（如 "the", "a", "is" 等）
-3. **词干还原**：使用 `SnowballStemmer` 将词还原为词干（如 "amazement" → "amaz"）
-4. **词干缓存**：LRU 缓存（10,000 条目）共享于多个 worker
-
-### 4.3 特征向量化
-
-使用 `CountVectorizer` 将文本转换为特征向量 ([classifier.py - L335-L343](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L335-L343))：
-
-```python
-self.data_vectorizer = CountVectorizer(
-    analyzer="word",
-    ngram_range=(1, 2),      # 提取 1-gram 和 2-gram 特征
-    min_df=0.01,             # 忽略出现在少于 1% 文档中的词
-)
-```
-
-**向量化缓存**：
-- 缓存键：`sha256(content + 版本 + NLTK 配置 + 向量化器哈希)`
-- 缓存时长：5 分钟
-- 缓存位置：`read-cache`
-
----
-
-## 五、分类决策机制
-
-### 5.1 机器学习分类器
-
-#### 5.1.1 分类器架构
-
-`DocumentClassifier` 使用多层感知器（MLP）神经网络：
-
-| 分类目标 | 分类器类型 | 说明 |
-|---------|-----------|------|
-| 标签 | `MultiLabelBinarizer` + `MLPClassifier` | 多标签分类 |
-| 联系人 | `MLPClassifier` | 多分类 |
-| 文档类型 | `MLPClassifier` | 多分类 |
-| 存储路径 | `MLPClassifier` | 多分类 |
-
-特殊情况：只有一个标签时，退化为二分类（`LabelBinarizer`）。
-
-#### 5.1.2 模型训练流程
-
-`train()` 方法 ([classifier.py - L221-L427](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L221-L427))：
-
-**步骤 1：收集训练数据**
-- 查询非收件箱文档
-- 提取 `MATCH_AUTO` 类型的标签、联系人、文档类型、存储路径
-- 计算训练数据哈希（用于判断是否需要重新训练）
-
-**步骤 2：判断是否需要重新训练**
-```python
-if (self.last_doc_change_time >= latest_doc_change
-    and self.last_auto_type_hash == hasher.digest()):
-    return False  # 无需重新训练
-```
-
-**步骤 3：特征向量化**
-- 使用 `CountVectorizer` 处理所有文档内容
-
-**步骤 4：训练分类器**
-- 对每个分类目标独立训练 MLP 模型
-- 模型参数：`MLPClassifier(tol=0.01)`
-
-**步骤 5：保存训练状态**
-- 保存模型文件（HMAC 签名保护）
-- 缓存训练元数据（50 分钟）
-
-#### 5.1.3 模型文件格式
-
-模型文件使用 HMAC-SHA256 签名保护 ([classifier.py - L136-L141](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L136-L141))：
-
-```
-[HMAC 签名 (32 字节)][Pickle 序列化数据]
-```
-
-序列化内容包括：
-- 格式版本号（当前 v10）
-- 最后文档变更时间
-- 自动类型哈希
-- 特征向量化器
-- 各分类器模型
-
-### 5.2 分类预测实现
-
-#### 5.2.1 predict_correspondent()
-[classifier.py - L536-L545](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L536-L545)
+[classifier.py#L536-L545](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L536-L545)
 
 ```python
 def predict_correspondent(self, content: str) -> int | None:
     if self.correspondent_classifier:
-        X = self._vectorize(content)
+        X = self._vectorize(content)                   # 文本向量化
         correspondent_id = self.correspondent_classifier.predict(X)
         return correspondent_id if correspondent_id != -1 else None
     return None
 ```
 
-#### 5.2.2 predict_tags()
-[classifier.py - L558-L577](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L558-L577)
-
-```python
-def predict_tags(self, content: str) -> list[int]:
-    if self.tags_classifier:
-        X = self._vectorize(content)
-        y = self.tags_classifier.predict(X)
-        tags_ids = self.tags_binarizer.inverse_transform(y)[0]
-        # 处理多标签和二分类的不同情况
-        return list(tags_ids) if ... else []
-    return []
-```
-
-### 5.3 分类决策函数
-
-#### 5.3.1 set_correspondent()
-[handlers.py - L93-L151](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L93-L151)
-
-**参数说明**：
-- `replace`：是否覆盖已有值
-- `use_first`：多匹配时的策略
-- `dry_run`：是否仅计算不保存
-
-**决策流程**：
-```
-1. 如果文档已有 correspondent 且 replace=False → 返回 None
-2. 调用 matching.match_correspondents() 获取候选列表
-3. 处理多匹配情况：
-   - use_first=True → 选择第一个匹配
-   - use_first=False → 不分配，返回 None
-4. 非 dry_run 时保存到数据库
-```
-
-相同结构的决策函数：
-- `set_document_type()` - [L154-L212](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L154-L212)
-- `set_storage_path()` - [L280-L338](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L280-L338)
-
-#### 5.3.2 set_tags()（特殊处理）
-[handlers.py - L215-L277](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L215-L277)
-
-标签分类有特殊的替换逻辑：
-
-```python
-if replace:
-    # 移除自动匹配的标签，但保留：
-    # 1. 收件箱标签 (is_inbox_tag=True)
-    # 2. 手动添加的标签 (match="" 且非 MATCH_AUTO)
-    Document.tags.through.objects.filter(document=document).exclude(
-        Q(tag__is_inbox_tag=True),
-    ).exclude(
-        Q(tag__match="") & ~Q(tag__matching_algorithm=Tag.MATCH_AUTO),
-    ).delete()
-
-# 添加新匹配的标签
-matched_tags = matching.match_tags(document, classifier)
-tags_to_add = set(matched_tags) - current_tags
-document.add_nested_tags(tags_to_add)
-```
+**预测值 `-1` 的含义**：表示"无匹配"，在训练时作为空标签的占位符。
 
 ---
 
-## 六、冲突处理机制
+## 五、已有值冲突处理方式
 
-### 6.1 多匹配冲突处理
+### 5.1 已有值保护机制
 
-当多个规则同时匹配时，处理策略由 `use_first` 参数控制：
+所有分类决策函数都通过 `replace` 参数控制是否覆盖已有值：
 
-| 元数据类型 | 默认策略 | 冲突处理代码位置 |
-|-----------|---------|-----------------|
-| 联系人 | `use_first=True` | [handlers.py - L128-L141](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L128-L141) |
-| 文档类型 | `use_first=True` | [handlers.py - L189-L202](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L189-L202) |
-| 存储路径 | `use_first=True` | [handlers.py - L315-L328](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L315-L328) |
-| 标签 | 全部添加 | [handlers.py - L266-L268](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L266-L268) |
-
-#### 冲突处理示例（联系人）：
-```python
-if potential_count > 1:
-    if use_first:
-        logger.debug(f"Detected {potential_count} potential correspondents, "
-                     f"so we've opted for {selected}")
-    else:
-        logger.debug(f"Detected {potential_count} potential correspondents, "
-                     f"not assigning any correspondent")
-        return None
-```
-
-### 6.2 规则与自动分类的优先级
-
-规则匹配和自动分类是 **OR 关系**，没有显式优先级：
+[handlers.py#L121-L122](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L121-L122)
 
 ```python
-# matching.py 中的匹配逻辑
-lambda o: (
-    matches(o, document)  # 规则匹配
-    or (
-        o.pk == pred_id and o.matching_algorithm == MatchingModel.MATCH_AUTO
-        # 自动分类预测
-    )
-)
-```
-
-**注意**：如果一个实体同时配置了非 AUTO 匹配算法，规则匹配会优先被检查，但实际上两者是 OR 关系，任一满足即匹配。
-
-### 6.3 已有值保护
-
-默认情况下（`replace=False`），不会覆盖已有的元数据值：
-
-```python
+# set_correspondent 中的已有值检查
 if document.correspondent and not replace:
     return None
 ```
 
-这意味着：
-- 用户手动设置的值会被保留
-- 只有未设置的字段才会被自动填充
-- `document_retagger` 命令会使用 `replace=True` 进行强制重新分类
+相同逻辑适用于：
+- `set_document_type` - [handlers.py#L182-L183](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L182-L183)
+- `set_storage_path` - [handlers.py#L308-L309](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L308-L309)
+
+### 5.2 冲突处理策略对比
+
+| 元数据类型 | 冲突点 | `replace=False`（默认消费） | `replace=True`（重新标记） |
+|-----------|--------|----------------------------|---------------------------|
+| 联系人 | 已有 `correspondent_id` | 直接返回 None，保留原值 | 覆盖为新匹配值 |
+| 文档类型 | 已有 `document_type_id` | 直接返回 None，保留原值 | 覆盖为新匹配值 |
+| 存储路径 | 已有 `storage_path_id` | 直接返回 None，保留原值 | 覆盖为新匹配值 |
+| 标签 | 已有标签集合 | 添加新匹配标签，保留原有标签 | 删除旧自动标签，添加新匹配标签 |
+
+### 5.3 标签的特殊冲突处理
+
+标签是多值属性，冲突处理方式不同：
+
+[handlers.py#L248-L277](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L248-L277)
+
+```python
+def set_tags(sender, document, *, classifier=None, replace=False, dry_run=False, **kwargs):
+    # replace=True 时，先移除旧标签
+    if replace:
+        tags_to_remove: set[Tag] = set(
+            document.tags.exclude(
+                is_inbox_tag=True,                    # 保留收件箱标签
+            ).exclude(
+                Q(match="") & ~Q(matching_algorithm=Tag.MATCH_AUTO),
+                # 保留手动标签
+            ),
+        )
+        if not dry_run:
+            Document.tags.through.objects.filter(document=document).exclude(
+                Q(tag__is_inbox_tag=True),
+            ).exclude(
+                Q(tag__match="") & ~Q(tag__matching_algorithm=Tag.MATCH_AUTO),
+            ).delete()
+
+    # 添加新匹配的标签（增量添加，不删除）
+    current_tags = set(document.tags.all())
+    matched_tags = matching.match_tags(document, classifier)
+    tags_to_add = set(matched_tags) - current_tags
+
+    if tags_to_add and not dry_run:
+        document.add_nested_tags(tags_to_add)
+
+    return tags_to_add, tags_to_remove
+```
+
+### 5.4 手动设置值的保护
+
+**如何判断"手动设置"的标签**：
+- `match=""`（匹配字符串为空）
+- `matching_algorithm != MATCH_AUTO`（非自动分类算法）
+
+这种标签被认为是用户手动添加的，在 `replace=True` 时也会被保留。
+
+### 5.5 工作流的优先级
+
+工作流动作在分类信号之后执行，可以覆盖自动分类结果：
+
+[apps.py#L30](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/apps.py#L30)
+
+```python
+document_consumption_finished.connect(run_workflows_added)
+```
+
+执行顺序：
+1. `set_correspondent` → 自动分配联系人
+2. `set_document_type` → 自动分配文档类型
+3. `set_tags` → 自动分配标签
+4. `set_storage_path` → 自动分配存储路径
+5. `run_workflows_added` → 工作流执行，可覆盖以上值
+
+**工作流分配具有最终决定权**。
 
 ---
 
-## 七、AI 分类扩展
+## 六、完整调用链总结
 
-### 7.1 LLM 分类流程
+### 6.1 文档消费时的分类流程
 
-`get_ai_document_classification()` ([ai_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/paperless_ai/ai_classifier.py#L88-L102)) 提供 AI 辅助分类：
-
-```python
-def get_ai_document_classification(document, user=None):
-    ai_config = AIConfig()
-    prompt = build_prompt_with_rag(document, user) if ai_config.llm_embedding_backend \
-             else build_prompt_without_rag(document)
-    client = AIClient()
-    result = client.run_llm_query(prompt)
-    return parse_ai_response(result)
+```
+consumer.py:
+  └─ ConsumerPlugin.run()
+      ├─ 解析文档，提取内容
+      ├─ 保存 Document 到数据库
+      ├─ classifier = load_classifier()  ← 预加载分类器
+      └─ document_consumption_finished.send(..., classifier=classifier)
+          │
+          ├─ add_inbox_tags()
+          ├─ set_correspondent(replace=False, use_first=True)
+          │   └─ matching.match_correspondents(doc, classifier)
+          │       ├─ classifier.predict_correspondent(doc.suggestion_content)
+          │       └─ filter: matches(o, doc) OR (o.pk == pred_id AND algo == AUTO)
+          ├─ set_document_type(replace=False, use_first=True)
+          ├─ set_tags(replace=False)
+          ├─ set_storage_path(replace=False, use_first=True)
+          ├─ add_to_index()
+          └─ run_workflows_added()  ← 工作流可覆盖自动分类结果
 ```
 
-### 7.2 RAG 增强上下文
+### 6.2 重新标记命令的执行流程
 
-`get_context_for_document()` ([ai_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/paperless_ai/ai_classifier.py#L49-L74)) 检索相似文档提供上下文：
-
-```python
-similar_docs = query_similar_documents(document=doc, ...)[:max_docs]
-context_blocks = []
-for similar in similar_docs:
-    text = similar.content[:1000] or ""
-    title = similar.title or similar.filename or "Untitled"
-    context_blocks.append(f"TITLE: {title}\n{text}")
 ```
-
-### 7.3 AI 结果匹配
-
-`paperless_ai/matching.py` 提供 AI 返回名称与系统实体的匹配：
-
-- 精确匹配优先
-- 模糊匹配备选（阈值 0.8，使用 `difflib.get_close_matches`）
-- 归一化处理：小写、去标点、去空格
-
-```python
-# _match_names_to_queryset() 核心逻辑
-if target in object_names:
-    # 精确匹配
-else:
-    matches = difflib.get_close_matches(target, object_names, n=1, cutoff=0.8)
-    # 模糊匹配
+document_retagger.py handle():
+  ├─ 解析参数: overwrite, use_first, suggest
+  ├─ classifier = load_classifier()
+  └─ for document in documents:
+      ├─ set_correspondent(replace=overwrite, use_first=use_first, dry_run=suggest)
+      ├─ set_document_type(replace=overwrite, use_first=use_first, dry_run=suggest)
+      ├─ set_tags(replace=overwrite, dry_run=suggest)
+      └─ set_storage_path(replace=overwrite, use_first=use_first, dry_run=suggest)
 ```
 
 ---
 
-## 八、完整分类流程
+## 七、代码引用汇总（仓库相对路径）
 
-### 8.1 文档消费时的分类流程
-
-```
-文档消费流程 (consumer.py):
-│
-├─→ 1. 前置检查 (ConsumerPreflightPlugin)
-├─→ 2. ASN 检查
-├─→ 3. 分页整理 (CollatePlugin)
-├─→ 4. 条形码识别 (BarcodePlugin)
-├─→ 5. 工作流触发 (WorkflowTriggerPlugin)
-│   └─→ 消费时工作流匹配，预分配元数据
-└─→ 6. 核心消费 (ConsumerPlugin)
-    ├─→ 解析文档，提取内容
-    ├─→ 解析日期
-    ├─→ 保存文档到数据库
-    ├─→ 加载分类器: classifier = load_classifier()
-    └─→ 发送 document_consumption_finished 信号
-        │
-        ├─→ add_inbox_tags()        # 添加收件箱标签
-        ├─→ set_correspondent()     # 自动分配联系人
-        ├─→ set_document_type()     # 自动分配文档类型
-        ├─→ set_tags()              # 自动分配标签
-        ├─→ set_storage_path()      # 自动分配存储路径
-        ├─→ add_to_index()          # 添加到搜索索引
-        ├─→ run_workflows_added()   # 运行文档添加工作流
-        └─→ add_or_update_document_in_llm_index()  # 更新 LLM 索引
-```
-
-### 8.2 消费流程中的关键代码位置
-
-- 分类器加载：[consumer.py - L570-L576](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/consumer.py#L570-L576)
-- 信号发送：[consumer.py - L658-L666](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/consumer.py#L658-L666)
-
-### 8.3 重新标记流程
-
-`document_retagger` 命令使用 `replace=True` 强制重新分类：
-
-```python
-# set_correspondent, set_document_type, set_storage_path:
-# replace=True, use_first=False
-# 意味着：覆盖已有值，但多匹配时不分配（避免错误）
-
-# set_tags:
-# replace=True
-# 意味着：移除所有自动标签，重新分配
-```
-
----
-
-## 九、关键技术要点总结
-
-### 9.1 匹配条件速查表
-
-| 匹配算法 | 适用场景 | 性能 | 精确度 |
-|---------|---------|------|-------|
-| MATCH_ANY | 简单关键词过滤 | 高 | 中 |
-| MATCH_ALL | 多条件组合过滤 | 中 | 高 |
-| MATCH_LITERAL | 精确短语匹配 | 高 | 高 |
-| MATCH_REGEX | 复杂模式匹配 | 低 | 高 |
-| MATCH_FUZZY | OCR 错误容错 | 中 | 中 |
-| MATCH_AUTO | 智能自动分类 | 中 | 取决于训练数据 |
-
-### 9.2 性能优化点
-
-1. **向量化缓存**：5 分钟缓存，避免重复计算
-2. **词干缓存**：10,000 条目 LRU 缓存，跨 worker 共享
-3. **训练条件判断**：基于文档变更时间和数据哈希，避免不必要的重训练
-4. **大文档截断**：超大文档仅取首尾部分内容
-
-### 9.3 安全机制
-
-1. **HMAC 签名**：模型文件防篡改
-2. **安全正则**：`safe_regex_search` 防止 ReDoS 攻击
-3. **权限过滤**：匹配时考虑用户权限（`get_objects_for_user_owner_aware`）
-
----
-
-## 十、代码引用汇总
-
-| 功能模块 | 核心文件 | 关键行范围 |
+| 功能模块 | 相对路径 | 关键行范围 |
 |---------|---------|-----------|
-| 匹配算法定义 | [models.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py) | [L46-L93](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L46-L93) |
-| 规则匹配实现 | [matching.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py) | [L169-L263](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L169-L263) |
-| 分类器训练 | [classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py) | [L221-L427](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L221-L427) |
-| 分类预测 | [classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py) | [L536-L588](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L536-L588) |
-| 分类决策处理 | [handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py) | [L93-L338](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L93-L338) |
-| 信号连接配置 | [apps.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/apps.py) | [L24-L33](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/apps.py#L24-L33) |
-| 消费触发分类 | [consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/consumer.py) | [L570-L666](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/consumer.py#L570-L666) |
-| AI 分类扩展 | [ai_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/paperless_ai/ai_classifier.py) | [L88-L102](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/paperless_ai/ai_classifier.py#L88-L102) |
-| AI 名称匹配 | [matching.py](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/paperless_ai/matching.py) | [L61-L93](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/paperless_ai/matching.py#L61-L93) |
+| 信号连接配置 | `src/documents/apps.py` | [L24-L33](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/apps.py#L24-L33) |
+| 消费时信号触发 | `src/documents/consumer.py` | [L570-L666](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/consumer.py#L570-L666) |
+| 重新标记命令 | `src/documents/management/commands/document_retagger.py` | [L186-L328](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/management/commands/document_retagger.py#L186-L328) |
+| 匹配算法定义 | `src/documents/models.py` | [L46-L79](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/models.py#L46-L79) |
+| 规则匹配实现 | `src/documents/matching.py` | [L169-L263](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L169-L263) |
+| 组合匹配逻辑 | `src/documents/matching.py` | [L47-L166](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/matching.py#L47-L166) |
+| ML 预测实现 | `src/documents/classifier.py` | [L536-L588](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/classifier.py#L536-L588) |
+| 联系人分类决策 | `src/documents/signals/handlers.py` | [L93-L151](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L93-L151) |
+| 文档类型分类决策 | `src/documents/signals/handlers.py` | [L154-L212](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L154-L212) |
+| 标签分类决策 | `src/documents/signals/handlers.py` | [L215-L277](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L215-L277) |
+| 存储路径分类决策 | `src/documents/signals/handlers.py` | [L280-L338](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/signals/handlers.py#L280-L338) |
+| 批量更新信号发送 | `src/documents/tasks.py` | [L253-L276](file:///d:/fz/0601/solo-dogfeeding/code/27-paperless-ngx/src/documents/tasks.py#L253-L276) |
