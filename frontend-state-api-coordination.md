@@ -314,6 +314,8 @@ class DocumentFilterSet(FilterSet):
 
 后端根据查询参数判断使用哪种搜索模式：
 
+下面是便于理解分支的简化结构，真实的嵌套函数和调用顺序见 10.4.2。
+
 ```python
 _TANTIVY_SEARCH_PARAM_NAMES = ("text", "title_search", "query", "more_like_id")
 
