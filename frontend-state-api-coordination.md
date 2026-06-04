@@ -1127,11 +1127,11 @@ if (rule.rule_type === FILTER_TITLE_CONTENT || rule.rule_type === FILTER_SIMPLE_
 `transformLegacyFilterRules()` 会将旧版自定义字段规则自动转换为新的查询语法。此转换**仅在前端参数转换阶段执行**，后端仍保留了原始过滤器的处理能力：
 
 ```
-旧规则: FILTER_HAS_CUSTOM_FIELDS_ALL(38) + value="5,8"
+旧规则: 两条 FILTER_HAS_CUSTOM_FIELDS_ALL(38)，value 分别为 "5" 和 "8"
     ↓ 前端自动转换（transformLegacyFilterRules）
 新规则: FILTER_CUSTOM_FIELDS_QUERY(42) + value='["and",[["5","exists",true],["8","exists",true]]]'
 
-旧规则: FILTER_HAS_CUSTOM_FIELDS_ANY(39) + value="5,8"
+旧规则: 两条 FILTER_HAS_CUSTOM_FIELDS_ANY(39)，value 分别为 "5" 和 "8"
     ↓ 前端自动转换（transformLegacyFilterRules）
 新规则: FILTER_CUSTOM_FIELDS_QUERY(42) + value='["or",[["5","exists",true],["8","exists",true]]]'
 ```
