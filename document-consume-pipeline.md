@@ -291,43 +291,146 @@ OCRmyPDF 运行完成后，文本提取优先级：
 
 ---
 
-## 五、入库与归档
+## 五、消费成功：入库事务与文件处理的精确顺序
 
-### 5.1 创建文档记录
+核心逻辑在 `src/documents/consumer.py` 的 `ConsumerPlugin.run()` 方法（L408-784）。以下是**精确的执行顺序**，从 OCR 解析完成后开始追踪：
 
-`ConsumerPlugin._store()`（[consumer.py#L815](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/consumer.py#L815-L875)）创建数据库记录：
+### 5.1 数据库事务开始
+
+在进度 95% 时进入 `transaction.atomic()`（L586-587）：
+
+```python
+with transaction.atomic():
+    ...  # 所有以下操作都在同一个数据库事务内
+```
+
+> **关键**：事务内的任何步骤失败都会全部回滚，包括数据库写入和文件操作。
+
+### 5.2 创建文档记录（_store）
+
+**代码位置**：`src/documents/consumer.py` 的 `_store()`（L815-875）
 
 1. **确定创建日期**：优先级 `metadata.created > parser.get_date() > 文件修改时间`
 2. **确定标题**：优先级 `metadata.title > metadata.filename 的文件名部分 > 原始文件名`。标题支持工作流占位符解析
 3. **计算 checksum**：SHA256（如果 qpdf 修复过 PDF，用修复前的原始文件计算）
-4. **创建 Document 对象**：写入 title、content（OCR 文本）、mime_type、checksum、page_count 等
-5. **应用覆盖**：`apply_overrides()` 设置通信方、文档类型、标签、存储路径、ASN、所有者、权限、自定义字段
+4. **`Document.objects.create()`**：写入 title、content（OCR 文本）、mime_type、checksum、page_count、created、modified、original_filename 等
+5. **`apply_overrides()`**：设置通信方、文档类型、标签、存储路径、ASN、所有者、权限、自定义字段
+6. **`document.save()`**：保存初始记录
 
-如果是已有文档的新版本，走 `_create_version_from_root()` 创建版本记录。
+> **注意**：此时 `document.filename` 字段为 `None`，这会导致 `post_save` 信号中的 `update_filename_and_move_files()` 直接返回（L465-474），不执行任何文件操作。
 
-### 5.2 文件写入磁盘
+### 5.3 document_consumption_finished 信号发送
 
-在 `transaction.atomic()` 内，使用 `FileLock(MEDIA_LOCK)` 保证并发安全：
+**代码位置**：`src/documents/consumer.py` L658-666
 
-1. **生成文件名**：`generate_unique_filename()` 根据文档元数据和 `FILENAME_FORMAT` 模板生成路径
-2. **写入原始文件**：工作副本 → `ORIGINALS_DIR/<generated_filename>`
-3. **写入缩略图**：临时缩略图 → `THUMBNAIL_DIR/<pk>-thumbnail.webp`
-4. **写入归档文件**（如有）：归档 PDF → `ARCHIVE_DIR/<generated_archive_filename>`
-5. **计算归档 checksum**
+在**文件写入磁盘之前**发送信号：
 
-然后调用 `document.save()` 触发 `post_save` 信号。
+```python
+document_consumption_finished.send(
+    sender=self.__class__,
+    document=document,
+    logging_group=self.logging_group,
+    classifier=classifier,
+    original_file=self.unmodified_original if self.unmodified_original else self.working_copy,
+)
+```
 
-### 5.3 清理临时文件
+**信号处理器按以下顺序同步执行**（`src/documents/apps.py` L24-31）：
 
-成功后删除：
-- `input_doc.original_file`（原始输入文件）
-- `self.working_copy`（工作副本）
-- `self.unmodified_original`（qpdf 修复前的原始文件，如有）
-- macOS 资源分支文件（`._filename`）
+| 顺序 | 处理器 | 作用 |
+|---|---|---|
+| 1 | `add_inbox_tags` | 为文档添加标记为"收件箱"的标签 |
+| 2 | `set_correspondent` | 用分类器 + 规则匹配自动设置通信方 |
+| 3 | `set_document_type` | 用分类器 + 规则匹配自动设置文档类型 |
+| 4 | `set_tags` | 用分类器 + 规则匹配自动设置标签 |
+| 5 | `set_storage_path` | 用分类器 + 规则匹配自动设置存储路径 |
+| 6 | `add_to_index` | 写入 Whoosh/Tantivy 搜索索引 |
+| 7 | `run_workflows_added` | 执行"文档添加"触发的工作流 |
+| 8 | `add_or_update_document_in_llm_index` | 写入 LLM 向量索引 |
 
-### 5.4 Post-consume 脚本
+> **关键**：这些处理器会直接修改 `document` 对象的属性（通信方、标签、存储路径等），这些修改会影响**后续的文件名生成**。如果工作流包含 `MoveToTrash` 动作，文档会被移到回收站但消费流程继续。
 
-如果配置了 `POST_CONSUME_SCRIPT`，在消费完成后执行。环境变量包含完整的文档信息：
+### 5.4 文件写入磁盘
+
+**代码位置**：`src/documents/consumer.py` L670-725
+
+在 `FileLock(settings.MEDIA_LOCK)` 保护下写入文件：
+
+1. **生成初始文件名**：`generate_unique_filename(document)` — 此时 document 已包含信号处理器设置的属性
+2. **长度检查**：如果文件名超过 255 字符，回退到默认命名
+3. **`document.filename = generated_filename`** — 设置文件名到 Document 对象
+4. **创建目录**：`create_source_path_directory(document.source_path)`
+5. **写入原始文件**：工作副本 → `ORIGINALS_DIR/<generated_filename>`
+6. **写入缩略图**：临时缩略图 → `THUMBNAIL_DIR/<pk>-thumbnail.webp`
+7. **写入归档文件**（如有）：
+   - 生成归档文件名：`generate_unique_filename(document, archive_filename=True)`
+   - 写入：归档 PDF → `ARCHIVE_DIR/<generated_archive_filename>`
+   - 计算归档 checksum：`compute_checksum(document.archive_path)`
+
+> **注意**：此时文件已写入磁盘但文件名尚未"最终确定"，因为 `document.save()` 后会重新计算。
+
+### 5.5 document.save() 触发文件名重算
+
+**代码位置**：`src/documents/consumer.py` L728-729
+
+```python
+# Don't save with the lock active. Saving will cause the file
+# renaming logic to acquire the lock as well.
+# This triggers things like file renaming
+document.save()
+```
+
+`post_save` 信号触发 `update_filename_and_move_files()`（`src/documents/signals/handlers.py` L434-668）：
+
+1. **检查文件名**：如果 `instance.filename` 为空，直接返回（避免消费初期触发）
+2. **获取 FileLock**：防止并发操作
+3. **刷新数据**：`instance.refresh_from_db()` — 确保获取最新状态
+4. **重新计算目标文件名**：`generate_filename(instance)`
+5. **文件名对比**：
+   - 如果目标文件名 == 当前文件名：仅更新 `modified` 时间，返回
+   - 如果目标文件名 != 当前文件名：需要移动文件
+6. **验证移动合法性**：不允许移出 `ORIGINALS_DIR` / `ARCHIVE_DIR`，目标文件不能已存在
+7. **执行移动**：`shutil.move(old_source_path, instance.source_path)`
+8. **直接更新数据库**：用 `Document.objects.filter(pk=instance.pk).update(...)` 避免无限递归
+9. **清理空目录**：删除移动后遗留的空子目录
+
+> **关键洞察**：文件名生成了两次！
+> - 第一次在 `FileLock` 内（L671）：只是为了把文件放到一个临时位置
+> - 第二次在 `post_save` 处理器中：才是真正的最终位置
+> - 如果 `FILENAME_FORMAT` 包含通信方/标签等动态字段，信号处理器的修改会影响最终位置
+
+### 5.6 版本更新信号
+
+**代码位置**：`src/documents/consumer.py` L731-735
+
+如果是已有文档的新版本，发送 `document_updated` 信号：
+- `run_workflows_updated`：执行"文档更新"触发的工作流
+- `send_websocket_document_updated`：发送 WebSocket 通知
+
+### 5.7 删除临时文件
+
+**代码位置**：`src/documents/consumer.py` L737-758
+
+事务内的最后一步：
+1. 删除原始输入文件：`self.input_doc.original_file.unlink()`
+2. 删除工作副本：`self.working_copy.unlink()`
+3. 删除未修改的原始文件（如有）：`self.unmodified_original.unlink()`
+4. 删除 macOS 资源分支文件：`._filename`
+
+至此事务结束。如果以上所有步骤成功，数据库事务提交。
+
+### 5.8 Post-consume 脚本（事务外）
+
+**代码位置**：`src/documents/consumer.py` L769
+
+```python
+self.run_post_consume_script(document)
+```
+
+**关键**：此步骤在 `transaction.atomic()` 块**之外**执行。
+
+- 如果脚本执行失败，`_fail()` 会抛出异常，但**文档已经成功消费**（事务已提交）
+- 脚本通过环境变量接收完整文档信息：
 
 ```
 DOCUMENT_ID, DOCUMENT_TYPE, DOCUMENT_CREATED, DOCUMENT_MODIFIED,
@@ -337,29 +440,39 @@ DOCUMENT_THUMBNAIL_URL, DOCUMENT_OWNER, DOCUMENT_CORRESPONDENT,
 DOCUMENT_TAGS, DOCUMENT_ORIGINAL_FILENAME, TASK_ID
 ```
 
-### 5.5 document_consumption_finished 信号
+### 5.9 流程时序总结
 
-在 `transaction.atomic()` 内发送，以下处理器同步执行（[apps.py#L24](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/apps.py#L24-L31)）：
+```
+transaction.atomic() 开始
+├─ _store() → 创建 Document 记录，filename=None
+│   └─ document.save() → post_save 触发但 filename 为空直接返回
+│
+├─ document_consumption_finished 信号
+│   ├─ add_inbox_tags
+│   ├─ set_correspondent  ← 修改 document 属性，影响后续文件名
+│   ├─ set_document_type
+│   ├─ set_tags
+│   ├─ set_storage_path
+│   ├─ add_to_index
+│   ├─ run_workflows_added
+│   └─ add_or_update_document_in_llm_index
+│
+├─ FileLock(MEDIA_LOCK)
+│   ├─ generate_unique_filename() → 第一次生成文件名
+│   ├─ 写入原始文件、缩略图、归档文件
+│   └─ document.filename = generated_filename  ← 设置文件名
+│
+├─ document.save()
+│   └─ post_save → update_filename_and_move_files()
+│       ├─ generate_filename() → 第二次生成（最终）文件名
+│       ├─ 如果有变化：shutil.move() 移动文件
+│       └─ 直接 update 数据库
+│
+└─ 删除临时文件
+transaction.atomic() 结束
 
-| 处理器 | 作用 |
-|---|---|
-| `add_inbox_tags` | 为文档添加标记为"收件箱"的标签 |
-| `set_correspondent` | 用分类器 + 规则匹配自动设置通信方 |
-| `set_document_type` | 用分类器 + 规则匹配自动设置文档类型 |
-| `set_tags` | 用分类器 + 规则匹配自动设置标签 |
-| `set_storage_path` | 用分类器 + 规则匹配自动设置存储路径 |
-| `add_to_index` | 写入 Whoosh/Tantivy 搜索索引 |
-| `run_workflows_added` | 执行"文档添加"触发的工作流（可含 Assignment/Removal/Email/Webhook/MoveToTrash 动作） |
-| `add_or_update_document_in_llm_index` | 写入 LLM 向量索引 |
-
-### 5.6 文件重命名与移动
-
-`document.save()` 触发 `post_save` 信号 → `update_filename_and_move_files()`（[handlers.py#L434](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/signals/handlers.py#L434-L668)）：
-
-1. 根据 `FILENAME_FORMAT` 和文档最新元数据生成目标文件名
-2. 如果文件名有变化，在 `FileLock` 保护下移动文件
-3. 同时处理原始文件和归档文件的移动
-4. 清理移动后遗留的空目录
+run_post_consume_script()  ← 事务外执行
+```
 
 ---
 
