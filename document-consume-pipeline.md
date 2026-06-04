@@ -350,26 +350,41 @@ document_consumption_finished.send(
 
 > **关键**：这些处理器会直接修改 `document` 对象的属性（通信方、标签、存储路径等），这些修改会影响**后续的文件名生成**。如果工作流包含 `MoveToTrash` 动作，文档会被移到回收站但消费流程继续。
 
-### 5.4 文件写入磁盘
+### 5.4 文件写入磁盘（初次放置）
 
 **代码位置**：`src/documents/consumer.py` L670-725
 
-在 `FileLock(settings.MEDIA_LOCK)` 保护下写入文件：
+在 `FileLock(settings.MEDIA_LOCK)` 保护下写入文件。此时 document 已包含信号处理器设置的属性（通信方、标签、存储路径等），文件名基于这些属性生成。
 
-1. **生成初始文件名**：`generate_unique_filename(document)` — 此时 document 已包含信号处理器设置的属性
-2. **长度检查**：如果文件名超过 255 字符，回退到默认命名
-3. **`document.filename = generated_filename`** — 设置文件名到 Document 对象
-4. **创建目录**：`create_source_path_directory(document.source_path)`
-5. **写入原始文件**：工作副本 → `ORIGINALS_DIR/<generated_filename>`
-6. **写入缩略图**：临时缩略图 → `THUMBNAIL_DIR/<pk>-thumbnail.webp`
-7. **写入归档文件**（如有）：
-   - 生成归档文件名：`generate_unique_filename(document, archive_filename=True)`
-   - 写入：归档 PDF → `ARCHIVE_DIR/<generated_archive_filename>`
-   - 计算归档 checksum：`compute_checksum(document.archive_path)`
+#### 原始文件
 
-> **注意**：此时文件已写入磁盘但文件名尚未"最终确定"，因为 `document.save()` 后会重新计算。
+1. **`generate_unique_filename(document)`**：生成原始文件的唯一文件名
+   - 返回 `Path` 对象，相对路径（不含 `ORIGINALS_DIR` 前缀）
+   - 内部调用 `generate_filename(document)` 渲染模板，如果目标路径已有同名文件则加 `_01`、`_02` 后缀
+2. **长度检查**：如果文件名超过 `Document.MAX_STORED_FILENAME_LENGTH`（255），回退到 `generate_filename(document, use_format=False)` 即纯数字 ID 命名
+3. **`document.filename = generated_filename`**：设置到 Document 对象
+4. **创建目录**：`create_source_path_directory(document.source_path)` — 递归创建父目录
+5. **写入**：`self._write(source, document.source_path)` — 将工作副本写入 `ORIGINALS_DIR/<generated_filename>`
 
-### 5.5 document.save() 触发文件名重算
+#### 缩略图
+
+6. **写入**：`self._write(thumbnail, document.thumbnail_path)` — 写入 `THUMBNAIL_DIR/<pk:07>.webp`
+   - 缩略图路径由 `Document.thumbnail_path` 属性计算（`src/documents/models.py` L479-484），固定格式 `{pk:07}.webp`，无模板渲染
+
+#### 归档文件（如有）
+
+7. **`generate_unique_filename(document, archive_filename=True)`**：生成归档文件名
+   - 优先尝试 `<原始文件名stem>.pdf`（与原始文件同目录结构），仅当目标不存在时使用
+   - 冲突时同样加 `_01`、`_02` 后缀
+8. **长度检查**：同原始文件的回退策略
+9. **`document.archive_filename = generated_archive_filename`**：设置到 Document 对象
+10. **创建目录**：`create_source_path_directory(document.archive_path)`
+11. **写入**：`self._write(archive_path, document.archive_path)` — 写入 `ARCHIVE_DIR/<generated_archive_filename>`
+12. **计算归档 checksum**：`compute_checksum(document.archive_path)` → 存入 `document.archive_checksum`
+
+> **注意**：此时 `document` 对象上 `filename` 和 `archive_filename` 已设置但**尚未 save 到数据库**，文件名尚未"最终确定"。
+
+### 5.5 document.save() 触发文件名重算与移动
 
 **代码位置**：`src/documents/consumer.py` L728-729
 
@@ -380,24 +395,87 @@ document_consumption_finished.send(
 document.save()
 ```
 
-`post_save` 信号触发 `update_filename_and_move_files()`（`src/documents/signals/handlers.py` L434-668）：
+特意在 `FileLock` 释放**之后**才 save，因为 `post_save` 信号处理器 `update_filename_and_move_files()` 也会获取同一个 `MEDIA_LOCK`，如果在锁内 save 会死锁。
 
-1. **检查文件名**：如果 `instance.filename` 为空，直接返回（避免消费初期触发）
-2. **获取 FileLock**：防止并发操作
-3. **刷新数据**：`instance.refresh_from_db()` — 确保获取最新状态
-4. **重新计算目标文件名**：`generate_filename(instance)`
-5. **文件名对比**：
-   - 如果目标文件名 == 当前文件名：仅更新 `modified` 时间，返回
-   - 如果目标文件名 != 当前文件名：需要移动文件
-6. **验证移动合法性**：不允许移出 `ORIGINALS_DIR` / `ARCHIVE_DIR`，目标文件不能已存在
-7. **执行移动**：`shutil.move(old_source_path, instance.source_path)`
-8. **直接更新数据库**：用 `Document.objects.filter(pk=instance.pk).update(...)` 避免无限递归
-9. **清理空目录**：删除移动后遗留的空子目录
+`post_save` 信号触发 `update_filename_and_move_files()`（`src/documents/signals/handlers.py` L434-668），执行**文件名重算和文件移动**：
+
+#### 5.5.1 前置检查
+
+- 如果 `instance.filename` 为空 → 直接返回（消费初期 `_store()` 中的 save 会走此路径，不执行任何移动）
+
+#### 5.5.2 原始文件名重算
+
+1. **获取 FileLock**：防止并发操作
+2. **刷新数据**：`instance.refresh_from_db()` — 等锁期间可能有其他更新
+3. **计算候选文件名**：`generate_filename(instance)` — 重新渲染模板
+4. **长度检查**：超过 255 字符 → 抛出 `CannotMoveFilesException`
+5. **冲突判断**（三路分支）：
+
+   | 条件 | 处理 |
+   |---|---|
+   | `candidate == old_filename` | 文件名未变，不需要移动 |
+   | `candidate_source_path 已存在` 且 `!= old_source_path` | 检查旧文件是否已不在 + 目标文件 checksum 是否匹配：若是则 `original_already_moved=True`（文件已就位）；若否则调用 `generate_unique_filename()` 加后缀 |
+   | 其他 | 使用候选文件名（正常路径） |
+
+6. **决定是否移动**：`move_original = (old_filename != new_filename) and not original_already_moved`
+
+#### 5.5.3 归档文件名重算（与原始文件逻辑对称）
+
+1. **计算候选文件名**：`generate_filename(instance, archive_filename=True)` — 归档文件扩展名固定 `.pdf`
+2. **长度检查**：同上
+3. **冲突判断**：与原始文件完全对称的三路分支，包括 `archive_already_moved` 标志
+4. **决定是否移动**：`move_archive = (old_archive_filename != new_archive_filename) and not archive_already_moved`
+
+#### 5.5.4 快速路径：无需移动
+
+如果 `move_original` 和 `move_archive` 都为 False：
+- 用 `Document.objects.filter(pk=instance.pk).update(**updates)` 直接更新数据库（不用 `save()` 避免无限递归）
+- 返回
+
+#### 5.5.5 执行移动
+
+```
+if move_original:
+    validate_move(instance, old_source_path, instance.source_path, ORIGINALS_DIR)
+    create_source_path_directory(instance.source_path)
+    shutil.move(old_source_path, instance.source_path)
+
+if move_archive:
+    validate_move(instance, old_archive_path, instance.archive_path, ARCHIVE_DIR)
+    create_source_path_directory(instance.archive_path)
+    shutil.move(old_archive_path, instance.archive_path)
+```
+
+`validate_move()` 的三个安全检查（`src/documents/signals/handlers.py` L444-463）：
+
+| 检查 | 条件 | 结果 |
+|---|---|---|
+| 路径逃逸 | `new_path` 不在 `root` 下 | 抛出 `CannotMoveFilesException` |
+| 源文件不存在 | `old_path` 不是文件 | 抛出 `CannotMoveFilesException`（`logger.fatal`） |
+| 目标文件已存在 | `new_path` 已是文件 | 抛出 `CannotMoveFilesException` |
+
+移动完成后，用 `Document.global_objects.filter(pk=instance.pk).update(...)` 更新数据库中的 `filename`、`archive_filename` 和 `modified`（不用 `save()` 避免递归），并清除文档缓存。
+
+#### 5.5.6 失败回滚
+
+如果移动过程中抛出 `OSError`、`DatabaseError` 或 `CannotMoveFilesException`：
+
+1. **尝试回移文件**：
+   - 如果原始文件已移到新位置且新位置文件存在 → `shutil.move(instance.source_path, old_source_path)`
+   - 如果归档文件已移到新位置且新位置文件存在 → `shutil.move(instance.archive_path, old_archive_path)`
+   - 回移本身失败则忽略（文件不会丢失，只是留在新位置，由 sanity checker 处理）
+2. **恢复内存中的文件名**：`instance.filename = old_filename`，`instance.archive_filename = old_archive_filename`
+
+#### 5.5.7 清理空目录
+
+无论成功还是失败，最后检查旧路径的父目录是否为空，递归向上删除空目录（直到到达 `ORIGINALS_DIR` / `ARCHIVE_DIR` 根目录为止）。
 
 > **关键洞察**：文件名生成了两次！
-> - 第一次在 `FileLock` 内（L671）：只是为了把文件放到一个临时位置
-> - 第二次在 `post_save` 处理器中：才是真正的最终位置
-> - 如果 `FILENAME_FORMAT` 包含通信方/标签等动态字段，信号处理器的修改会影响最终位置
+> - **第一次**：`ConsumerPlugin.run()` 中 `FileLock` 内（L671），调用 `generate_unique_filename()` — 把文件放到初始位置
+> - **第二次**：`post_save` 处理器中，调用 `generate_filename()` — 重算最终位置并移动
+> - 两次生成的文件名通常相同，但如果信号处理器修改了 document 属性（如 `set_storage_path` 改变了存储路径模板），第二次生成结果可能不同，文件会被移动到新位置
+
+> **归档文件特殊逻辑**：`generate_unique_filename(doc, archive_filename=True)` 优先尝试 `<原始文件stem>.pdf` 作为归档文件名（`src/documents/file_handling.py` L68-82），保持原始文件与归档文件名的一致性，只有当此名称冲突时才走 `generate_filename()` + 计数器后缀
 
 ### 5.6 版本更新信号
 
@@ -444,7 +522,7 @@ DOCUMENT_TAGS, DOCUMENT_ORIGINAL_FILENAME, TASK_ID
 
 ```
 transaction.atomic() 开始
-├─ _store() → 创建 Document 记录，filename=None
+├─ _store() → 创建 Document 记录，filename=None, archive_filename=None
 │   └─ document.save() → post_save 触发但 filename 为空直接返回
 │
 ├─ document_consumption_finished 信号
@@ -452,26 +530,133 @@ transaction.atomic() 开始
 │   ├─ set_correspondent  ← 修改 document 属性，影响后续文件名
 │   ├─ set_document_type
 │   ├─ set_tags
-│   ├─ set_storage_path
+│   ├─ set_storage_path   ← 可能改变存储路径模板
 │   ├─ add_to_index
 │   ├─ run_workflows_added
 │   └─ add_or_update_document_in_llm_index
 │
-├─ FileLock(MEDIA_LOCK)
-│   ├─ generate_unique_filename() → 第一次生成文件名
-│   ├─ 写入原始文件、缩略图、归档文件
-│   └─ document.filename = generated_filename  ← 设置文件名
+├─ FileLock(MEDIA_LOCK)   ← 第一次获取锁
+│   ├─ generate_unique_filename(document)          → 原始文件初始文件名
+│   ├─ document.filename = generated_filename
+│   ├─ _write(working_copy, document.source_path)  → ORIGINALS_DIR/...
+│   ├─ _write(thumbnail, document.thumbnail_path)  → THUMBNAIL_DIR/<pk>.webp
+│   ├─ generate_unique_filename(document, archive_filename=True)  → 归档文件初始文件名
+│   ├─ document.archive_filename = generated_archive_filename
+│   ├─ _write(archive_path, document.archive_path) → ARCHIVE_DIR/...
+│   └─ document.archive_checksum = compute_checksum(...)
 │
-├─ document.save()
+├─ document.save()   ← FileLock 已释放后才 save（避免死锁）
 │   └─ post_save → update_filename_and_move_files()
-│       ├─ generate_filename() → 第二次生成（最终）文件名
-│       ├─ 如果有变化：shutil.move() 移动文件
-│       └─ 直接 update 数据库
+│       ├─ FileLock(MEDIA_LOCK)   ← 第二次获取锁
+│       ├─ generate_filename(instance)             → 重算原始文件名
+│       ├─ 冲突判断：三路分支（相同/已存在/正常）
+│       ├─ generate_filename(instance, archive=True) → 重算归档文件名
+│       ├─ 冲突判断：三路分支（相同/已存在/正常）
+│       ├─ 如需移动：validate_move() → shutil.move()
+│       ├─ Document.objects.filter(pk=...).update()  ← 避免 save() 递归
+│       └─ delete_empty_directories()
 │
-└─ 删除临时文件
+└─ 删除临时文件（original_file, working_copy, unmodified_original, ._shadow）
 transaction.atomic() 结束
 
 run_post_consume_script()  ← 事务外执行
+```
+
+---
+
+## 六、文件路径与命名机制详解
+
+### 6.1 文件路径属性
+
+`Document` 模型上的路径属性（`src/documents/models.py` L431-484）都是动态计算的，由数据库中存储的相对文件名拼接根目录得到：
+
+| 属性 | 计算方式 | 数据库字段 | 根目录 |
+|---|---|---|---|
+| `source_path` | `ORIGINALS_DIR / filename` | `filename` | `ORIGINALS_DIR` |
+| `archive_path` | `ARCHIVE_DIR / archive_filename` | `archive_filename` | `ARCHIVE_DIR` |
+| `thumbnail_path` | `THUMBNAIL_DIR / {pk:07}.webp` | 无（固定规则） | `THUMBNAIL_DIR` |
+
+当 `filename` 或 `archive_filename` 为空时，`source_path` 回退为 `ORIGINALS_DIR / {pk:07}{file_type}`。
+
+### 6.2 文件名生成的两层函数
+
+**`generate_filename()`**（`src/documents/file_handling.py` L125-185）：核心渲染函数
+
+```
+输入: document, counter=0, archive_filename=False, use_format=True
+输出: Path（相对路径）
+```
+
+1. **确定模板来源**（按优先级）：
+   - `document.storage_path.path`（文档级存储路径模板）
+   - `settings.FILENAME_FORMAT`（全局模板，先转换为新语法）
+   - 无模板 → 使用 `{pk:07}` 数字命名
+2. **渲染模板**：通过 Jinja2 模板引擎，注入文档上下文（`src/documents/templating/filepath.py` L345-412）：
+   - 基础元数据：title、correspondent、document_type、asn、owner_username、original_name、doc_pk
+   - 日期：created_year/month/day、added_year/month/day 等
+   - 标签：tag_list、tag_name_list
+   - 自定义字段：custom_fields（按字段名索引，含 type 和 value）
+   - 空值统一替换为 `-none-` 占位符
+3. **安全检查**：`_is_safe_relative_path()` — 拒绝绝对路径和 `..` 遍历
+4. **后处理**：
+   - `FILENAME_FORMAT_REMOVE_NONE=True` 时删除 `-none-` 占位符及多余分隔符
+5. **拼装最终路径**：`{rendered_path.stem}{version_suffix}{counter_str}{filetype_str}`
+   - `version_suffix`：版本文档添加 `_v{index}`
+   - `counter_str`：冲突时添加 `_01`、`_02`
+   - `filetype_str`：原始文件用 `doc.file_type`（如 `.pdf`、`.png`），归档文件固定 `.pdf`
+
+**`generate_unique_filename()`**（`src/documents/file_handling.py` L44-99）：冲突解决包装器
+
+```
+输入: doc, archive_filename=False
+输出: Path（相对路径，保证不与现有文件冲突）
+```
+
+1. **归档文件快捷路径**：如果 `archive_filename=True` 且 `doc.filename` 存在，先尝试 `{原始文件stem}.pdf`（保持同名），目标不存在则直接返回
+2. **循环检测冲突**：从 `counter=0` 开始调用 `generate_filename(doc, counter=counter)`，检查 `(root / new_filename).exists()`
+   - 如果文件名与当前文件名相同 → 返回（未改变）
+   - 如果目标文件已存在 → counter++ 重试
+   - 如果目标文件不存在 → 返回
+
+### 6.3 原始文件 vs 归档文件的命名差异
+
+| 方面 | 原始文件 | 归档文件 |
+|---|---|---|
+| 根目录 | `ORIGINALS_DIR` | `ARCHIVE_DIR` |
+| 数据库字段 | `filename` | `archive_filename` |
+| 扩展名 | 保留原始扩展名（`.pdf`、`.png` 等） | 固定 `.pdf` |
+| 快捷命名 | 无 | 优先 `<原始文件stem>.pdf`（`file_handling.py` L68-82） |
+| 冲突检测 | `ORIGINALS_DIR / name` 是否存在 | `ARCHIVE_DIR / name` 是否存在 |
+| 版本后缀 | `_v{index}`（仅版本文档） | `_v{index}`（仅版本文档） |
+| 上下文文档 | 版本文档使用 `root_document` 渲染模板 | 同原始文件 |
+
+### 6.4 两阶段文件名生成对比
+
+| 阶段 | 调用函数 | 目的 | 冲突处理 |
+|---|---|---|---|
+| 初次放置（5.4） | `generate_unique_filename()` | 把文件写到磁盘 | 循环加 counter 直到文件名不冲突 |
+| 重算移动（5.5） | `generate_filename()` | 计算目标位置 | 三路分支判断（相同/已存在/新路径） |
+
+> 两阶段设计的核心原因：初次放置时 `document.filename` 为 None，需要先生成一个文件名才能写入文件；写入后 save 触发 `update_filename_and_move_files()`，此函数**依赖 `filename` 不为空**才执行（L465-474 的守卫条件）。如果文件名在信号处理器后发生了变化（如存储路径改变），文件会被移动到正确位置。
+
+### 6.5 文件移动的完整生命周期
+
+```
+消费时：
+  临时文件 ──write──→ ORIGINALS_DIR/<第一次生成的文件名>  (5.4)
+                       │
+                       └──save──→ post_save → 5.5 重算
+                                    │
+                                    ├─ 文件名相同 → 不移动
+                                    ├─ 文件名不同 → validate_move() → shutil.move()
+                                    │                ORIGINALS_DIR/<旧> → ORIGINALS_DIR/<新>
+                                    └─ 冲突       → generate_unique_filename() 加后缀
+
+后续编辑时（用户修改通信方/标签/存储路径）：
+  Document.save() → post_save → update_filename_and_move_files()
+                                    │
+                                    ├─ 原始文件：ORIGINALS_DIR/<旧> → ORIGINALS_DIR/<新>
+                                    └─ 归档文件：ARCHIVE_DIR/<旧>   → ARCHIVE_DIR/<新>
 ```
 
 ---
