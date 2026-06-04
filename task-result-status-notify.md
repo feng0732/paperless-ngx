@@ -345,20 +345,75 @@ status_mgr.send_documents_deleted(delete_ids)
 
 ### 5.4 链路③：任务列表（REST API）
 
-**后端写入路径**（按代码顺序）：
+#### 后端写入路径（按代码顺序）：
 
 1. `consume_file` 函数 return `ConsumeFileSuccessResult(document_id=document.pk)`
 2. Celery 触发 `task_postrun` signal → [task_postrun_handler](src/documents/signals/handlers.py#L1165-L1223)
 3. 更新 `PaperlessTask` 记录：`status=SUCCESS`, `date_done=now`, `duration_seconds=...`, `result_data={"document_id": N}`
 4. DB 持久化完成
 
-**前端读取路径**：
+#### 前端读取与触发机制：
+
+**不是单纯轮询**：`TasksService.reload()` 并非通过定时器周期性调用，而是**由 WebSocket 事件被动触发**。
+
+触发源在 [AppComponent.ngOnInit()](src-ui/src/app/app.component.ts#L76-L136) 中，订阅了三个 WebSocket Subject，每个事件到达时都调用 `tasksService.reload()`：
+
+| WebSocket Subject | 触发时机 | 调用 |
+|---|---|---|
+| `onDocumentConsumptionFinished()` | 消费成功（status=SUCCESS） | `tasksService.reload()` |
+| `onDocumentConsumptionFailed()` | 消费失败（status=FAILED） | `tasksService.reload()` |
+| `onDocumentDetected()` | 开始消费（status=STARTED） | `tasksService.reload()` |
+
+**读取流程**：
 
 1. [TasksService.reload()](src-ui/src/app/services/tasks.service.ts#L69-L86) 发起 `GET /api/tasks/?acknowledged=false&page_size=1000`
+   - 内置防抖：`if (this.loading) return` 防止并发请求
 2. 响应经 [TaskSerializerV10](src/documents/serialisers.py#L2442-L2484) 序列化后返回
 3. 前端更新 `fileTasks` 数组，组件可访问 `completedFileTasks` / `failedFileTasks` 等过滤视图
 
-**关键**：这条链路依赖前端主动轮询，是最晚到达的通知方式，但它提供了最完整的状态数据（包括 result_data 中的 document_id / duplicate_of 等结构化结果）。
+#### 时序边界问题：SUCCESS 进度 vs task_postrun 写入
+
+**关键发现**：WebSocket SUCCESS 消息在 `consume_file` return **之前**就已发送，但 `PaperlessTask` 的最终状态写入在 return **之后** 才发生。
+
+**Worker 端代码顺序**（[consumer.py](src/documents/consumer.py#L769-L784)）：
+
+```
+L769  self.run_post_consume_script(document)        # 执行消费后脚本
+L773  self._send_progress(100, 100, SUCCESS, ...)  # ← 阻塞发送 WebSocket 消息
+       → ProgressManager.send_progress()
+         → async_to_sync(channel_layer.group_send)  # 同步阻塞直到 Redis 确认
+L782  document.refresh_from_db()                    # 从 DB 刷新文档
+L784  return ConsumeFileSuccessResult(...)          # ← 函数返回
+       ↓ （Celery 框架接管）
+       Celery task_postrun signal 触发
+       → task_postrun_handler 更新 PaperlessTask status=SUCCESS  # ← DB 写入在此
+```
+
+**前端接收顺序**：
+
+1. WebSocket `status_update(SUCCESS)` 到达 AppComponent → 立即触发 `tasksService.reload()`
+2. HTTP GET `/api/tasks/` 请求发往后端
+3. **竞态窗口**：请求到达时，`task_postrun` handler 可能还没完成 DB 写入
+4. 响应返回，更新 `fileTasks`
+
+**实际影响**：
+- 由于 `group_send` 是同步阻塞调用，消息已确认到达 Redis，但 WebSocket 消息从 Redis → Channels Consumer → 前端 → HTTP GET 请求往返有网络延迟
+- 本地环境下通常 DB 写入比网络往返快，reload 能读到最新状态
+- 理论上存在极小概率：HTTP 请求在 DB 写入之前到达，读到的仍是 STARTED 状态
+- 设计容错：即使第一次 reload 没读到 SUCCESS，用户进入 /tasks 页面时会再次调用 reload 确保数据最新
+
+**DocumentListComponent 的独立行为**：
+
+[DocumentListComponent.ngOnInit()](src-ui/src/app/components/document-list/document-list.component.ts#L262-L272) 也订阅了 WebSocket 事件，但它调用的是文档列表服务的 reload，不是 TasksService：
+
+| WebSocket Subject | 调用 | 作用 |
+|---|---|---|
+| `onDocumentConsumptionFinished()` | `this.list.reload()` | 刷新文档列表（DocumentListViewService） |
+| `onDocumentDeleted()` | `this.list.reload()` | 刷新文档列表 |
+
+两个组件独立工作：`AppComponent` 负责刷新任务列表，`DocumentListComponent` 负责刷新文档内容列表。
+
+**关键**：这条链路是事件驱动的"准实时"更新（而非定时轮询），但依赖于 WebSocket 消息与 DB 写入的时序竞态。它提供了最完整的状态数据（包括 result_data 中的 document_id / duplicate_of 等结构化结果）。
 
 ### 5.5 上传流程 (UploadDocumentsService)
 
@@ -465,59 +520,63 @@ interface WebsocketProgressMessage {
 ### 6.1 新建文档消费
 
 ```
-前端                        Django API              Celery Broker          Celery Worker                  WebSocket
- │                            │                         │                      │                             │
- │─ POST /documents/post_document/ ─→│                    │                      │                             │
- │                            │── apply_async() ──────→│                      │                             │
- │←── Response(task_id) ─────│                         │                      │                             │
- │                            │                         │                      │                             │
- │                            │   [before_task_publish] │                      │                             │
- │                            │   创建 PaperlessTask    │                      │                             │
- │                            │   status=PENDING        │                      │                             │
- │                            │                         │                      │                             │
- │                            │                         │── 消息分发 ─────────→│                             │
- │                            │                         │                      │                             │
- │                            │                         │   [task_prerun]      │                             │
- │                            │                         │   PaperlessTask      │                             │
- │                            │                         │   status=STARTED     │                             │
- │                            │                         │                      │                             │
- │                            │                         │   ConsumerPreflightPlugin                          │
- │                            │                         │   send_progress(0,100,STARTED)──→ channel_layer ──→│
- │←─────────────────────────────────────────────────────────────────────────────────── status_update ─────│
- │  FileStatus.phase=STARTED  │                         │                      │                             │
- │                            │                         │   ConsumerPlugin                                  │
- │                            │                         │   send_progress(20,100,WORKING)─→ channel_layer ──→│
- │←─────────────────────────────────────────────────────────────────────────────────── status_update ─────│
- │  FileStatus.phase=WORKING  │                         │                      │                             │
- │                            │                         │   ...70%...90%...95%│                             │
- │                            │                         │                      │                             │
- │                            │                         │   [事务内]                                       │
- │                            │                         │   document.save()                                  │
- │                            │                         │   document_consumption_finished.send()             │
- │                            │                         │     → add_inbox_tags, set_correspondent, ...       │
- │                            │                         │     → run_workflows_added → workflow actions       │
- │                            │                         │     → add_to_index, add_or_update_document_in_llm │
- │                            │                         │   （注意：这些 handler 不会触发 document_updated） │
- │                            │                         │                      │                             │
- │                            │                         │   [事务外]                                       │
- │                            │                         │   run_post_consume_script()                        │
- │                            │                         │   send_progress(100,100,SUCCESS) → channel_layer ─→│
- │←─────────────────────────────────────────────────────────────────────────────────── status_update ─────│  ← 链路①
- │  FileStatus.phase=SUCCESS  │                         │                      │                             │
- │  documentConsumptionFinishedSubject.next(status)      │                      │                             │
- │                            │                         │                      │                             │
- │                            │                         │   return ConsumeFileSuccessResult                  │
- │                            │                         │                      │                             │
- │                            │                         │   [task_postrun]     │                             │
- │                            │                         │   PaperlessTask      │                             │
- │                            │                         │   status=SUCCESS     │                             │
- │                            │                         │   result_data={document_id: N}                     │
- │                            │                         │                      │                             │
- │                            │                         │   （新建文档不触发 document_updated 信号）          │
- │                            │                         │   （前端不会收到 document_updated WebSocket 消息）  │
- │                            │                         │                      │                             │
- │─ GET /api/tasks/ ─────────→│                         │                      │                             │
- │←── PaperlessTask list ────│                         │                      │             ← 链路③         │
+前端 (AppComponent)           Django API              Celery Broker          Celery Worker                  WebSocket
+      │                          │                         │                      │                             │
+      │─ POST /documents/post_document/ ─→│                │                      │                             │
+      │                          │── apply_async() ──────→│                      │                             │
+      │←── Response(task_id) ───│                         │                      │                             │
+      │                          │                         │                      │                             │
+      │                          │   [before_task_publish] │                      │                             │
+      │                          │   创建 PaperlessTask    │                      │                             │
+      │                          │   status=PENDING        │                      │                             │
+      │                          │                         │                      │                             │
+      │                          │                         │── 消息分发 ─────────→│                             │
+      │                          │                         │                      │                             │
+      │                          │                         │   [task_prerun]      │                             │
+      │                          │                         │   PaperlessTask      │                             │
+      │                          │                         │   status=STARTED     │                             │
+      │                          │                         │                      │                             │
+      │                          │                         │   ConsumerPreflightPlugin                          │
+      │                          │                         │   send_progress(0,100,STARTED)──→ channel_layer ──→│
+      │←─────────────────────────────────────────────────────────────────────────────────── status_update(STARTED) ──│  ← 链路①
+      │  onDocumentDetected() 触发                                                     │                             │
+      │  └─ tasksService.reload() ─── GET /api/tasks/ ──→│                             │
+      │←──────────────────────────────────────────────────────────────────── PaperlessTask (STARTED) ←─│  ← 链路③
+      │                          │                         │                      │                             │
+      │                          │                         │   ConsumerPlugin                                  │
+      │                          │                         │   send_progress(20,100,WORKING)─→ channel_layer ──→│
+      │←─────────────────────────────────────────────────────────────────────────────────── status_update(WORKING) ──│
+      │  FileStatus.phase=WORKING│                         │                      │                             │
+      │                          │                         │   ...70%...90%...95%│                             │
+      │                          │                         │                      │                             │
+      │                          │                         │   [事务内]                                       │
+      │                          │                         │   document.save()                                  │
+      │                          │                         │   document_consumption_finished.send()             │
+      │                          │                         │     → add_inbox_tags, set_correspondent, ...       │
+      │                          │                         │     → run_workflows_added → workflow actions       │
+      │                          │                         │     → add_to_index, add_or_update_document_in_llm │
+      │                          │                         │   （注意：这些 handler 不会触发 document_updated） │
+      │                          │                         │                      │                             │
+      │                          │                         │   [事务外]                                       │
+      │                          │                         │   run_post_consume_script()                        │
+      │                          │                         │   send_progress(100,100,SUCCESS) → channel_layer ─→│
+      │←─────────────────────────────────────────────────────────────────────────────────── status_update(SUCCESS) ──│  ← 链路①
+      │  onDocumentConsumptionFinished() 触发                                           │                             │
+      │  └─ tasksService.reload() ─── GET /api/tasks/ ───→│  ╭───────────────╮  │                             │
+      │  ╭───────────────────────────────────────────────────────────────────────────  │  竞态窗口！     │  │                             │
+      │  │  ╰─ HTTP 请求可能在 task_postrun DB 写入之前到达  │  ╰───────────────╯  │                             │
+      │  │                       │                         │                      │                             │
+      │  │                       │                         │   return ConsumeFileSuccessResult                  │
+      │  │                       │                         │                      │                             │
+      │  │                       │                         │   [task_postrun]     │                             │
+      │  │                       │                         │   PaperlessTask      │                             │
+      │  │                       │                         │   status=SUCCESS     │                             │
+      │  │                       │                         │   result_data={document_id: N}                     │
+      │  ▼←────────────────────────────────────────────────────────────────── PaperlessTask ←──────────────────────────│  ← 链路③
+      │  （读到 SUCCESS / 仍读到 STARTED？取决于时序）     │                         │                      │                             │
+      │                          │                         │                      │                             │
+      │                          │                         │   （新建文档不触发 document_updated 信号）          │
+      │                          │                         │   （前端不会收到 document_updated WebSocket 消息）  │
 ```
 
 ### 6.2 新版本消费
@@ -548,18 +607,32 @@ Celery Worker                                                            WebSock
 
 ## 七、关键设计要点
 
-### 7.1 双通道并行
+### 7.1 事件驱动的双通道并行（非轮询）
 
 - **WebSocket**：细粒度实时进度（STARTED/WORKING/SUCCESS/FAILED + 百分比），只在消费期间推送
 - **REST /api/tasks/**：粗粒度任务状态 (PENDING/STARTED/SUCCESS/FAILURE/REVOKED)，可随时查询历史
 
-两者独立工作，WebSocket 断线不影响任务执行，前端仍可通过轮询 tasks API 获取最终状态。
+**关键修正**：REST API 不是"轮询"，而是**由 WebSocket 事件被动触发**。[AppComponent.ngOnInit()](src-ui/src/app/app.component.ts#L76-L136) 订阅了三个 WebSocket Subject，每次收到事件都调用 `tasksService.reload()`。
 
-### 7.2 Celery Signal 自动追踪
+两者独立工作，WebSocket 断线不影响任务执行，用户进入 /tasks 页面时会触发 reload 获取最终状态。
+
+### 7.2 AppComponent 与 DocumentListComponent 的职责分工
+
+两个组件都订阅 WebSocket 事件，但调用不同的 reload：
+
+| 组件 | 订阅的 Subject | 调用 | 作用 |
+|---|---|---|---|
+| AppComponent | `onDocumentDetected()` | `tasksService.reload()` | 刷新任务列表（侧边栏/TASKS 页面） |
+| AppComponent | `onDocumentConsumptionFinished()` | `tasksService.reload()` | 刷新任务列表 |
+| AppComponent | `onDocumentConsumptionFailed()` | `tasksService.reload()` | 刷新任务列表 |
+| DocumentListComponent | `onDocumentConsumptionFinished()` | `this.list.reload()` | 刷新文档内容列表 |
+| DocumentListComponent | `onDocumentDeleted()` | `this.list.reload()` | 刷新文档内容列表 |
+
+### 7.3 Celery Signal 自动追踪
 
 任务生命周期通过 5 个 Celery signal handler 自动同步到 DB，**业务代码无需手动更新 PaperlessTask**。[TRACKED_TASKS](src/documents/signals/handlers.py#L1005-L1017) 白名单控制哪些任务被追踪。
 
-### 7.3 权限过滤与边界分析
+### 7.4 权限过滤与边界分析
 
 #### 后端过滤逻辑
 
@@ -607,10 +680,29 @@ return (
 
 **实际影响**：由于后端是第一道过滤，消息在后端就被拦截，前端不会收到这些消息，所以**不会导致越权泄露**。前端 `canViewMessage` 只是防御性 fallback，防止后端过滤遗漏。但在无主文档场景下，后端过度严格 —— 非 superuser 的合法消费者无法通过 WebSocket 收到自己上传的无主文档进度（不过 Web/API 上传时 `owner_id` 必有值，此边界仅影响消费目录/邮件等无主场景）。
 
-### 7.4 消费流程 Plugin 化
+### 7.5 消费流程 Plugin 化
 
 `consume_file` 通过 Plugin 链顺序执行（ConsumerPreflightPlugin → AsnCheckPlugin → CollatePlugin → BarcodePlugin → AsnCheckPlugin → WorkflowTriggerPlugin → ConsumerPlugin），每个 Plugin 通过 `ProgressManager` 发送进度，实现了关注点分离。
 
-### 7.5 新建文档缺失 document_updated 通知
+### 7.6 SUCCESS 进度与 task_postrun 的时序竞态
+
+**关键时序发现**：WebSocket SUCCESS 消息在 `consume_file` return **之前**就已发送，但 `PaperlessTask` 的最终状态写入在 return **之后** 才发生。
+
+**Worker 端执行顺序**（[consumer.py](src/documents/consumer.py#L769-L784)）：
+
+1. `run_post_consume_script(document)` - 执行消费后脚本
+2. `_send_progress(100, 100, SUCCESS, ...)` - **阻塞发送** WebSocket 消息（`async_to_sync(group_send)` 同步执行）
+3. `document.refresh_from_db()` - 从 DB 刷新文档
+4. `return ConsumeFileSuccessResult(...)` - 函数返回
+5. Celery `task_postrun` signal 触发 → handler 更新 `PaperlessTask status=SUCCESS` ← **DB 写入在此**
+
+**竞态分析**：
+- `group_send` 是同步阻塞调用，消息已确认到达 Redis
+- 但 WebSocket 消息从 Redis → Channels Consumer → 前端 → HTTP GET 请求往返有网络延迟
+- 本地环境下通常 DB 写入比网络往返快，reload 能读到 SUCCESS 状态
+- 理论上存在极小概率：HTTP 请求在 DB 写入之前到达，读到的仍是 STARTED 状态
+- 设计容错：TasksService.reload() 内置 `if (this.loading) return` 防抖防止并发请求，用户进入 /tasks 页面也会再次 reload
+
+### 7.7 新建文档缺失 document_updated 通知
 
 新建文档消费成功后，`ConsumerPlugin.run()` 只发送 `status_update(SUCCESS)` 进度消息，**不发送** `document_updated` WebSocket 消息（因为 `document.root_document_id` 为 None，跳过了 `document_updated.send()` 调用）。前端文档列表的刷新依赖 `documentConsumptionFinishedSubject` 的订阅者处理，而非 `documentUpdatedSubject`。这是一个有意的设计选择：消费进度通知已经足以告知前端新文档创建成功。
