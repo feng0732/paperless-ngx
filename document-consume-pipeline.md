@@ -48,18 +48,18 @@
 
 ## 二、入口识别：文档如何进入系统
 
-文档有四种来源，对应 `DocumentSource` 枚举（[data_models.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/data_models.py#L150-L158)）：
+文档有四种来源，对应 `DocumentSource` 枚举（[data_models.py](src/documents/data_models.py#L150-L158)）：
 
 | 来源 | DocumentSource | 入口代码 | 触发方式 |
 |---|---|---|---|
-| 消费目录 | `ConsumeFolder (1)` | [document_consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/management/commands/document_consumer.py#L308-L353) | `watchfiles` 监听目录变化 |
-| API 上传 | `ApiUpload (2)` | [views.py#L3127](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/views.py#L3127-L3158) | REST API `POST /api/documents/post_document/` |
-| 邮件收取 | `MailFetch (3)` | [mail.py#L878](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless_mail/mail.py#L878-L905) | Celery 定时任务 `process_mail_accounts` |
-| Web UI 上传 | `WebUI (4)` | [views.py#L3127](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/views.py#L3127-L3158) | 前端拖拽/选择文件上传 |
+| 消费目录 | `ConsumeFolder (1)` | [document_consumer.py](src/documents/management/commands/document_consumer.py#L308-L353) | `watchfiles` 监听目录变化 |
+| API 上传 | `ApiUpload (2)` | [views.py#L3127](src/documents/views.py#L3127-L3158) | REST API `POST /api/documents/post_document/` |
+| 邮件收取 | `MailFetch (3)` | [mail.py#L878](src/paperless_mail/mail.py#L878-L905) | Celery 定时任务 `process_mail_accounts` |
+| Web UI 上传 | `WebUI (4)` | [views.py#L3127](src/documents/views.py#L3127-L3158) | 前端拖拽/选择文件上传 |
 
 ### 2.1 消费目录监听
 
-`document_consumer` 管理命令（[document_consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/management/commands/document_consumer.py)）是消费目录的守护进程，核心流程：
+`document_consumer` 管理命令（[document_consumer.py](src/documents/management/commands/document_consumer.py)）是消费目录的守护进程，核心流程：
 
 1. **启动时扫描**：`_process_existing_files()` 遍历目录中已有文件
 2. **持续监听**：通过 `watchfiles.watch()` 监听文件系统事件（原生 inotify/FSEvents 或轮询回退）
@@ -71,7 +71,7 @@
 
 ### 2.2 API / Web UI 上传
 
-两个入口共用 `post_document()` 视图（[views.py#L3127](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/views.py#L3127)）：
+两个入口共用 `post_document()` 视图（[views.py#L3127](src/documents/views.py#L3127)）：
 
 1. 上传文件写入 `SCRATCH_DIR` 下的临时文件
 2. 从请求参数构造 `DocumentMetadataOverrides`（可含 title、correspondent、tags 等预设元数据）
@@ -80,7 +80,7 @@
 
 ### 2.3 邮件收取
 
-`MailAccountFetcher.handle_mail_rule()` 处理邮件规则（[mail.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless_mail/mail.py)）：
+`MailAccountFetcher.handle_mail_rule()` 处理邮件规则（[mail.py](src/paperless_mail/mail.py)）：
 
 1. 连接 IMAP 邮箱，按规则过滤邮件
 2. 附件模式：逐个附件保存为临时文件，构造 `ConsumableDocument(source=MailFetch)`
@@ -89,14 +89,14 @@
 
 ### 2.4 核心数据模型
 
-- **`ConsumableDocument`**（[data_models.py#L162](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/data_models.py#L162-L188)）：封装待消费文件，包含来源、文件路径、关联邮件规则等。`__post_init__` 中自动解析绝对路径并检测 MIME 类型。
-- **`DocumentMetadataOverrides`**（[data_models.py#L13](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/data_models.py#L13-L99)）：携带元数据覆盖值（标题、通信方、标签、存储路径、自定义字段、权限等）。各插件可通过 `update()` 方法增量合并覆盖。
+- **`ConsumableDocument`**（[data_models.py#L162](src/documents/data_models.py#L162-L188)）：封装待消费文件，包含来源、文件路径、关联邮件规则等。`__post_init__` 中自动解析绝对路径并检测 MIME 类型。
+- **`DocumentMetadataOverrides`**（[data_models.py#L13](src/documents/data_models.py#L13-L99)）：携带元数据覆盖值（标题、通信方、标签、存储路径、自定义字段、权限等）。各插件可通过 `update()` 方法增量合并覆盖。
 
 ---
 
 ## 三、预处理：插件链逐步处理
 
-`consume_file` 任务（[tasks.py#L124](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/tasks.py#L124-L220)）是消费流水线的总调度。它按序实例化并执行插件链，每个插件遵循统一接口（[base.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/plugins/base.py#L23-L103)）：
+`consume_file` 任务（[tasks.py#L124](src/documents/tasks.py#L124-L220)）是消费流水线的总调度。它按序实例化并执行插件链，每个插件遵循统一接口（[base.py](src/documents/plugins/base.py#L23-L103)）：
 
 ```
 able_to_run → setup() → run() → cleanup()
@@ -109,7 +109,7 @@ able_to_run → setup() → run() → cleanup()
 
 ### 3.1 ConsumerPreflightPlugin — 预检
 
-代码：[consumer.py#L954](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/consumer.py#L954-L1054)
+代码：[consumer.py#L954](src/documents/consumer.py#L954-L1054)
 
 1. **`pre_check_file_exists()`**：确认文件仍然存在
 2. **`pre_check_duplicate()`**：计算文件 SHA256，在数据库中查找相同 checksum 的文档。如果 `CONSUMER_DELETE_DUPLICATES` 开启，直接删除重复文件并抛出 `ConsumeFileDuplicateError`
@@ -117,7 +117,7 @@ able_to_run → setup() → run() → cleanup()
 
 ### 3.2 AsnCheckPlugin — ASN 校验
 
-代码：[consumer.py#L1056](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/consumer.py#L1056-L1104)
+代码：[consumer.py#L1056](src/documents/consumer.py#L1056-L1104)
 
 检查 `metadata.asn`（档案序列号）：
 - 范围校验：必须在 `[1, 4294967295]` 范围内
@@ -127,7 +127,7 @@ able_to_run → setup() → run() → cleanup()
 
 ### 3.3 CollatePlugin — 双面扫描整理
 
-代码：[double_sided.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/double_sided.py)
+代码：[double_sided.py](src/documents/double_sided.py)
 
 仅当 `CONSUMER_ENABLE_COLLATE_DOUBLE_SIDED` 开启且文件位于配置的双面子目录时激活：
 
@@ -139,7 +139,7 @@ able_to_run → setup() → run() → cleanup()
 
 ### 3.4 BarcodePlugin — 条码识别与文档拆分
 
-代码：[barcodes.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/barcodes.py)
+代码：[barcodes.py](src/documents/barcodes.py)
 
 仅当条码功能开启且文件为 PDF/TIFF 时激活。处理流程：
 
@@ -159,7 +159,7 @@ able_to_run → setup() → run() → cleanup()
 
 ### 3.5 WorkflowTriggerPlugin — 消费阶段工作流
 
-代码：[consumer.py#L67](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/consumer.py#L67-L87)
+代码：[consumer.py#L67](src/documents/consumer.py#L67-L87)
 
 调用 `run_workflows(trigger_type=CONSUMPTION)`，匹配消费阶段的 Workflow：
 
@@ -171,7 +171,7 @@ able_to_run → setup() → run() → cleanup()
 
 ## 四、OCR 与解析：ConsumerPlugin 核心
 
-代码：[consumer.py#L246](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/consumer.py#L246-L784)
+代码：[consumer.py#L246](src/documents/consumer.py#L246-L784)
 
 这是消费流水线中工作量最大的插件，完整流程如下：
 
@@ -193,13 +193,13 @@ mime_type = magic.from_file(self.working_copy, mime=True)
 
 ### 4.3 解析器选择
 
-通过 `ParserRegistry`（[registry.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless/parsers/registry.py)）选择最合适的解析器：
+通过 `ParserRegistry`（[registry.py](src/paperless/parsers/registry.py)）选择最合适的解析器：
 
 1. 遍历所有注册解析器（第三方优先，然后内置）
 2. 检查 `supported_mime_types()` 是否包含当前 MIME 类型
 3. 调用 `score()` 获取优先级分数，分数最高者胜出
 
-内置解析器（[registry.py#L200](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless/parsers/registry.py#L200-L210)）：
+内置解析器（[registry.py#L200](src/paperless/parsers/registry.py#L200-L210)）：
 
 | 解析器 | 类名 | 支持的 MIME 类型 | 说明 |
 |---|---|---|---|
@@ -219,7 +219,7 @@ mime_type = magic.from_file(self.working_copy, mime=True)
 
 ### 4.5 解析与 OCR（RasterisedDocumentParser）
 
-代码：[tesseract.py#L494](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless/parsers/tesseract.py#L494-L659)
+代码：[tesseract.py#L494](src/paperless/parsers/tesseract.py#L494-L659)
 
 这是最核心的解析器，处理所有栅格化文档（PDF + 图片）。流程取决于 `OCR_MODE` 设置：
 
@@ -243,7 +243,7 @@ mime_type = magic.from_file(self.working_copy, mime=True)
 
 #### OCRmyPDF 调用参数
 
-`construct_ocrmypdf_parameters()`（[tesseract.py#L266](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless/parsers/tesseract.py#L266-L383)）构建参数字典，包括：
+`construct_ocrmypdf_parameters()`（[tesseract.py#L266](src/paperless/parsers/tesseract.py#L266-L383)）构建参数字典，包括：
 
 - 语言、输出类型（pdfa/pdfa-1/pdfa-2/pdfa-3/pdf）
 - OCR 模式（force_ocr / redo_ocr / skip_text）
@@ -269,7 +269,7 @@ OCRmyPDF 运行完成后，文本提取优先级：
 
 ### 4.6 归档文件生成决策
 
-`should_produce_archive()`（[consumer.py#L124](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/consumer.py#L124-L189)）决定是否生成归档 PDF：
+`should_produce_archive()`（[consumer.py#L124](src/documents/consumer.py#L124-L189)）决定是否生成归档 PDF：
 
 | 条件 | 是否生成归档 |
 |---|---|
@@ -661,21 +661,24 @@ run_post_consume_script()  ← 事务外执行
 
 ---
 
-## 六、关键文件索引
+## 七、关键文件索引
 
 | 文件 | 职责 |
 |---|---|
-| [tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/tasks.py#L124) | `consume_file` Celery 任务，插件链总调度 |
-| [consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/consumer.py) | `ConsumerPlugin`（核心消费）、`ConsumerPreflightPlugin`、`AsnCheckPlugin`、`WorkflowTriggerPlugin` |
-| [barcodes.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/barcodes.py) | `BarcodePlugin` 条码识别与文档拆分 |
-| [double_sided.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/double_sided.py) | `CollatePlugin` 双面扫描整理 |
-| [data_models.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/data_models.py) | `ConsumableDocument`、`DocumentMetadataOverrides` |
-| [plugins/base.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/plugins/base.py) | 插件接口定义、`StopConsumeTaskError` |
-| [parsers.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/parsers.py) | 旧版 `DocumentParser` 基类、缩略图工具函数 |
-| [registry.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless/parsers/registry.py) | `ParserRegistry` 解析器注册与选择 |
-| [tesseract.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless/parsers/tesseract.py) | `RasterisedDocumentParser` OCR 核心实现 |
-| [text.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless/parsers/text.py) | `TextDocumentParser` 纯文本解析器 |
-| [document_consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/management/commands/document_consumer.py) | 消费目录监听管理命令 |
-| [mail.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/paperless_mail/mail.py) | 邮件收取与消费任务投递 |
-| [handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/signals/handlers.py) | 消费完成后的信号处理器（自动分类、工作流、索引） |
-| [apps.py](file:///d:/fz/0601/solo-dogfeeding/code/26-paperless-ngx/src/documents/apps.py) | 信号连接注册 |
+| [tasks.py](src/documents/tasks.py#L124) | `consume_file` Celery 任务，插件链总调度 |
+| [consumer.py](src/documents/consumer.py) | `ConsumerPlugin`（核心消费）、`ConsumerPreflightPlugin`、`AsnCheckPlugin`、`WorkflowTriggerPlugin` |
+| [barcodes.py](src/documents/barcodes.py) | `BarcodePlugin` 条码识别与文档拆分 |
+| [double_sided.py](src/documents/double_sided.py) | `CollatePlugin` 双面扫描整理 |
+| [data_models.py](src/documents/data_models.py) | `ConsumableDocument`、`DocumentMetadataOverrides` |
+| [plugins/base.py](src/documents/plugins/base.py) | 插件接口定义、`StopConsumeTaskError` |
+| [parsers.py](src/documents/parsers.py) | 旧版 `DocumentParser` 基类、缩略图工具函数 |
+| [registry.py](src/paperless/parsers/registry.py) | `ParserRegistry` 解析器注册与选择 |
+| [tesseract.py](src/paperless/parsers/tesseract.py) | `RasterisedDocumentParser` OCR 核心实现 |
+| [text.py](src/paperless/parsers/text.py) | `TextDocumentParser` 纯文本解析器 |
+| [document_consumer.py](src/documents/management/commands/document_consumer.py) | 消费目录监听管理命令 |
+| [mail.py](src/paperless_mail/mail.py) | 邮件收取与消费任务投递 |
+| [handlers.py](src/documents/signals/handlers.py) | 信号处理器：自动分类、工作流、索引、文件名重算与移动 |
+| [apps.py](src/documents/apps.py) | 信号连接注册 |
+| [file_handling.py](src/documents/file_handling.py) | `generate_filename()`、`generate_unique_filename()` 文件名生成 |
+| [filepath.py](src/documents/templating/filepath.py) | Jinja2 模板渲染文件路径、安全校验 |
+| [models.py](src/documents/models.py#L431-L484) | `Document.source_path`、`archive_path`、`thumbnail_path` 属性 |
