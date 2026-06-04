@@ -681,4 +681,5 @@ run_post_consume_script()  ← 事务外执行
 | [apps.py](src/documents/apps.py) | 信号连接注册 |
 | [file_handling.py](src/documents/file_handling.py) | `generate_filename()`、`generate_unique_filename()` 文件名生成 |
 | [filepath.py](src/documents/templating/filepath.py) | Jinja2 模板渲染文件路径、安全校验 |
+| [utils.py](src/documents/utils.py#L147-L169) | `compute_checksum()` SHA-256 哈希计算 |
 | [models.py](src/documents/models.py#L431-L484) | `Document.source_path`、`archive_path`、`thumbnail_path` 属性 |
