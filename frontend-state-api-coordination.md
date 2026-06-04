@@ -1012,7 +1012,7 @@ replaceUrl: !this.router.routerState.snapshot.url.includes('?')
 | ID | 常量 | filtervar | isnull_filtervar | datatype | multi | 后端处理方式 |
 |----|------|-----------|-----------------|----------|-------|------------|
 | 0 | FILTER_TITLE | `title__icontains` | — | string | ✗ | 参数转换时被重写为 `title_search` → Tantivy TITLE（已废弃，保留兼容旧保存视图） |
-| 1 | FILTER_CONTENT | `content__icontains` | — | string | ✗ | ORM `icontains` |
+| 1 | FILTER_CONTENT | `content__icontains` | — | string | ✗ | `EffectiveContentFilter(lookup_expr="icontains")` → 优先 `effective_content`，回退 `content`（已废弃，前端不再生成） |
 | 2 | FILTER_ASN | `archive_serial_number` | — | number | ✗ | ORM `exact` |
 | 3 | FILTER_CORRESPONDENT | `correspondent__id` | `correspondent__isnull` | Correspondent | ✗ | ORM `exact` / `isnull` |
 | 4 | FILTER_DOCUMENT_TYPE | `document_type__id` | `document_type__isnull` | DocumentType | ✗ | ORM `exact` / `isnull` |
@@ -1030,7 +1030,7 @@ replaceUrl: !this.router.routerState.snapshot.url.includes('?')
 | 16 | FILTER_MODIFIED_AFTER | `modified__date__gt` | — | date | ✗ | ORM `gt` |
 | 17 | FILTER_DOES_NOT_HAVE_TAG | `tags__id__none` | — | Tag | ✓ | 自定义 `ObjectFilter(exclude=True)` |
 | 18 | FILTER_ASN_ISNULL | `archive_serial_number__isnull` | — | boolean | ✗ | ORM `isnull` |
-| 19 | FILTER_TITLE_CONTENT | `title_content` | — | string | ✗ | 参数转换时被重写为 `text` → Tantivy TEXT（已废弃，保留兼容旧保存视图） |
+| 19 | FILTER_TITLE_CONTENT | `title_content` | — | string | ✗ | 参数转换时被重写为 `text` → Tantivy TEXT（已废弃，保留兼容旧保存视图；如直接发 `title_content` 参数走 `TitleContentFilter` ORM 并输出警告日志） |
 | 20 | FILTER_FULLTEXT_QUERY | `query` | — | string | ✗ | → Tantivy `SearchMode.QUERY`（高级搜索语法） |
 | 21 | FILTER_FULLTEXT_MORELIKE | `more_like_id` | — | number | ✗ | → Tantivy `more_like_this_ids()`（单独分支，不走 `_get_tantivy_query_and_mode`） |
 | 22 | FILTER_HAS_TAGS_ANY | `tags__id__in` | — | Tag | ✓ | 自定义 `ObjectFilter(in_list=True)` |
@@ -1119,6 +1119,174 @@ if (rule.rule_type === FILTER_TITLE_CONTENT || rule.rule_type === FILTER_SIMPLE_
 2. Tantivy 执行全文搜索，返回匹配文档ID列表
 3. `intersect_and_order()` 将 Tantivy 结果与 `filtered_qs` 取交集 → 最终结果
 4. 排序由 Tantivy 或 ORM 决定（取决于 `use_tantivy_sort` 判断）
+
+#### 10.4.1 内容过滤器详解
+
+**文件**：[filters.py](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/filters.py#L171-L204)
+
+内容搜索有三条独立的后端路径，对应不同的HTTP参数：
+
+| HTTP参数 | 后端过滤器类 | 实现逻辑 | 来源 |
+|---------|-------------|---------|------|
+| `title_content` | `TitleContentFilter` | `Q(title__icontains=value) \| Q(effective_content__icontains=value)`，FieldError时回退 `content` | 旧版保存视图，使用时输出警告日志 |
+| `content__icontains` | `EffectiveContentFilter(lookup_expr="icontains")` | `effective_content__icontains=value`，FieldError时回退 `content` | FILTER_CONTENT(1)（前端不再生成） |
+| `content__istartswith` | `EffectiveContentFilter(lookup_expr="istartswith")` | `effective_content__istartswith=value` | DocumentFilterSet.fields 定义的自动过滤器 |
+| `content__iendswith` | `EffectiveContentFilter(lookup_expr="iendswith")` | `effective_content__iendswith=value` | 同上 |
+| `content__iexact` | `EffectiveContentFilter(lookup_expr="iexact")` | `effective_content__iexact=value` | 同上 |
+| `text` | 无（Tantivy） | 全文搜索：标题+内容，按词项匹配 | 前端 FILTER_SIMPLE_TEXT(49) |
+| `title_search` | 无（Tantivy） | 标题搜索，仅匹配 title 字段 | 前端 FILTER_SIMPLE_TITLE(48) |
+
+**EffectiveContentFilter 核心逻辑**：
+```python
+class EffectiveContentFilter(Filter):
+    def filter(self, qs, value):
+        value = value.strip() if isinstance(value, str) else value
+        if not value:
+            return qs
+        try:
+            return qs.filter(**{f"effective_content__{self.lookup_expr}": value})
+        except FieldError:
+            return qs.filter(**{f"content__{self.lookup_expr}": value})
+```
+- `effective_content` 是注解字段，包含原始内容 + AI提取内容
+- 无 AI 配置时 `effective_content` 不存在，自动回退到 `content` 字段
+- 4种 lookup_expr 复用同一 Filter 类
+
+**注意**：前端 `FILTER_CONTENT`(1) 的 filtervar 是 `content__icontains`，**没有**特殊分支拦截，会直接作为 `content__icontains` 发送到后端。但前端 FilterEditor 已不再生成此规则，仅用于兼容旧保存视图。
+
+#### 10.4.2 搜索入口真实结构
+
+**文件**：[views.py](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/views.py#L2233-L2451)
+
+`UnifiedSearchViewSet.list()` 中的搜索调用链结构如下：
+
+```
+list(request)
+    ├─ _is_search_request()?
+    │   └─ 否 → super().list(request)  # 纯ORM路径
+    │
+    └─ 是 → 搜索路径
+        ├─ parse_search_params()  # list()内部的嵌套函数
+        │   ├─ 互斥校验：len(active) > 1 → ValidationError
+        │   ├─ ordering_param = request.query_params.get("ordering", "")
+        │   ├─ sort_reverse = ordering_param.startswith("-")
+        │   ├─ sort_field_name = ordering_param.lstrip("-") or None
+        │   ├─ use_tantivy_sort = (
+        │   │       sort_field_name in TantivyBackend.SORTABLE_FIELDS
+        │   │       or sort_field_name is None
+        │   │       or sort_field_name == "score"
+        │   │   )
+        │   └─ 返回 SearchParams（命名元组）
+        │
+        ├─ backend = get_backend()
+        ├─ filtered_qs = self.filter_queryset(self.get_queryset())  # 先应用所有ORM筛选器
+        │
+        ├─ "more_like_id" in request.query_params?
+        │   ├─ 是 → run_more_like_this(backend, user, filtered_qs)
+        │   │   ├─ more_like_doc_id = _get_more_like_id(params, user)  # 权限校验
+        │   │   ├─ all_ids = backend.more_like_this_ids(doc_id, user=user)
+        │   │   ├─ ordered_ids = intersect_and_order(all_ids, filtered_qs, use_tantivy_sort=True)
+        │   │   └─ 分页 + 构造 stub SearchHit（score=0.0，无高亮）
+        │   │
+        │   └─ 否 → run_text_search(backend, user, filtered_qs)
+        │       ├─ query_str, search_mode = _get_tantivy_query_and_mode(params)
+        │       ├─ is_score_sort = sort_field_name == "score"
+        │       ├─ all_ids = backend.search_ids(
+        │       │       query_str,
+        │       │       user=user,
+        │       │       sort_field=None if (not use_tantivy_sort or is_score_sort) else sort_field_name,
+        │       │       sort_reverse=sort_reverse,
+        │       │       search_mode=search_mode,
+        │       │   )
+        │       ├─ ordered_ids = intersect_and_order(all_ids, filtered_qs, use_tantivy_sort=use_tantivy_sort)
+        │       ├─ if is_score_sort and not sort_reverse: ordered_ids.reverse()  # 升序score
+        │       └─ 分页 + backend.highlight_hits() → SearchHit
+        │
+        ├─ get_paginated_response(hits)
+        └─ 结果序列化 → 返回
+
+```
+
+**关键细节**：
+1. `parse_search_params()` 是在 `list()` 方法内部 `def` 的嵌套函数，不是类方法
+2. `filtered_qs` 是在进入搜索分支**之前**就通过 `self.filter_queryset()` 生成的，包含所有ORM筛选条件（权限过滤、标签、通讯员等）
+3. `more_like_id` 分支硬编码 `use_tantivy_sort=True`，始终按相似度排序
+4. `use_tantivy_sort=False` 且非score排序时，传给 `backend.search_ids()` 的 `sort_field=None`，Tantivy按相关性返回，然后在 `intersect_and_order` 中被ORM重排序
+
+#### 10.4.3 Tantivy 与 ORM 交集排序详解
+
+**文件**：[views.py](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/views.py#L2299-L2323)
+
+`intersect_and_order()` 是搜索结果排序的核心函数，根据 `use_tantivy_sort` 标志决定最终排序来源：
+
+```python
+def intersect_and_order(all_ids: list[int], filtered_qs: QuerySet[Document], *, use_tantivy_sort: bool) -> list[int]:
+    if not all_ids:
+        return []
+    if use_tantivy_sort:
+        # 模式A：保留Tantivy排序（相关性 / Tantivy字段排序）
+        if len(all_ids) <= _TANTIVY_INTERSECT_THRESHOLD:  # 5000
+            # 小结果集：pk__in 查询，避免全表扫描
+            visible_ids = set(filtered_qs.filter(pk__in=all_ids).values_list("pk", flat=True))
+        else:
+            # 大结果集：全表扫描 + Python集合交集（SQLite优化）
+            visible_ids = set(filtered_qs.values_list("pk", flat=True))
+        # 关键：按 Tantivy 返回的 all_ids 顺序过滤，保留 Tantivy 排序
+        return [doc_id for doc_id in all_ids if doc_id in visible_ids]
+    # 模式B：ORM重排序（丢失Tantivy排序）
+    # 直接过滤 + ORM排序，返回的是ORM查询结果的顺序
+    return list(filtered_qs.filter(id__in=all_ids).values_list("pk", flat=True))
+```
+
+**use_tantivy_sort 的判断条件** [views.py#L2277-L2281](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/views.py#L2277-L2281)：
+```python
+use_tantivy_sort = (
+    sort_field_name in TantivyBackend.SORTABLE_FIELDS
+    or sort_field_name is None
+    or sort_field_name == "score"
+)
+```
+
+**TantivyBackend.SORTABLE_FIELDS** [_backend.py#L268-L277](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/search/_backend.py#L268-L277)：
+```python
+SORTABLE_FIELDS: frozenset[str] = frozenset({
+    "created",
+    "added",
+    "modified",
+    "archive_serial_number",
+    "page_count",
+    "num_notes",
+})
+```
+- 文本字段（`title`、`correspondent__name`、`document_type__name`）被排除，因为 Tantivy 的分词 fast 字段排序与 ORM 基于 collation 的排序不一致
+- 这些字段排序时 `use_tantivy_sort=False`，走模式B，ORM重排序
+
+**交集阈值 `_TANTIVY_INTERSECT_THRESHOLD = 5_000`** [views.py#L265](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/views.py#L265)：
+- ≤5000 条：`pk__in=all_ids` 精准查询，性能好
+- >5000 条：SQLite 对大 IN 子句性能差，改为全表扫描 + Python 集合交集
+- PostgreSQL 处理大 IN 子句高效，此阈值主要保护 SQLite 用户
+
+**score 排序的特殊处理** [views.py#L2352-L2353](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/views.py#L2352-L2353)：
+```python
+if is_score_sort and not sort_reverse:
+    ordered_ids = list(reversed(ordered_ids))
+```
+- Tantivy 默认按分数从高到低返回（best-first）
+- `ordering=-score`（降序）：无需反转
+- `ordering=score`（升序）：需要反转结果，分数从低到高
+
+**两种排序模式对比表**：
+
+| use_tantivy_sort | 排序来源 | 交集实现 | 适用场景 |
+|------------------|---------|---------|---------|
+| `True` | Tantivy 返回的 all_ids 顺序（相关性 / 日期字段） | 按 all_ids 顺序逐个过滤 visible_ids | score排序、created/added等数值字段排序 |
+| `False` | ORM 排序（collation 文本排序） | `filter(id__in=all_ids)` 后走 ORM order_by | title、correspondent__name 等文本字段排序 |
+
+**边界场景**：
+- 搜索 "invoice" 并按 `correspondent__name` 排序 → `use_tantivy_sort=False` → ORM重排序，丢失相关性
+- 搜索 "invoice" 并按 `created` 排序 → `use_tantivy_sort=True` → Tantivy按created排序，保留顺序
+- 搜索 "invoice" 不指定排序 → `use_tantivy_sort=True`（sort_field_name is None）→ 相关性排序
+- 搜索 "invoice" 并按 `score` 升序 → `use_tantivy_sort=True` + 反转 → 最低相关性在前
 
 ### 10.5 旧版规则自动升级
 
