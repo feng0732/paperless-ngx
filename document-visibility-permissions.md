@@ -283,15 +283,25 @@ def get_serializer_class(self):
     return DocumentSerializer
 ```
 
-### 4.2 Tantivy 搜索层与 ORM 层的职责划分
+### 4.2 三种过滤机制的职责划分
 
-搜索结果经过两个独立的过滤系统后取交集。两层的职责不同：
+搜索请求的过滤涉及三种机制，需要区分它们各自的职责范围：
 
-**Tantivy 搜索层**负责：查询匹配 + 权限过滤
-- 解析用户查询字符串，在索引中搜索匹配文档
-- 应用权限过滤（owner_id / viewer_id），排除不可见文档
-- 返回按相关性排序的匹配文档ID列表
-- **不处理业务过滤条件**（标签、对应方、日期等不在索引查询中）
+**机制一：Tantivy 索引字段查询**——由用户搜索查询字符串驱动
+
+Tantivy 索引中存储了 tag、correspondent、document_type、owner、custom_fields 等字段，用户可以通过搜索查询语法在索引中直接过滤，例如 `tag:foo`、`correspondent:alice`、`created:[2024-01-01 TO 2024-12-31]`：
+
+```python
+# search/_query.py
+# tag:foo,bar → tag:foo AND tag:bar（逗号扩展）
+def normalize_query(query):
+    def _expand(m):
+        field = m.group(1)
+        values = [v.strip() for v in m.group(2).split(",") if v.strip()]
+        return " AND ".join(f"{field}:{v}" for v in values)
+```
+
+索引字段查询和权限过滤在 Tantivy 中以 Must 布尔查询组合：
 
 ```python
 # search/_backend.py
@@ -299,23 +309,45 @@ def _apply_permission_filter(self, query, user):
     if user is not None:
         permission_filter = build_permission_filter(self._schema, user)
         return tantivy.Query.boolean_query([
-            (tantivy.Occur.Must, query),           # 用户查询
+            (tantivy.Occur.Must, query),            # 用户查询（含字段语法）
             (tantivy.Occur.Must, permission_filter), # 权限过滤
         ])
     return query  # user=None 时跳过权限过滤（超级用户）
 ```
 
-**ORM 层**负责：权限兜底 + 业务过滤 + 软删除过滤
-- 调用 `self.filter_queryset(self.get_queryset())` 一次性执行所有 filter_backends
-- `ObjectOwnedOrGrantedPermissionsFilter` 提供权限兜底
-- `DjangoFilterBackend` + `DocumentFilterSet` 应用业务条件
-- `Document.objects.all()` 默认排除软删除文档（`deleted_at__isnull=True` 在 `_permitted_document_ids` 中，但不在默认 queryset 中；实际上 `Document.objects.all()` 不含软删除过滤，需要 `filtered_qs` 的其他条件来保证）
+**机制二：DRF 查询参数过滤**——由 URL query_params 驱动
+
+DRF 查询参数（如 `tags__id__all=1,2`、`correspondent__id=5`、`created__date__gte=2024-01-01`）由 `DjangoFilterBackend` + `DocumentFilterSet` 在 ORM 层处理。这些过滤条件与 Tantivy 索引字段查询是**独立的**：即使 Tantivy 已经通过 `tag:foo` 过滤了，ORM 层仍会根据 `tags__id__all` 再次过滤。
+
+**机制三：ORM 交集裁剪**——确保最终结果同时满足搜索层和数据库层
+
+`intersect_and_order` 将 Tantivy 搜索结果与 ORM 可见范围取交集：
 
 ```python
 # views.py
+# filtered_qs 已经过所有 DRF filter_backends 处理
+# 包含：权限过滤 + DRF 查询参数过滤 + 软删除排除（Document.objects 默认行为）
 filtered_qs = self.filter_queryset(self.get_queryset())
 user = None if request.user.is_superuser else request.user
+
+# Tantivy 搜索结果 = 索引字段查询匹配 + 权限过滤
+all_ids = backend.search_ids(query_str, user=user, ...)
+
+# 交集：同时满足搜索层和 ORM 层的所有条件
+ordered_ids = intersect_and_order(all_ids, filtered_qs, ...)
 ```
+
+**三种机制的协作关系**：
+
+| 维度 | Tantivy 索引字段查询 | DRF 查询参数过滤 | ORM 交集裁剪 |
+|-----|---------------------|-----------------|-------------|
+| 触发方式 | 搜索查询字符串（如 `tag:foo`） | URL query_params（如 `tags__id__all=1`） | 自动（搜索请求必经） |
+| 执行位置 | 搜索索引 | 数据库 | Python 侧 |
+| 过滤内容 | 全文匹配 + 字段语法 + 权限 | 业务条件 + 权限 | 搜索结果 ∩ ORM 可见范围 |
+| 软删除 | 不处理（索引可能残留） | 自动排除（`Document.objects` 默认行为） | 交集时自动排除 |
+| 作用 | 搜索匹配 + 初步权限过滤 | 业务过滤 + 权限兜底 | 确保两层结果一致 |
+
+**关于软删除**：`Document` 继承 `SoftDeleteModel`，`Document.objects` 管理器默认排除 `deleted_at IS NOT NULL` 的文档。文档软删除时会调用 `get_backend().remove(doc_id)` 从 Tantivy 索引中移除，但如果索引更新存在延迟，Tantivy 可能短暂包含已删除文档。ORM 交集的 `filtered_qs` 基于 `Document.objects.all()`，自动排除软删除文档，因此交集结果不会包含已删除文档。这个兜底来自 `Document.objects` 的默认管理器行为，而非 `_permitted_document_ids` 中的 `deleted_at__isnull=True`（后者仅用于关联计数场景）
 
 ### 4.3 交集裁剪的核心算法
 
@@ -384,9 +416,9 @@ def _get_more_like_id(query_params, user):
 - 分页准确：搜索结果的分页总数基于权限过滤后的文档集计算，不会出现"总数显示100条但实际只能看到30条"的不一致
 
 **ORM 层过滤的必要性**：
-- 业务条件过滤：标签、对应方、日期等业务过滤条件由 `DjangoFilterBackend` + `DocumentFilterSet` 在数据库层处理，Tantivy 索引查询不包含这些条件
+- DRF 查询参数过滤：标签ID、对应方ID、日期范围等由 `DjangoFilterBackend` + `DocumentFilterSet` 在数据库层处理，Tantivy 索引字段查询语法（如 `tag:foo`）和 DRF 查询参数（如 `tags__id__all=1`）是两套独立的过滤机制，DRF 查询参数仅在 ORM 层生效
 - 权限兜底：如果搜索索引的权限数据（`owner_id`、`viewer_id`）与数据库不同步（索引更新延迟），ORM 层仍能保证安全边界
-- 软删除排除：`_permitted_document_ids` 中包含 `deleted_at__isnull=True` 条件，确保索引中残留的已删除文档不会出现
+- 软删除排除：`Document.objects` 管理器默认排除软删除文档，即使 Tantivy 索引短暂残留已删除文档，交集也会将其排除
 
 ---
 
@@ -526,16 +558,19 @@ response.data["selection_data"] = self._get_selection_data_for_queryset(
 [参数解析] parse_search_params() 提取查询条件、排序方式、分页参数
     ↓
 [ORM 可见范围] filter_queryset() 执行所有 filter_backends
-  → 得到权限过滤 + 业务过滤后的 queryset
+  ├─ DjangoFilterBackend: DRF 查询参数过滤（tags__id__all 等）
+  ├─ ObjectOwnedOrGrantedPermissionsFilter: 权限过滤
+  └─ Document.objects 默认排除软删除文档
+  → 得到权限过滤 + DRF 查询参数过滤后的 queryset
     ↓
 [Tantivy 搜索]
-  ├─ _parse_query() 解析用户查询
+  ├─ _parse_query() 解析用户查询（含索引字段语法如 tag:foo）
   ├─ _apply_permission_filter() 叠加权限过滤
   │   └─ build_permission_filter() 构建 owner/viewer 条件
   └─ 返回按相关性排序的匹配文档 ID 列表
     ↓
 [交集裁剪] intersect_and_order() 取搜索结果与 ORM 可见范围的交集
-  → 搜索层过滤权限，ORM层过滤权限+业务条件，交集确保两者都满足
+  → 确保同时满足：索引字段查询 + 权限过滤 + DRF 查询参数 + 软删除排除
     ↓
 [分页切片] 计算当前页文档 ID
     ↓
@@ -587,14 +622,14 @@ WHERE id IN (SELECT id FROM documents WHERE owner_id = X OR owner_id IS NULL OR 
 
 ### 7.4 为什么搜索层和 ORM 层的过滤职责不同？
 
-**搜索层仅做权限过滤**：Tantivy 索引中存储了 `owner_id` 和 `viewer_id` 字段，权限过滤可以在索引层高效完成，但索引中不包含完整的业务过滤语义（标签、对应方、自定义字段查询等仍需数据库处理）。
+**搜索层处理索引字段查询 + 权限过滤**：Tantivy 索引中存储了 tag、correspondent、document_type、owner_id、viewer_id 等字段，用户可以通过搜索查询语法（如 `tag:foo`、`correspondent:alice`）在索引中直接过滤，权限过滤也在此层完成。
 
-**ORM 层做权限兜底 + 业务过滤 + 软删除过滤**：
+**ORM 层处理 DRF 查询参数 + 权限兜底 + 软删除排除**：
+- DRF 查询参数：标签ID（`tags__id__all`）、对应方ID（`correspondent__id`）、日期范围等由 `DjangoFilterBackend` + `DocumentFilterSet` 处理，这些条件与 Tantivy 索引字段查询是独立的两套机制
 - 权限兜底：防止索引权限数据不同步
-- 业务过滤：标签、对应方、日期等复杂过滤条件在数据库中生效
-- 软删除：`_permitted_document_ids` 包含 `deleted_at__isnull=True`，确保索引中残留的已删除文档不会出现
+- 软删除排除：`Document.objects` 默认管理器自动排除软删除文档
 
-交集的结果是：最终返回的文档**同时满足**搜索层权限、ORM层权限、ORM层业务条件三层约束。
+交集的结果是：最终返回的文档同时满足 Tantivy 搜索层（索引字段查询 + 权限过滤）和 ORM 层（DRF 查询参数 + 权限兜底 + 软删除排除）的所有约束。
 
 ---
 
@@ -604,7 +639,7 @@ WHERE id IN (SELECT id FROM documents WHERE owner_id = X OR owner_id IS NULL OR 
 |-----|---------|---------|
 | **普通列表** | `ObjectOwnedOrGrantedPermissionsFilter` | `owner=me OR owner IS NULL OR has_perm(view)` |
 | **详情查询** | `PaperlessObjectPermissions.has_object_permission` | `is_owner OR has_perm(view) OR owner IS NULL` |
-| **全文搜索** | Tantivy `build_permission_filter` + ORM 交集 | 搜索层权限过滤 + ORM层权限+业务过滤 + 交集裁剪 |
+| **全文搜索** | Tantivy 索引字段查询 + 权限过滤 + ORM 交集 | 索引字段查询 + 权限过滤 + DRF 查询参数 + 软删除排除 + 交集裁剪 |
 | **创建文档** | Django 模型权限 `add_document` | 无对象级检查 |
 | **修改文档** | `has_object_permission` | `is_owner OR has_perm(change)` |
 | **删除文档** | `has_object_permission` | `is_owner OR has_perm(delete)` |
