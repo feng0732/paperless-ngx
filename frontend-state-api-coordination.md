@@ -317,6 +317,9 @@ class DocumentFilterSet(FilterSet):
 ```python
 _TANTIVY_SEARCH_PARAM_NAMES = ("text", "title_search", "query", "more_like_id")
 
+def _get_active_search_params(self, request):
+    return [param for param in _TANTIVY_SEARCH_PARAM_NAMES if param in request.query_params]
+
 def _is_search_request(self):
     return bool(self._get_active_search_params())
 
@@ -326,7 +329,13 @@ def list(self, request, *args, **kwargs):
         return super().list(request)
     else:
         # 模式2：Tantivy全文搜索
-        return self._search_list(request)
+        # 注意：多个搜索参数互斥，len(active) > 1 会抛出 ValidationError
+        if "more_like_id" in request.query_params:
+            # 子分支A：more_like_this 独立处理
+            return run_more_like_this(backend, user, filtered_qs)
+        else:
+            # 子分支B：text/title_search/query 走 _get_tantivy_query_and_mode
+            return run_text_search(backend, user, filtered_qs)
 ```
 
 #### 模式1：ORM筛选（非搜索请求）
@@ -651,15 +660,21 @@ DocumentListViewService.setFilterRules(rules)
 
 ### 6.1 前端筛选规则 ↔ 后端参数映射表
 
-| 前端 rule_type | 前端 filtervar | 后端 FilterSet 字段 | 说明 |
-|---------------|----------------|---------------------|------|
-| 3 (FILTER_CORRESPONDENT) | `correspondent__id` | `correspondent__id` | 通讯员精确匹配 |
-| 22 (FILTER_HAS_TAGS_ANY) | `tags__id__in` | `tags__id__in` | 包含任一标签 |
-| 6 (FILTER_HAS_TAGS_ALL) | `tags__id__all` | `tags__id__all` | 包含所有标签 |
-| 27 (FILTER_DOES_NOT_HAVE_CORRESPONDENT) | `correspondent__id__none` | `correspondent__id__none` | 排除通讯员 |
-| 49 (FILTER_SIMPLE_TEXT) | `text` | 无（Tantivy） | 简单全文搜索 |
-| 20 (FILTER_FULLTEXT_QUERY) | `query` | 无（Tantivy） | 高级搜索查询 |
-| 21 (FILTER_FULLTEXT_MORELIKE) | `more_like_id` | 无（Tantivy） | 相似文档 |
+| 前端 rule_type | 定义 filtervar | 实际HTTP参数 | 后端接收方式 | 说明 |
+|---------------|----------------|-------------|------------|------|
+| 3 (FILTER_CORRESPONDENT) | `correspondent__id` | `correspondent__id` | FilterSet `exact` | 通讯员精确匹配 |
+| 22 (FILTER_HAS_TAGS_ANY) | `tags__id__in` | `tags__id__in` | `ObjectFilter(in_list=True)` | 包含任一标签 |
+| 6 (FILTER_HAS_TAGS_ALL) | `tags__id__all` | `tags__id__all` | `ObjectFilter`（逐个AND） | 包含所有标签 |
+| 27 (FILTER_DOES_NOT_HAVE_CORRESPONDENT) | `correspondent__id__none` | `correspondent__id__none` | `ObjectFilter(exclude=True)` | 排除通讯员 |
+| 0 (FILTER_TITLE) | `title__icontains` | `title_search` | Tantivy `SearchMode.TITLE` | 旧版规则，参数转换时被重写 |
+| 48 (FILTER_SIMPLE_TITLE) | `title_search` | `title_search` | Tantivy `SearchMode.TITLE` | 新版标题搜索 |
+| 19 (FILTER_TITLE_CONTENT) | `title_content` | `text` | Tantivy `SearchMode.TEXT` | 旧版规则，参数转换时被重写 |
+| 49 (FILTER_SIMPLE_TEXT) | `text` | `text` | Tantivy `SearchMode.TEXT` | 新版全文搜索 |
+| 20 (FILTER_FULLTEXT_QUERY) | `query` | `query` | Tantivy `SearchMode.QUERY` | 高级搜索语法 |
+| 21 (FILTER_FULLTEXT_MORELIKE) | `more_like_id` | `more_like_id` | `run_more_like_this` 分支 | 相似文档，独立处理路径 |
+| 38 (FILTER_HAS_CUSTOM_FIELDS_ALL) | `custom_fields__id__all` | 前端转42 | 后端保留 `ObjectFilter` | 前端自动转为42 |
+| 39 (FILTER_HAS_CUSTOM_FIELDS_ANY) | `custom_fields__id__in` | 前端转42 | 后端保留 `ObjectFilter(in_list=True)` | 前端自动转为42 |
+| 42 (FILTER_CUSTOM_FIELDS_QUERY) | `custom_field_query` | `custom_field_query` | `CustomFieldQueryFilter` | JSON表达式 |
 
 ### 6.2 排序字段映射
 
@@ -996,7 +1011,7 @@ replaceUrl: !this.router.routerState.snapshot.url.includes('?')
 
 | ID | 常量 | filtervar | isnull_filtervar | datatype | multi | 后端处理方式 |
 |----|------|-----------|-----------------|----------|-------|------------|
-| 0 | FILTER_TITLE | `title__icontains` | — | string | ✗ | ORM `icontains`（已废弃，保留兼容） |
+| 0 | FILTER_TITLE | `title__icontains` | — | string | ✗ | 参数转换时被重写为 `title_search` → Tantivy TITLE（已废弃，保留兼容旧保存视图） |
 | 1 | FILTER_CONTENT | `content__icontains` | — | string | ✗ | ORM `icontains` |
 | 2 | FILTER_ASN | `archive_serial_number` | — | number | ✗ | ORM `exact` |
 | 3 | FILTER_CORRESPONDENT | `correspondent__id` | `correspondent__isnull` | Correspondent | ✗ | ORM `exact` / `isnull` |
@@ -1015,9 +1030,9 @@ replaceUrl: !this.router.routerState.snapshot.url.includes('?')
 | 16 | FILTER_MODIFIED_AFTER | `modified__date__gt` | — | date | ✗ | ORM `gt` |
 | 17 | FILTER_DOES_NOT_HAVE_TAG | `tags__id__none` | — | Tag | ✓ | 自定义 `ObjectFilter(exclude=True)` |
 | 18 | FILTER_ASN_ISNULL | `archive_serial_number__isnull` | — | boolean | ✗ | ORM `isnull` |
-| 19 | FILTER_TITLE_CONTENT | `title_content` | — | string | ✗ | → URL参数 `text`（Tantivy，已废弃） |
-| 20 | FILTER_FULLTEXT_QUERY | `query` | — | string | ✗ | → Tantivy高级搜索 |
-| 21 | FILTER_FULLTEXT_MORELIKE | `more_like_id` | — | number | ✗ | → Tantivy相似文档 |
+| 19 | FILTER_TITLE_CONTENT | `title_content` | — | string | ✗ | 参数转换时被重写为 `text` → Tantivy TEXT（已废弃，保留兼容旧保存视图） |
+| 20 | FILTER_FULLTEXT_QUERY | `query` | — | string | ✗ | → Tantivy `SearchMode.QUERY`（高级搜索语法） |
+| 21 | FILTER_FULLTEXT_MORELIKE | `more_like_id` | — | number | ✗ | → Tantivy `more_like_this_ids()`（单独分支，不走 `_get_tantivy_query_and_mode`） |
 | 22 | FILTER_HAS_TAGS_ANY | `tags__id__in` | — | Tag | ✓ | 自定义 `ObjectFilter(in_list=True)` |
 | 23 | FILTER_ASN_GT | `archive_serial_number__gt` | — | number | ✗ | ORM `gt` |
 | 24 | FILTER_ASN_LT | `archive_serial_number__lt` | — | number | ✗ | ORM `lt` |
@@ -1032,13 +1047,13 @@ replaceUrl: !this.router.routerState.snapshot.url.includes('?')
 | 33 | FILTER_OWNER_ANY | `owner__id__in` | — | number | ✓ | ORM `in` |
 | 34 | FILTER_OWNER_ISNULL | `owner__isnull` | — | boolean | ✗ | ORM `isnull` |
 | 35 | FILTER_OWNER_DOES_NOT_INCLUDE | `owner__id__none` | — | number | ✓ | 自定义 `ObjectFilter(exclude=True)` |
-| 36 | FILTER_CUSTOM_FIELDS_TEXT | `custom_fields__icontains` | — | string | ✗ | ORM `icontains`（已废弃） |
-| 37 | FILTER_SHARED_BY_USER | `shared_by__id` | — | number | ✓ | 自定义过滤器 |
-| 38 | FILTER_HAS_CUSTOM_FIELDS_ALL | `custom_fields__id__all` | — | number | ✓ | 自定义（旧版，自动转42） |
-| 39 | FILTER_HAS_CUSTOM_FIELDS_ANY | `custom_fields__id__in` | — | number | ✓ | 自定义（旧版，自动转42） |
-| 40 | FILTER_DOES_NOT_HAVE_CUSTOM_FIELDS | `custom_fields__id__none` | — | number | ✓ | 自定义 `ObjectFilter(exclude=True)` |
-| 41 | FILTER_HAS_ANY_CUSTOM_FIELDS | `has_custom_fields` | — | boolean | ✗ | `BooleanFilter` |
-| 42 | FILTER_CUSTOM_FIELDS_QUERY | `custom_field_query` | — | string | ✗ | 自定义 `CustomFieldQueryFilter` |
+| 36 | FILTER_CUSTOM_FIELDS_TEXT | `custom_fields__icontains` | — | string | ✗ | 自定义 `CustomFieldsFilter`（已废弃，日志警告） |
+| 37 | FILTER_SHARED_BY_USER | `shared_by__id` | — | number | ✓ | 自定义 `SharedByUser` |
+| 38 | FILTER_HAS_CUSTOM_FIELDS_ALL | `custom_fields__id__all` | — | number | ✓ | `ObjectFilter(field_name="custom_fields__field")` 逐个AND（旧版，前端自动转42） |
+| 39 | FILTER_HAS_CUSTOM_FIELDS_ANY | `custom_fields__id__in` | — | number | ✓ | `ObjectFilter(field_name="custom_fields__field", in_list=True)`（旧版，前端自动转42） |
+| 40 | FILTER_DOES_NOT_HAVE_CUSTOM_FIELDS | `custom_fields__id__none` | — | number | ✓ | `ObjectFilter(field_name="custom_fields__field", exclude=True)` 逐个排除 |
+| 41 | FILTER_HAS_ANY_CUSTOM_FIELDS | `has_custom_fields` | — | boolean | ✗ | `BooleanFilter(field_name="custom_fields", lookup_expr="isnull", exclude=True)` 即"有自定义字段" |
+| 42 | FILTER_CUSTOM_FIELDS_QUERY | `custom_field_query` | — | string | ✗ | 自定义 `CustomFieldQueryFilter`（JSON表达式解析） |
 | 43 | FILTER_CREATED_TO | `created__date__lte` | — | date | ✗ | ORM `lte` |
 | 44 | FILTER_CREATED_FROM | `created__date__gte` | — | date | ✗ | ORM `gte` |
 | 45 | FILTER_ADDED_TO | `added__date__lte` | — | date | ✗ | ORM `lte` |
@@ -1049,19 +1064,27 @@ replaceUrl: !this.router.routerState.snapshot.url.includes('?')
 
 ### 10.2 参数转换中的特殊路由
 
-某些 `rule_type` 的 `filtervar` 与最终HTTP参数名不同，存在"二次路由"：
+某些 `rule_type` 的 `filtervar` 与最终HTTP参数名不同，在 [queryParamsFromFilterRules](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src-ui/src/app/utils/query-params.ts#L151-L188) 中被特殊分支拦截并重写：
 
-| rule_type | 定义中的 filtervar | 最终HTTP参数名 | 转换位置 |
+| rule_type | 定义中的 filtervar | 最终HTTP参数名 | 转换分支 |
 |-----------|-------------------|---------------|---------|
-| 19 (FILTER_TITLE_CONTENT) | `title_content` | `text` | [queryParamsFromFilterRules](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src-ui/src/app/utils/query-params.ts#L157-L160) |
-| 49 (FILTER_SIMPLE_TEXT) | `text` | `text` | [queryParamsFromFilterRules](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src-ui/src/app/utils/query-params.ts#L157-L160) |
-| 0 (FILTER_TITLE) | `title__icontains` | `title_search` | [queryParamsFromFilterRules](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src-ui/src/app/utils/query-params.ts#L161-L164) |
-| 48 (FILTER_SIMPLE_TITLE) | `title_search` | `title_search` | [queryParamsFromFilterRules](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src-ui/src/app/utils/query-params.ts#L161-L164) |
+| 19 (FILTER_TITLE_CONTENT) | `title_content` | `text` | 第157-160行：if-else 先于 filtervar 匹配 |
+| 49 (FILTER_SIMPLE_TEXT) | `text` | `text` | 第157-160行：同上分支，filtervar 恰好一致 |
+| 0 (FILTER_TITLE) | `title__icontains` | `title_search` | 第161-164行：if-else 先于 filtervar 匹配 |
+| 48 (FILTER_SIMPLE_TITLE) | `title_search` | `title_search` | 第161-164行：同上分支，filtervar 恰好一致 |
 
-**转换逻辑**：
-- `FILTER_TITLE_CONTENT`(19) 和 `FILTER_SIMPLE_TEXT`(49) → 都映射到 `text` 参数（Tantivy全文搜索）
-- `FILTER_TITLE`(0) 和 `FILTER_SIMPLE_TITLE`(48) → 都映射到 `title_search` 参数（Tantivy标题搜索）
-- 旧版 `FILTER_TITLE`(0) 使用ORM `title__icontains`，新版使用Tantivy `title_search`
+**关键代码逻辑**（[query-params.ts#L156-L165](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src-ui/src/app/utils/query-params.ts#L156-L165)）：
+
+```typescript
+// 这两个 if-else 分支在普通 filtervar 匹配之前执行，拦截了4种规则
+if (rule.rule_type === FILTER_TITLE_CONTENT || rule.rule_type === FILTER_SIMPLE_TEXT) {
+  params[SIMPLE_TEXT_PARAMETER] = rule.value     // → 'text'
+} else if (rule.rule_type === FILTER_TITLE || rule.rule_type === FILTER_SIMPLE_TITLE) {
+  params[SIMPLE_TITLE_PARAMETER] = rule.value    // → 'title_search'
+}
+```
+
+**注意**：FILTER_TITLE(0) 的 filtervar 虽然定义为 `title__icontains`，但**永远不会作为 `title__icontains` 发送到后端**，因为特殊分支会将其重写为 `title_search`。同样，FILTER_TITLE_CONTENT(19) 的 filtervar `title_content` 也不会被使用，而是被重写为 `text`。这两个旧规则仅在保存视图的数据库记录中保留原始 rule_type ID，参数转换时统一走新路径。
 
 ### 10.3 isnull 双参数规则
 
@@ -1077,36 +1100,47 @@ replaceUrl: !this.router.routerState.snapshot.url.includes('?')
 
 ### 10.4 后端Tantivy触发参数
 
-后端根据以下4个参数决定是否进入Tantivy搜索模式：
+后端在 [UnifiedSearchViewSet.list()](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/views.py#L2250-L2451) 中根据 `_TANTIVY_SEARCH_PARAM_NAMES = ("text", "title_search", "query", "more_like_id")` 判断是否进入搜索模式。但4个参数在后端的处理路径不同：
 
-| HTTP参数 | 对应前端规则 | Tantivy搜索模式 |
-|---------|------------|----------------|
-| `text` | FILTER_SIMPLE_TEXT(49) / FILTER_TITLE_CONTENT(19) | `SearchMode.TEXT`（全文+标题） |
-| `title_search` | FILTER_SIMPLE_TITLE(48) / FILTER_TITLE(0) | `SearchMode.TITLE`（仅标题） |
-| `query` | FILTER_FULLTEXT_QUERY(20) | `SearchMode.QUERY`（高级搜索语法） |
-| `more_like_id` | FILTER_FULLTEXT_MORELIKE(21) | `SearchMode.MORE_LIKE`（相似文档） |
+| HTTP参数 | 对应前端规则 | 判断方式 | 后端处理路径 |
+|---------|------------|---------|------------|
+| `text` | FILTER_SIMPLE_TEXT(49) / FILTER_TITLE_CONTENT(19) | `_get_tantivy_query_and_mode` | `SearchMode.TEXT` → `run_text_search` |
+| `title_search` | FILTER_SIMPLE_TITLE(48) / FILTER_TITLE(0) | `_get_tantivy_query_and_mode` | `SearchMode.TITLE` → `run_text_search` |
+| `query` | FILTER_FULLTEXT_QUERY(20) | `_get_tantivy_query_and_mode` | `SearchMode.QUERY` → `run_text_search` |
+| `more_like_id` | FILTER_FULLTEXT_MORELIKE(21) | 单独 `if "more_like_id" in request.query_params` | `_get_more_like_id()` → `run_more_like_this` |
+
+**重要细节**：
+1. `more_like_id` **不经过** `_get_tantivy_query_and_mode()`，而是在 `list()` 中通过 `if "more_like_id" in request.query_params` 单独判断，调用 `run_more_like_this()` 分支
+2. 四个参数**互斥**：后端在 `parse_search_params()` 中检查 `if len(active) > 1` 则抛出 `ValidationError`，提示"Specify only one of text, title_search, query, or more_like_id"
+3. `_get_tantivy_query_and_mode` 只处理前3个参数（text/title_search/query），优先级为 `text` > `title_search` > `query`
 
 **混合筛选行为**：当请求同时包含 Tantivy 参数和 ORM 参数时：
-1. Tantivy 先执行全文搜索，返回匹配文档ID列表
-2. ORM 参数作为 `filtered_qs` 对文档做二次筛选
-3. 两者取交集 → 最终结果
+1. 后端先调用 `self.filter_queryset(self.get_queryset())` 应用所有 ORM 筛选器，得到 `filtered_qs`
+2. Tantivy 执行全文搜索，返回匹配文档ID列表
+3. `intersect_and_order()` 将 Tantivy 结果与 `filtered_qs` 取交集 → 最终结果
 4. 排序由 Tantivy 或 ORM 决定（取决于 `use_tantivy_sort` 判断）
 
 ### 10.5 旧版规则自动升级
 
 **文件**：[query-params.ts](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src-ui/src/app/utils/query-params.ts#L60-L101)
 
-`transformLegacyFilterRules()` 会将旧版自定义字段规则自动转换为新的查询语法：
+`transformLegacyFilterRules()` 会将旧版自定义字段规则自动转换为新的查询语法。此转换**仅在前端参数转换阶段执行**，后端仍保留了原始过滤器的处理能力：
 
 ```
-旧规则: FILTER_HAS_CUSTOM_FIELDS_ANY(38) + value="5,8"
-    ↓ 自动转换
-新规则: FILTER_CUSTOM_FIELDS_QUERY(42) + value='["or",[["5","exists",true],["8","exists",true]]]'
-
-旧规则: FILTER_HAS_CUSTOM_FIELDS_ALL(39) + value="5,8"
-    ↓ 自动转换
+旧规则: FILTER_HAS_CUSTOM_FIELDS_ALL(38) + value="5,8"
+    ↓ 前端自动转换（transformLegacyFilterRules）
 新规则: FILTER_CUSTOM_FIELDS_QUERY(42) + value='["and",[["5","exists",true],["8","exists",true]]]'
+
+旧规则: FILTER_HAS_CUSTOM_FIELDS_ANY(39) + value="5,8"
+    ↓ 前端自动转换（transformLegacyFilterRules）
+新规则: FILTER_CUSTOM_FIELDS_QUERY(42) + value='["or",[["5","exists",true],["8","exists",true]]]'
 ```
+
+**后端兼容性**：虽然前端会自动将38/39转为42，但后端 [DocumentFilterSet](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src/documents/filters.py#L811-L821) 仍保留了 `custom_fields__id__all` 和 `custom_fields__id__in` 过滤器，可以独立工作。这意味着：
+- 如果直接构造 API 请求（绕过前端），`custom_fields__id__all=5,8` 仍然有效
+- 前端路径下，38/39 规则被转换后会被从 FilterRule 数组中移除（[query-params.ts#L98-L100](file:///d:/fz/0601/solo-dogfeeding/code/30-paperless-ngx/src-ui/src/app/utils/query-params.ts#L98-L100)）
+
+**注意**：`FILTER_DOES_NOT_HAVE_CUSTOM_FIELDS`(40) 和 `FILTER_HAS_ANY_CUSTOM_FIELDS`(41) **不参与**旧版转换（代码中有 TODO 注释），它们仍然使用原始的后端过滤器路径。
 
 ---
 
