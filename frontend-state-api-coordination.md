@@ -1148,8 +1148,8 @@ class EffectiveContentFilter(Filter):
         except FieldError:
             return qs.filter(**{f"content__{self.lookup_expr}": value})
 ```
-- `effective_content` 是注解字段，包含原始内容 + AI提取内容
-- 无 AI 配置时 `effective_content` 不存在，自动回退到 `content` 字段
+- `effective_content` 是查询集注解字段，优先取最新版本文档的内容，取不到时回退当前文档的 `content`
+- 查询集没有该注解或后端版本不支持该字段时，会捕获 `FieldError` 并改查 `content` 字段
 - 4种 lookup_expr 复用同一 Filter 类
 
 **注意**：前端 `FILTER_CONTENT`(1) 的 filtervar 是 `content__icontains`，**没有**特殊分支拦截，会直接作为 `content__icontains` 发送到后端。但前端 FilterEditor 已不再生成此规则，仅用于兼容旧保存视图。
