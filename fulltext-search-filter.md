@@ -158,41 +158,52 @@ get_backend().rebuild(documents, iter_wrapper=...)
 
 ### 2.2 Tantivy Schema 定义
 
-索引字段结构由 `src/documents/search/_schema.py` 中 `build_schema()` 构建。所有字段如下：
+索引字段结构由 `src/documents/search/_schema.py` 中 `build_schema()` 构建。
+
+**Tantivy API 默认值说明：** `add_text_field()` 和 `add_json_field()` 的 `indexed` 默认为 `True`（自动建倒排索引，可查询），`fast` 默认为 `False`；`add_unsigned_field()` 和 `add_date_field()` 的参数必须显式指定。代码注释和实际参数之间的差异已在校对时注明。
+
+所有字段如下（逐项与代码核对）：
 
 | 类别 | 字段名 | Tantivy 类型 | stored | indexed | fast | 分词器 | 说明 |
 |------|--------|-------------|--------|---------|------|--------|------|
 | 主键 | `id` | unsigned | ✓ | ✓ | ✓ | — | Django 主键 |
-| 校验和 | `checksum` | text | ✓ | — | — | raw | 原始文件 MD5 |
-| 全文搜索 | `title` | text | ✓ | — | — | paperless_text | 标题，2.0x 权重 |
-| 全文搜索 | `correspondent` | text | ✓ | — | — | paperless_text | 往来方名称 |
-| 全文搜索 | `document_type` | text | ✓ | — | — | paperless_text | 文档类型名 |
-| 全文搜索 | `storage_path` | text | ✓ | — | — | paperless_text | 存储路径名 |
-| 全文搜索 | `original_filename` | text | ✓ | — | — | paperless_text | 原始文件名 |
-| 全文搜索 | `content` | text | ✓ | — | — | paperless_text | OCR 正文 |
-| 排序影子字段 | `title_sort` | text | — | — | ✓ | simple_analyzer | 仅用于排序 |
-| 排序影子字段 | `correspondent_sort` | text | — | — | ✓ | simple_analyzer | 仅用于排序 |
-| 排序影子字段 | `type_sort` | text | — | — | ✓ | simple_analyzer | 仅用于排序 |
-| CJK 支持 | `bigram_content` | text | — | — | — | bigram_analyzer | 中日韩文二元语法 |
-| 简单子串搜索 | `simple_title` | text | — | — | — | simple_search_analyzer | TEXT/TITLE 模式用 |
-| 简单子串搜索 | `simple_content` | text | — | — | — | simple_search_analyzer | TEXT/TITLE 模式用 |
-| 自动补全 | `autocomplete_word` | text | ✓ | — | — | raw | 归一化后的单词集合 |
-| 标签 | `tag` | text | ✓ | — | — | paperless_text | 标签名（多值） |
-| 结构化 JSON | `notes` | json | ✓ | — | — | paperless_text | 支持 notes.user:alice |
-| 备注纯文本 | `notes_text` | text | ✓ | — | — | paperless_text | 备注高亮专用副本 |
-| 结构化 JSON | `custom_fields` | json | ✓ | — | — | paperless_text | 支持 custom_fields.name:x |
-| 过滤用 ID | `correspondent_id` | unsigned | — | ✓ | ✓ | — | 多值 |
+| 校验和 | `checksum` | text | ✓ | ✓ | — | raw | 原始文件 MD5；stored 便于取回；raw 分词器保留完整值；不在任何搜索字段列表中 |
+| 全文搜索 | `title` | text | ✓ | ✓ | — | paperless_text | 标题；QUERY 模式默认字段，权重 2.0x |
+| 全文搜索 | `correspondent` | text | ✓ | ✓ | — | paperless_text | 往来方名称；QUERY 模式默认字段 |
+| 全文搜索 | `document_type` | text | ✓ | ✓ | — | paperless_text | 文档类型名；QUERY 模式默认字段 |
+| 全文搜索 | `storage_path` | text | ✓ | ✓ | — | paperless_text | 存储路径名；已建索引，但**不在** `DEFAULT_SEARCH_FIELDS`，需显式字段语法查询 |
+| 全文搜索 | `original_filename` | text | ✓ | ✓ | — | paperless_text | 原始文件名；已建索引，但**不在** `DEFAULT_SEARCH_FIELDS`，需显式字段语法查询 |
+| 全文搜索 | `content` | text | ✓ | ✓ | — | paperless_text | OCR 正文；QUERY 模式默认字段 |
+| 排序影子字段 | `title_sort` | text | — | ✓ | ✓ | simple_analyzer | 仅用于 fast field 排序；代码注释写 "not stored/indexed"，但实际 `indexed` 默认为 True |
+| 排序影子字段 | `correspondent_sort` | text | — | ✓ | ✓ | simple_analyzer | 仅用于 fast field 排序 |
+| 排序影子字段 | `type_sort` | text | — | ✓ | ✓ | simple_analyzer | 仅用于 fast field 排序 |
+| CJK 支持 | `bigram_content` | text | — | ✓ | — | bigram_analyzer | 中日韩文 2-gram 二元语法；代码注释 "not stored, indexed only"，准确；不在默认搜索字段列表，需显式 `bigram_content:xxx` |
+| 简单子串搜索 | `simple_title` | text | — | ✓ | — | simple_search_analyzer | TEXT/TITLE 模式 `?text=` / `?title_search=` 用；`SIMPLE_SEARCH_FIELDS` 成员 |
+| 简单子串搜索 | `simple_content` | text | — | ✓ | — | simple_search_analyzer | TEXT 模式用；`SIMPLE_SEARCH_FIELDS` 成员 |
+| 自动补全 | `autocomplete_word` | text | ✓ | ✓ | — | raw | 归一化后的单词；raw 分词器保留完整 token；代码注释写 "not indexed"，但实际 `indexed` 默认为 True——**必须 indexed 才能被 `terms_with_prefix()` 扫描 term dictionary** 做前缀匹配 |
+| 标签 | `tag` | text | ✓ | ✓ | — | paperless_text | 标签名（多值，一个文档多 tag 多次 add）；QUERY 模式默认字段 |
+| 结构化 JSON | `notes` | json | ✓ | ✓ | — | paperless_text | 备注结构化查询：`notes.user:alice`、`notes.note:keyword` |
+| 备注纯文本 | `notes_text` | text | ✓ | ✓ | — | paperless_text | 备注纯文本副本；Tantivy 的 `SnippetGenerator` 不支持 JSON 字段高亮，所以需要该文本字段做高亮 |
+| 结构化 JSON | `custom_fields` | json | ✓ | ✓ | — | paperless_text | 自定义字段结构化查询：`custom_fields.name:invoice`、`custom_fields.value:1000` |
+| 过滤用 ID | `correspondent_id` | unsigned | — | ✓ | ✓ | — | 多值，term 查询过滤 |
 | 过滤用 ID | `document_type_id` | unsigned | — | ✓ | ✓ | — | 多值 |
 | 过滤用 ID | `storage_path_id` | unsigned | — | ✓ | ✓ | — | 多值 |
 | 过滤用 ID | `tag_id` | unsigned | — | ✓ | ✓ | — | 多值 |
-| 过滤用 ID | `owner_id` | unsigned | — | ✓ | ✓ | — | 单值 |
-| 过滤用 ID | `viewer_id` | unsigned | — | ✓ | ✓ | — | 多值（共享用户） |
-| 日期 | `created` | date | ✓ | ✓ | ✓ | — | 文档创建日期 |
-| 日期 | `modified` | date | ✓ | ✓ | ✓ | — | 最后修改 |
-| 日期 | `added` | date | ✓ | ✓ | ✓ | — | 入库时间 |
-| 数值 | `asn` | unsigned | ✓ | ✓ | ✓ | — | 归档序列号 |
-| 数值 | `page_count` | unsigned | ✓ | ✓ | ✓ | — | 页数 |
-| 数值 | `num_notes` | unsigned | ✓ | ✓ | ✓ | — | 备注数 |
+| 过滤用 ID | `owner_id` | unsigned | — | ✓ | ✓ | — | 单值，权限过滤用 |
+| 过滤用 ID | `viewer_id` | unsigned | — | ✓ | ✓ | — | 多值，共享权限过滤用 |
+| 日期 | `created` | date | ✓ | ✓ | ✓ | — | 文档创建日期；SORTABLE_FIELDS 成员 |
+| 日期 | `modified` | date | ✓ | ✓ | ✓ | — | 最后修改；SORTABLE_FIELDS 成员 |
+| 日期 | `added` | date | ✓ | ✓ | ✓ | — | 入库时间；SORTABLE_FIELDS 成员 |
+| 数值 | `asn` | unsigned | ✓ | ✓ | ✓ | — | 归档序列号；SORTABLE_FIELDS 成员 |
+| 数值 | `page_count` | unsigned | ✓ | ✓ | ✓ | — | 页数；SORTABLE_FIELDS 成员 |
+| 数值 | `num_notes` | unsigned | ✓ | ✓ | ✓ | — | 备注数；SORTABLE_FIELDS 成员 |
+
+**查询字段列表对照（`src/documents/search/_query.py`）：**
+- `DEFAULT_SEARCH_FIELDS`（QUERY 模式）：`title`, `content`, `correspondent`, `document_type`, `tag`
+- `SIMPLE_SEARCH_FIELDS`（TEXT 模式）：`simple_title`, `simple_content`
+- `TITLE_SEARCH_FIELDS`（TITLE 模式）：`simple_title`
+- `_FIELD_BOOSTS`：`{"title": 2.0}`
+- `_SIMPLE_FIELD_BOOSTS`：`{"simple_title": 2.0}`
 
 ### 2.3 分词器（Tokenizer）
 
