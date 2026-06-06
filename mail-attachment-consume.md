@@ -9,8 +9,9 @@
 | [models.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/models.py) | MailAccount / MailRule / ProcessedMail 模型 |
 | [mail.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py) | 核心处理逻辑（MailAccountHandler） |
 | [tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/tasks.py) | Celery 任务入口 |
-| [preprocessor.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/preprocessor.py) | 邮件预处理器（如 PGP 解密 |
-| [oauth.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless-ngx/src/paperless_mail/oauth.py) | OAuth 认证管理 |
+| [preprocessor.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/preprocessor.py) | 邮件预处理器（如 PGP 解密） |
+| [oauth.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/oauth.py) | OAuth 认证管理 |
+| [registry.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/registry.py) | 解析器注册表（附件 MIME 支持判定依赖此表） |
 
 ---
 
@@ -51,6 +52,7 @@ def process_mail_accounts(account_ids: list[int] | None = None) -> str:
 定义位置：[models.py#L87-L313](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/models.py#L87-L313)
 
 #### 过滤规则（筛选邮件）：
+
 | 字段 | 作用 |
 |------|------|
 | `folder` | IMAP 文件夹，默认 INBOX |
@@ -60,25 +62,27 @@ def process_mail_accounts(account_ids: list[int] | None = None) -> str:
 | `filter_attachment_filename_exclude` | 附件文件名排除匹配（通配符，逗号分隔多个） |
 
 #### 处理范围：
+
 - `consumption_scope`：
   - `ATTACHMENTS_ONLY`（1）仅处理附件
   - `EML_ONLY`（2）仅处理整封邮件（.eml）
-  - `EVERYTHING`（3）邮件+附件都处理
-
+  - `EVERYTHING`（3）邮件 + 附件都处理
 - `attachment_type`：
   - `ATTACHMENTS_ONLY`（1）仅处理 content-disposition=attachment 的附件（跳过 inline 嵌入图片等）
   - `EVERYTHING`（2）处理所有附件（含 inline）
 
 #### 处理后动作（MailAction）：
+
 | 动作 | IMAP 查询过滤（避免重复处理） | 执行动作 |
 |------|------|------|
 | DELETE（1） | - | 删除邮件 |
 | MOVE（2） | - | 移动到 action_parameter 指定文件夹 |
 | MARK_READ（3） | 仅拉取未读邮件 | 标记已读 |
 | FLAG（4） | 仅拉取未星标邮件 | 加星标 |
-| TAG（5） | 排除已打标签 | 打 IMAP keyword/Gmail 标签/Apple Mail 颜色标签 |
+| TAG（5） | 排除已打标签 | 打 IMAP keyword / Gmail 标签 / Apple Mail 颜色标签 |
 
 #### 元数据赋值：
+
 | 字段 | 说明 |
 |------|------|
 | `assign_title_from` | 从邮件主题 / 附件文件名 / 不指定 |
@@ -104,7 +108,7 @@ def process_mail_accounts(account_ids: list[int] | None = None) -> str:
 2. OAuth Token 过期则刷新
 3. 登录邮箱（mailbox_login）
    ├─ is_token → XOAUTH2 认证
-   └─ 密码认证（ASCII / UTF-8（AUTH=PLAIN）
+   └─ 密码认证（ASCII / UTF-8 AUTH=PLAIN）
 4. 按 order 顺序遍历每条规则
    └─ _handle_mail_rule()
 ```
@@ -118,7 +122,7 @@ def process_mail_accounts(account_ids: list[int] | None = None) -> str:
 2. make_criterias() 构造 IMAP 查询条件
 3. M.fetch(criteria, mark_seen=False, bulk=True) 拉取邮件
 4. 逐封邮件去重与跳过：
-   ├─ rule_seen_messages：本次 fetch 结果去重（同邮件重复跳过
+   ├─ rule_seen_messages：本次 fetch 结果去重
    ├─ consumed_messages：已被前面规则处理的邮件跳过
    └─ ProcessedMail：DB 中已有记录跳过
 5. _handle_message() 处理单封邮件
@@ -127,31 +131,23 @@ def process_mail_accounts(account_ids: list[int] | None = None) -> str:
 
 ### 4.3 make_criterias — IMAP 查询条件构造
 
-定义位置：[mail.py#L383-L411](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L615-L713)
-
-```python
-def make_criterias(rule, *, supports_gmail_labels):
-    criterias = {}
-    # 邮件年龄过滤：date_gte = today - maximum_age
-    # filter_from / filter_to / filter_subject / filter_body
-    # 与 MailAction.get_criteria() 组合（AND）
-```
+定义位置：[mail.py#L383-L411](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L383-L411)
 
 MailAction 与过滤条件：
 - MARK_READ：`seen=False`（仅未读）
 - FLAG：`flagged=False`（仅未加星标）
 - TAG：
   - Apple Mail 颜色：`flagged=False`
-  - Gmail 标签：`NOT(gmail_label=X) AND no_keyword=X
-  - 普通 keyword：`no_keyword=X
+  - Gmail 标签：`NOT(gmail_label=X) AND no_keyword=X`
+  - 普通 keyword：`no_keyword=X`
 - DELETE / MOVE：无过滤（每次都扫描全部）
 
 ### 4.4 邮件预处理器
 
 定义位置：[preprocessor.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/preprocessor.py)
 
-当前注册的预处理器（mail.py#L454-L456](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L454-L456)：
-- `MailMessageDecryptor`：PGP 加密邮件解密（EMAIL_ENABLE_GPG_DECRYPTOR 开启）
+当前注册的预处理器（[mail.py#L454-L456](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L454-L456)）：
+- `MailMessageDecryptor`：PGP 加密邮件解密（`EMAIL_ENABLE_GPG_DECRYPTOR` 开启）
 
 ---
 
@@ -165,24 +161,26 @@ MailAction 与过滤条件：
 _handle_message(message, rule)
   ├─ _preprocess_message() 预处理（解密等）
   ├─ 若 ATTACHMENTS_ONLY 且无附件 → 直接返回 0
-  ├─ consumption_scope 判断：
-  │   ├─ EML_ONLY / EVERYTHING → _process_eml() 处理 .eml
-  │   └─ ATTACHMENTS_ONLY / EVERYTHING → _process_attachments() 处理附件
+  ├─ consumption_scope 判断（顺序执行，各自独立入队）：
+  │   ├─ EML_ONLY / EVERYTHING → _process_eml()  .eml 文件
+  │   └─ ATTACHMENTS_ONLY / EVERYTHING → _process_attachments() 逐个附件
   └─ 返回成功处理的文件数
 ```
+
+**关键**：当 `consumption_scope = EVERYTHING` 时，`_process_eml` 和 `_process_attachments` 各自内部独立调用 `queue_consumption_tasks()`，会向 Celery 提交两个独立的 chord（详见第六节）。
 
 ### 5.2 _process_attachments — 附件逐个筛选核心
 
 定义位置：[mail.py#L798-L940](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L798-L940)
 
-每个附件经过以下关卡，按顺序跳过：
+每个附件经过以下四道关卡，按顺序判断：
 
 #### 关卡 1：Content-Disposition 检查
 
 ```python
 if (
     att.content_disposition != "attachment"
-    and rule.attachment_type == ATTACHMENTS_ONLY
+    and rule.attachment_type == MailRule.AttachmentProcessing.ATTACHMENTS_ONLY
 ):
     跳过 → "Skipping attachment ... with content disposition inline"
 ```
@@ -206,7 +204,7 @@ def filename_inclusion_matches(filter_include, filename):
 
 #### 关卡 3：文件名排除匹配
 
-定义位置：[mail.py#L780-L796](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless-ngx/src/paperless_mail/mail.py#L780-L796)
+定义位置：[mail.py#L780-L796](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L780-L796)
 
 ```python
 def filename_exclusion_matches(filter_exclude, filename):
@@ -220,7 +218,7 @@ def filename_exclusion_matches(filter_exclude, filename):
 
 #### 关卡 4：MIME 类型支持检测
 
-定义位置：[mail.py#L851-L853](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L851-L853)
+定义位置：[mail.py#L849-L914](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L849-L914)
 
 ```python
 mime_type = magic.from_buffer(att.payload, mime=True)  # 读取附件二进制内容检测真实类型
@@ -230,18 +228,46 @@ else:
     跳过 → "Skipping attachment ... since guessed mime type ... is not supported"
 ```
 
-**注意：不使用邮件声明的 Content-Type，而是用 python-magic 从实际文件内容嗅探真实 MIME 类型。
+**注意**：不使用邮件声明的 Content-Type，而是用 python-magic 从实际文件内容嗅探真实 MIME 类型。
 
-`is_mime_type_supported()` 定义：[parsers.py#L25-L29](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/documents/parsers.py#L25-L29)
+### 5.3 解析器注册表：MIME 支持范围的精确核准
 
-各 Parser 支持的 MIME：
-- TesseractParser：`application/pdf, image/*
-- TikaParser：各种办公文档、图片
-- TextParser：text/plain, text/csv 等
-- MailParser：`message/rfc822` (.eml)
-- RemoteParser：各种文档格式
+`is_mime_type_supported()` 定义：[documents/parsers.py#L25-L29](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/documents/parsers.py#L25-L29)
 
-### 5.3 _process_eml — 整封邮件作为 .eml
+```python
+def is_mime_type_supported(mime_type: str) -> bool:
+    return get_parser_registry().get_parser_for_file(mime_type, "") is not None
+```
+
+其内部调用 `ParserRegistry.get_parser_for_file()`（[registry.py#L332-L393](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/registry.py#L332-L393)），判断机制如下：
+
+**注册表内置解析器注册顺序**（[registry.py#L192-L210](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/registry.py#L192-L210)）：
+
+```
+TextDocumentParser → RemoteDocumentParser → TikaDocumentParser → MailDocumentParser → RasterisedDocumentParser
+```
+
+**遍历与选择规则**：
+1. 先遍历第三方外部解析器（entrypoints `paperless_ngx.parsers`），再遍历内置解析器
+2. 对每个解析器依次检查：
+   - `mime_type in parser.supported_mime_types()`
+   - `parser.score(mime_type, filename, path) is not None`（用于条件性启用/禁用）
+3. 取 `score` 最高者；分数相同则先遍历到的胜出（外部插件优先于内置）
+4. 只要有任一解析器能处理，`is_mime_type_supported()` 就返回 True
+
+**五个内置解析器的精确 MIME 支持**：
+
+| 解析器 | 支持 MIME → 扩展名 | 分数 | 启用条件 |
+|------|------|------|------|
+| **RasterisedDocumentParser**（Tesseract OCR）<br>[tesseract.py#L47-L95](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/tesseract.py#L47-L95) | `application/pdf` → .pdf<br>`image/jpeg` → .jpg<br>`image/png` → .png<br>`image/tiff` → .tif<br>`image/gif` → .gif<br>`image/bmp` → .bmp<br>`image/webp` → .webp<br>`image/heic` | 10 | 始终启用 |
+| **RemoteDocumentParser**（Azure AI 等远程 OCR）<br>[remote.py#L35-L149](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/remote.py#L35-L149) | `application/pdf` → .pdf<br>`image/png` → .png<br>`image/jpeg` → .jpg<br>`image/tiff` → .tiff<br>`image/bmp` → .bmp<br>`image/gif` → .gif<br>`image/webp` | 20 | `REMOTE_OCR_ENGINE` + API Key + Endpoint 必须完整配置；<br>分数比 Tesseract 高，配置生效时自动优先 |
+| **TikaDocumentParser**（办公文档，需 Tika + Gotenberg）<br>[tika.py#L42-L135](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/tika.py#L42-L135) | `application/msword` → .doc<br>`application/vnd.openxmlformats-officedocument.wordprocessingml.document` → .docx<br>`application/vnd.ms-excel` → .xls<br>`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` → .xlsx<br>`application/vnd.ms-powerpoint` → .ppt<br>`application/vnd.openxmlformats-officedocument.presentationml.presentation` → .pptx<br>`application/vnd.openxmlformats-officedocument.presentationml.slideshow` → .ppsx<br>`application/vnd.oasis.opendocument.presentation` → .odp<br>`application/vnd.oasis.opendocument.spreadsheet` → .ods<br>`application/vnd.oasis.opendocument.text` → .odt<br>`application/vnd.oasis.opendocument.graphics` → .odg<br>`text/rtf` → .rtf | 10 | `TIKA_ENABLED=True` 且 Gotenberg 可用 |
+| **MailDocumentParser**（.eml 邮件文件）<br>[mail.py#L57-L59](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/mail.py#L57-L59) | `message/rfc822` → .eml | — | — |
+| **TextDocumentParser**（纯文本）<br>[text.py#L34-L105](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/text.py#L34-L105) | `text/plain` → .txt<br>`text/csv` → .csv<br>`application/csv` → .csv | 10 | 始终启用 |
+
+> **结论**：邮件附件能被接收的 MIME 覆盖范围 = 以上五个内置解析器（以及任何已安装的第三方插件解析器）的 MIME 并集，且对应解析器的 `score()` 不返回 `None`（即启用条件满足）。
+
+### 5.4 _process_eml — 整封邮件作为 .eml
 
 定义位置：[mail.py#L942-L1009](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L942-L1009)
 
@@ -249,7 +275,7 @@ else:
 1. 在 SCRATCH_DIR 创建临时 .eml 文件
 2. 特殊处理：将 "From" 头部移到最前（解决 magic 识别为 text/plain 而非 message/rfc822）
 3. 写入邮件原始字节
-4. 直接构造 consume_file 任务入队
+4. 直接构造 consume_file 任务并调用 queue_consumption_tasks() 立即入队
 ```
 
 ---
@@ -262,7 +288,7 @@ else:
 
 ```python
 settings.SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-temp_dir = Path(tempfile.mkdtemp(prefix="paperless-mail-", dir=settings.SCRATCH_DIR)
+temp_dir = Path(tempfile.mkdtemp(prefix="paperless-mail-", dir=settings.SCRATCH_DIR))
 attachment_name = pathvalidate.sanitize_filename(att.filename)
 temp_filename = temp_dir / attachment_name
 temp_filename.write_bytes(att.payload)
@@ -278,16 +304,14 @@ temp_filename.write_bytes(att.payload)
 
 ```python
 input_doc = ConsumableDocument(
-    source=DocumentSource.MailFetch,      # 来源标记为 MailFetch (3)
-    original_file=temp_filename,     # 临时文件绝对路径
-    mailrule_id=rule.pk,             # 关联规则 ID
+    source=DocumentSource.MailFetch,     # 来源标记为 MailFetch (3)
+    original_file=temp_filename,         # 临时文件绝对路径
+    mailrule_id=rule.pk,                 # 关联规则 ID
 )
 # __post_init__ 中自动：
 #   - original_file 转为绝对路径 resolve()
 #   - magic.from_file() 再次检测文件 MIME 类型
 ```
-
-DocumentSource 枚举：[data_models.py#L150-L158](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/documents/data_models.py#L150-L158)
 
 ### 6.3 构造 DocumentMetadataOverrides
 
@@ -295,90 +319,150 @@ DocumentSource 枚举：[data_models.py#L150-L158](file:///d:/fz/0601/solo-dogfe
 
 ```python
 doc_overrides = DocumentMetadataOverrides(
-    title=title,                                     # 主题或附件文件名（由 rule.assign_title_from
+    title=title,
     filename=pathvalidate.sanitize_filename(att.filename),
     correspondent_id=correspondent.id if correspondent else None,
     document_type_id=doc_type.id if doc_type else None,
-    tag_ids=tag_ids,                                   # rule.assign_tags 全部标签
-    owner_id=rule.owner.id if (rule.assign_owner_from_rule and rule.owner else None,
+    tag_ids=tag_ids,
+    owner_id=rule.owner.id if (rule.assign_owner_from_rule and rule.owner) else None,
 )
 ```
 
 Title 来源（`_get_title`）：[mail.py#L492-L510](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L492-L510)
-- FROM_SUBJECT：邮件主题
-- FROM_FILENAME：附件文件名（不含扩展名）
-- NONE：不指定
+- `FROM_SUBJECT`：邮件主题
+- `FROM_FILENAME`：附件文件名（不含扩展名）
+- `NONE`：不指定
 
 Correspondent 来源（`_get_correspondent`）：[mail.py#L512-L538](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L512-L538)
-- FROM_EMAIL：发件人邮箱地址（get_or_create）
-- FROM_NAME：发件人显示名（退回邮箱地址）
-- FROM_CUSTOM：rule.assign_correspondent 指定
-- FROM_NOTHING：不指定
+- `FROM_EMAIL`：发件人邮箱地址（get_or_create）
+- `FROM_NAME`：发件人显示名（失败退回邮箱地址）
+- `FROM_CUSTOM`：`rule.assign_correspondent` 指定
+- `FROM_NOTHING`：不指定
 
-### 6.4 Celery 任务编排
-
-定义位置：[mail.py#L896-L905](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L896-L905)
-
-```python
-consume_task = consume_file.s(
-    input_doc=input_doc,
-    overrides=doc_overrides,
-).set(headers={"trigger_source": PaperlessTask.TriggerSource.EMAIL_CONSUME})
-```
-
-### 6.5 queue_consumption_tasks — Chord 编排
+### 6.4 queue_consumption_tasks — Chord 编排
 
 定义位置：[mail.py#L334-L358](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L334-L358)
 
 ```python
 def queue_consumption_tasks(consume_tasks, rule, message):
-    mail_action_task = apply_mail_action.s(rule_id, uid, subject, date)
-    chord(header=consume_tasks, body=mail_action_task)
-        .on_error(error_callback.s(...))
+    mail_action_task = apply_mail_action.s(
+        rule_id=rule.pk,
+        uid=message.uid,
+        folder=rule.folder,
+        subject=message.subject,
+        date=message.date,
+    )
+    chord(header=consume_tasks, body=mail_action_task) \
+        .on_error(error_callback.s(rule_id=rule.pk, ...)) \
         .delay()
 ```
 
-使用 Celery Chord 模式：
+单个 Chord 的执行模式：
+
 ```
-┌──────────────────────────────────────────────────────────┐
-│  header（并行）：                                 │
-│    consume_file(task1)  consume_file(task2) ...     │
-└───────────────┬───────────────────────────────────────┘
-                │ 全部成功完成
-                ▼
-┌──────────────────────────────────────────────────────────┐
-│  body：apply_mail_action                         │
-│    - 对邮件执行 IMAP 动作（标记已读/移动/删除等     │
-│    - 写入 ProcessedMail 记录（SUCCESS/FAILED）             │
-└──────────────────────────────────────────────────────────┘
-                │ 任一 header 任务失败
-                ▼
-┌──────────────────────────────────────────────────────────┐
-│  error_callback：error_callback                       │
-│    - 记录 ProcessedMail（FAILED + traceback）            │
-└──────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────┐
+│  header（并行）：所有 consume_file 任务                       │
+│    consume_file(附件1)  consume_file(附件2)  ...                  │
+└───────────────────────────┬────────────────────────────────────────┘
+                            │ 全部成功完成
+                            ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  body：apply_mail_action                                      │
+│    1. 重新连接 IMAP                                         │
+│    2. action.post_consume() 执行邮件动作（MARK_READ 等）            │
+│    3. ProcessedMail.objects.create(status="SUCCESS")                │
+└────────────────────────────────────────────────────────────────────┘
+                            │ 任一 header 任务失败
+                            ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  error_callback：error_callback                                   │
+│    - ProcessedMail.objects.create(status="FAILED", error=traceback) │
+└────────────────────────────────────────────────────────────────────┘
 ```
+
+### 6.5 EVERYTHING 模式下的双 Chord 衔接
+
+这是代码中最容易被误解的关键点。当 `consumption_scope = EVERYTHING`（邮件 + 附件都处理）时：
+
+`_handle_message` 在 [mail.py#L737-L757](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L737-L757) **顺序调用**两个处理函数：
+
+```python
+# 第一步：处理 .eml
+if rule.consumption_scope in (EML_ONLY, EVERYTHING):
+    processed_elements += self._process_eml(...)  # ← 内部立即调用 queue_consumption_tasks()
+
+# 第二步：处理附件
+if rule.consumption_scope in (ATTACHMENTS_ONLY, EVERYTHING):
+    processed_elements += self._process_attachments(...)  # ← 内部再次调用 queue_consumption_tasks()
+```
+
+**两个处理函数各自独立入队**，产生两个互不相关的 Celery Chord：
+
+```
+_handle_message()
+  │
+  ├─ _process_eml()
+  │   └─ queue_consumption_tasks([eml_consume_task], ...)
+  │        └─ Chord A：
+  │           ├─ header = [consume_file(eml)]
+  │           ├─ body   = apply_mail_action(rule, uid, folder, ...)   ← 写 1 条 ProcessedMail(SUCCESS/FAILED)
+  │           └─ .on_error(error_callback(...))
+  │
+  └─ _process_attachments()
+      ├─ 遍历附件，构造 consume_tasks = [att1_task, att2_task, ...]
+      └─ queue_consumption_tasks(consume_tasks, ...)
+           └─ Chord B：
+              ├─ header = [consume_file(att1), consume_file(att2), ...]
+              ├─ body   = apply_mail_action(rule, uid, folder, ...)   ← 再写 1 条 ProcessedMail(SUCCESS/FAILED)
+              └─ .on_error(error_callback(...))
+```
+
+**两个 Chord 之间没有任何同步或依赖关系**，Celery 会并行调度它们各自的 header。
+
+#### 双 Chord 对邮件动作（MailAction）的影响：
+
+| MailAction | 两次执行的实际效果 |
+|------|------|
+| **MARK_READ** | 幂等；两次 `\Seen` 标记无副作用 |
+| **FLAG** | 幂等；两次 `\Flagged` 标记无副作用 |
+| **TAG**（keyword / Gmail 标签 / Apple Mail 颜色） | 幂等；重复打标签无副作用 |
+| **MOVE** | 第一次移动成功，邮件 UID 离开原文件夹；第二次执行 `post_consume()` 时 IMAP 找不到该 UID，会抛异常并在 error_callback 中记录 `FAILED` |
+| **DELETE** | 类似 MOVE，第二次找不到邮件 UID |
+
+#### 双 Chord 对 ProcessedMail 记录的影响：
+
+`ProcessedMail` 模型（[models.py#L316-L375](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/models.py#L316-L375)）**没有**对 `(rule, folder, uid)` 做唯一约束。因此：
+- 当 Chord A 和 Chord B 的 body（`apply_mail_action`）都成功时，会产生 **两条** `ProcessedMail(status="SUCCESS")` 记录
+- 其中任一 chord 任一 header 任务失败时，会额外产生一条 `FAILED` 记录
+- 下次取信时，`_handle_mail_rule` 中 `ProcessedMail.objects.filter(rule=rule, uid=message.uid, folder=rule.folder).exists()` 只要存在任意一条就跳过该邮件
+
+#### _process_attachments 中对重复 ProcessedMail 的保护：
+
+当附件全部被过滤跳过（没有任何合格附件）时，`_process_attachments` 的 [mail.py#L922-L938](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L922-L938) 会先检查 `ProcessedMail` 是否已经存在，只有不存在时才写入一条 `PROCESSED_WO_CONSUMPTION` 状态的记录——这是为了避免与 `_process_eml` 的 Chord A 已经写入的记录重复。
 
 ### 6.6 apply_mail_action — 消费完成后动作
 
 定义位置：[mail.py#L240-L304](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L240-L304)
 
 ```
-1. 重新连接邮箱
-2. action.post_consume() 执行 IMAP 操作
-3. ProcessedMail.objects.create(status="SUCCESS")
+1. 重新连接邮箱（与 handle_mail_account 相同逻辑）
+2. rule.action.post_consume(M, uid) 执行 IMAP 操作
+3. ProcessedMail.objects.create(
+       rule=rule, folder=rule.folder, uid=uid,
+       subject=subject, received=date,
+       status="SUCCESS",
+   )
 ```
-
-ProcessedMail 模型记录：[models.py#L316-L375](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/models.py#L316-L375)
-- rule / folder / uid（IMAP UID）/ subject / received / processed / status / error
 
 ### 6.7 无合格附件时的处理
 
-mail.py#L922-L938](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L922-L938)：若一封邮件所有附件都被过滤跳过（但 .eml 也没入队），且 ProcessedMail 尚无记录，则直接写入：
+定义位置：[mail.py#L922-L938](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L922-L938)
+
+若一封邮件所有附件都被过滤跳过（没有可消费的附件），且 `ProcessedMail` 尚无记录，则直接同步写入：
 ```python
 ProcessedMail.objects.create(status="PROCESSED_WO_CONSUMPTION")
 ```
-防止下次重复扫描。
+防止下次取信时重复扫描。
 
 ---
 
@@ -392,15 +476,15 @@ ProcessedMail.objects.create(status="PROCESSED_WO_CONSUMPTION")
 consume_file(input_doc, overrides)
   └─ 插件链（非版本文档）：
      ├─ ConsumerPreflightPlugin   预检
-     ├─ AsnCheckPlugin      ASN 检查
-     ├─ CollatePlugin      双面扫描整理
-     ├─ BarcodePlugin     条码分割
-     ├─ AsnCheckPlugin    再次 ASN 检查（条码后）
-     ├─ WorkflowTriggerPlugin  工作流触发
-     └─ ConsumerPlugin    实际入库
+     ├─ AsnCheckPlugin            ASN 检查
+     ├─ CollatePlugin             双面扫描整理
+     ├─ BarcodePlugin             条码分割
+     ├─ AsnCheckPlugin            再次 ASN 检查（条码后）
+     ├─ WorkflowTriggerPlugin     工作流触发
+     └─ ConsumerPlugin            实际入库
 ```
 
-ConsumerPlugin 内部调用 `Consumer.try_consume() → `documents/consumer.py）完成文档解析、OCR、归档、写入 originals / thumbnails / 存储路径计算等（与普通上传一致）。
+`ConsumerPlugin` 内部调用 `Consumer.try_consume()`（[documents/consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/documents/consumer.py)）完成文档解析、OCR、归档、写入 originals / thumbnails 等操作（与普通上传完全一致）。
 
 ---
 
@@ -410,49 +494,46 @@ ConsumerPlugin 内部调用 `Consumer.try_consume() → `documents/consumer.py�
 process_mail_accounts() [Celery Task]
   │
   └─ MailAccountHandler.handle_mail_account(account)
-       ├─ get_mailbox()        建立 IMAP 连接
-       ├─ mailbox_login()         登录
+       ├─ get_mailbox()         建立 IMAP 连接
+       ├─ mailbox_login()       登录
        │
        └─ 遍历 account.rules.order_by("order"):
-       │    │
-       │    └─ _handle_mail_rule(M, rule, ...)
-       │         ├─ M.folder.set(rule.folder)    选择文件夹
-       │         ├─ make_criterias()         构造 IMAP 查询
-       │         ├─ M.fetch(criterias)          拉取邮件列表
-       │         │
-       │         └─ 遍历 messages:
-       │              │
-       │              ├─ 去重（rule_seen / consumed_messages / ProcessedMail）
-       │              │
-       │              └─ _handle_message(message, rule)
-       │                   ├─ _preprocess_message()   PGP 解密等
-       │                   │
-       │                   ├─ _process_eml()       EML （可选）
-       │                   │    └─ 写 .eml → ConsumableDocument → consume_file.s()
-       │                   │
-       │                   └─ _process_attachments()   逐个附件：
-       │                        │
-       │                        └─ for att in message.attachments:
-       │                             ├─ content_disposition 关卡
-       │                             ├─ filename_include 关卡
-       │                             ├─ filename_exclude 关卡
-       │                             ├─ magic.from_buffer → mime 关卡
-       │                             │
-       │                             ├─ 写临时文件
-       │                             ├─ ConsumableDocument(MailFetch)
-       │                             ├─ DocumentMetadataOverrides(title, correspondent, tags...)
-       │                             └─ consume_file.s() 加入 consume_tasks 列表
-       │
-       └─ queue_consumption_tasks(consume_tasks, rule, message)
             │
-            └─ chord(header=consume_tasks,
-            │            body=apply_mail_action.s(...))
-            │      .on_error(error_callback.s(...))
-            │      .delay()
-            │
-            └─ 所有 consume_file 全部完成
+            └─ _handle_mail_rule(M, rule, ...)
+                 ├─ M.folder.set(rule.folder)     选择文件夹
+                 ├─ make_criterias()              构造 IMAP 查询
+                 ├─ M.fetch(criterias)            拉取邮件列表
                  │
-                 └─ apply_mail_action()
-                      ├─ IMAP 动作（MARK_READ/MOVE/DELETE/FLAG/TAG
-                      └─ ProcessedMail.objects.create(SUCCESS/FAILED)
+                 └─ 遍历 messages:
+                      │
+                      ├─ 去重（rule_seen / consumed_messages / ProcessedMail）
+                      │
+                      └─ _handle_message(message, rule)
+                           ├─ _preprocess_message()     PGP 解密等
+                           │
+                           ├─ EML_ONLY / EVERYTHING:
+                           │    └─ _process_eml()
+                           │         ├─ 写临时 .eml
+                           │         ├─ ConsumableDocument(MailFetch)
+                           │         ├─ DocumentMetadataOverrides
+                           │         └─ queue_consumption_tasks([eml_task])  ← Chord A 入队
+                           │
+                           └─ ATTACHMENTS_ONLY / EVERYTHING:
+                                └─ _process_attachments()
+                                     └─ for att in message.attachments:
+                                          ├─ content_disposition 关卡
+                                          ├─ filename_include 关卡
+                                          ├─ filename_exclude 关卡
+                                          ├─ magic.from_buffer → MIME 关卡（查解析器注册表）
+                                          │
+                                          ├─ 合格：写临时文件
+                                          │       ConsumableDocument + Overrides
+                                          │       consume_file.s() 加入列表
+                                          └─ 全部附件处理完毕：
+                                               ├─ 有任务：queue_consumption_tasks([att1, att2, ...]) ← Chord B 入队
+                                               └─ 无任务：ProcessedMail(PROCESSED_WO_CONSUMPTION) （需 .eml 侧尚未写入）
 ```
+
+Chord A 和 Chord B 在 Celery 中独立执行，各自完成后分别：
+- 执行一次 `apply_mail_action`（IMAP 动作 + 写 `ProcessedMail`）
+- 出错时通过 `error_callback` 写 `ProcessedMail(FAILED)`
