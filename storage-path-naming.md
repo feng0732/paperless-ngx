@@ -2,7 +2,7 @@
 
 ## 一、整体目录结构配置
 
-所有文件存储的根目录配置在 [paperless/settings/__init__.py](paperless/settings/__init__.py#L65-L88) 中：
+所有文件存储的根目录配置在 [paperless/settings/__init__.py](src/paperless/settings/__init__.py#L65-L88) 中：
 
 ```
 MEDIA_ROOT/                    # 媒体根目录 (PAPERLESS_MEDIA_ROOT)
@@ -24,7 +24,7 @@ MEDIA_ROOT/                    # 媒体根目录 (PAPERLESS_MEDIA_ROOT)
 
 ## 二、StoragePath 模型
 
-[documents/models.py](documents/models.py#L147-L155) 中定义的 `StoragePath` 模型：
+[documents/models.py](src/documents/models.py#L147-L155) 中定义的 `StoragePath` 模型：
 
 ```python
 class StoragePath(MatchingModel):
@@ -41,7 +41,7 @@ class StoragePath(MatchingModel):
 
 ### 3.1 模板引擎配置
 
-模板系统基于 Jinja2 的沙箱环境，定义在 [documents/templating/environment.py](documents/templating/environment.py)：
+模板系统基于 Jinja2 的沙箱环境，定义在 [documents/templating/environment.py](src/documents/templating/environment.py)：
 
 ```python
 class JinjaEnvironment(SandboxedEnvironment):
@@ -59,7 +59,7 @@ _template_environment = JinjaEnvironment(
 
 ### 3.2 自定义 FilePathTemplate 类
 
-在 [documents/templating/filepath.py](documents/templating/filepath.py#L34-L52) 中定义：
+在 [documents/templating/filepath.py](src/documents/templating/filepath.py#L34-L52) 中定义：
 
 ```python
 class FilePathTemplate(Template):
@@ -74,7 +74,7 @@ class FilePathTemplate(Template):
 
 ### 3.3 模板可用变量
 
-模板上下文通过多个函数构建，位于 [documents/templating/filepath.py](documents/templating/filepath.py)：
+模板上下文通过多个函数构建，位于 [documents/templating/filepath.py](src/documents/templating/filepath.py)：
 
 #### 基本元数据上下文 (`get_basic_metadata_context`)
 
@@ -124,7 +124,7 @@ custom_fields.<字段名>.value  - 字段值
 
 ### 3.4 可用过滤器
 
-注册在 [documents/templating/filepath.py](documents/templating/filepath.py#L101-L107)：
+注册在 [documents/templating/filepath.py](src/documents/templating/filepath.py#L101-L107)：
 
 - `get_cf_value(custom_fields, name, default)` - 获取自定义字段值
 - `datetime(format)` - 日期格式化（strftime）
@@ -133,7 +133,7 @@ custom_fields.<字段名>.value  - 字段值
 
 ### 3.5 模板验证与渲染
 
-核心函数 `validate_filepath_template_and_render` 在 [filepath.py](documents/templating/filepath.py#L345-L412)：
+核心函数 `validate_filepath_template_and_render` 在 [filepath.py](src/documents/templating/filepath.py#L345-L412)：
 
 1. 若无真实文档，使用 `create_dummy_document()` 创建假文档进行验证
 2. 构建完整上下文字典
@@ -142,7 +142,7 @@ custom_fields.<字段名>.value  - 字段值
 
 ### 3.6 旧格式兼容
 
-[documents/templating/utils.py](documents/templating/utils.py) 中的 `convert_format_str_to_template_format()` 将旧的 Python `{var}` 格式转换为 Jinja2 `{{ var }}` 格式。
+[documents/templating/utils.py](src/documents/templating/utils.py) 中的 `convert_format_str_to_template_format()` 将旧的 Python `{var}` 格式转换为 Jinja2 `{{ var }}` 格式。
 
 ---
 
@@ -159,7 +159,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 
 ### 4.2 `generate_filename()` 详细逻辑
 
-位于 [documents/file_handling.py](documents/file_handling.py#L125-L185)：
+位于 [documents/file_handling.py](src/documents/file_handling.py#L125-L185)：
 
 **步骤 1：确定格式字符串来源（优先级从高到低）**
 
@@ -190,7 +190,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 
 ### 4.3 `generate_unique_filename()` 冲突避免
 
-位于 [documents/file_handling.py](documents/file_handling.py#L44-L99)：
+位于 [documents/file_handling.py](src/documents/file_handling.py#L44-L99)：
 
 1. 先尝试 `generate_filename(counter=0)`
 2. 若目标路径已存在且不等于旧路径，counter++ 重试（`_01`, `_02`, ...）
@@ -198,7 +198,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 
 ### 4.4 `format_filename()` 后处理
 
-位于 [documents/file_handling.py](documents/file_handling.py#L102-L122)：
+位于 [documents/file_handling.py](src/documents/file_handling.py#L102-L122)：
 
 - 若 `FILENAME_FORMAT_REMOVE_NONE=True`：
   - 移除 `/-none-/` 目录段
@@ -212,7 +212,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 
 ### 5.1 是否生成归档的判断逻辑
 
-[documents/consumer.py](documents/consumer.py#L124-L189) 中的 `should_produce_archive()`：
+[documents/consumer.py](src/documents/consumer.py#L124-L189) 中的 `should_produce_archive()`：
 
 | 条件 | 结果 |
 |------|------|
@@ -226,7 +226,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 
 ### 5.2 归档文件存储路径
 
-Document 模型属性 [models.py](documents/models.py#L440-L453)：
+Document 模型属性 [models.py](src/documents/models.py#L440-L453)：
 
 ```python
 @property
@@ -250,7 +250,7 @@ def archive_path(self) -> Path | None:
 
 ### 6.1 缩略图路径规则
 
-Document 模型属性 [models.py](documents/models.py#L478-L488)：
+Document 模型属性 [models.py](src/documents/models.py#L478-L488)：
 
 ```python
 @property
@@ -276,14 +276,14 @@ THUMBNAIL_DIR / {doc_pk:07}.webp
 两种生成方式：
 
 **方式 1：消费流程中实时生成**
-[consumer.py](documents/consumer.py#L526-L536)
+[consumer.py](src/documents/consumer.py#L526-L536)
 ```python
 thumbnail = document_parser.get_thumbnail(self.working_copy, mime_type)
 # 之后写入 document.thumbnail_path
 ```
 
 **方式 2：管理命令批量重新生成**
-[documents/management/commands/document_thumbnails.py](documents/management/commands/document_thumbnails.py)
+[documents/management/commands/document_thumbnails.py](src/documents/management/commands/document_thumbnails.py)
 - 命令：`document_thumbnails`
 - 支持 `--document <id>` 指定单个文档
 - 支持多进程并行处理
@@ -295,7 +295,7 @@ thumbnail = document_parser.get_thumbnail(self.working_copy, mime_type)
 
 ### 7.1 触发信号
 
-位于 [documents/signals/handlers.py](documents/signals/handlers.py#L431-L668) 的 `update_filename_and_move_files()` 监听以下信号：
+位于 [documents/signals/handlers.py](src/documents/signals/handlers.py#L431-L668) 的 `update_filename_and_move_files()` 监听以下信号：
 
 - `post_save` (Document) - 文档保存后
 - `m2m_changed` (Document.tags.through) - 标签变更时
@@ -331,7 +331,7 @@ thumbnail = document_parser.get_thumbnail(self.working_copy, mime_type)
 
 ### 7.4 目录清理
 
-`delete_empty_directories()` 在 [file_handling.py](documents/file_handling.py#L15-L41)：
+`delete_empty_directories()` 在 [file_handling.py](src/documents/file_handling.py#L15-L41)：
 - 从文件所在目录开始向上遍历
 - 遇到空目录则删除
 - 到达根目录（ORIGINALS_DIR / ARCHIVE_DIR）停止
@@ -341,7 +341,7 @@ thumbnail = document_parser.get_thumbnail(self.working_copy, mime_type)
 
 ## 八、消费流程中的完整文件处理
 
-[documents/consumer.py](documents/consumer.py#L586-L784) 中的文件落盘流程：
+[documents/consumer.py](src/documents/consumer.py#L586-L784) 中的文件落盘流程：
 
 ```
 事务开始
@@ -378,7 +378,7 @@ thumbnail = document_parser.get_thumbnail(self.working_copy, mime_type)
 
 ## 九、文档删除时的文件清理
 
-[documents/signals/handlers.py](documents/signals/handlers.py#L342-L402) 的 `cleanup_document_deletion()`：
+[documents/signals/handlers.py](src/documents/signals/handlers.py#L342-L402) 的 `cleanup_document_deletion()`：
 
 1. 获取 MEDIA_LOCK
 2. 若配置了 EMPTY_TRASH_DIR：
@@ -393,13 +393,13 @@ thumbnail = document_parser.get_thumbnail(self.working_copy, mime_type)
 
 | 文件 | 主要职责 |
 |------|---------|
-| [documents/file_handling.py](documents/file_handling.py) | 文件名生成、目录创建、空目录清理 |
-| [documents/templating/filepath.py](documents/templating/filepath.py) | 模板上下文构建、渲染、验证 |
-| [documents/templating/environment.py](documents/templating/environment.py) | Jinja2 沙箱环境配置 |
-| [documents/templating/filters.py](documents/templating/filters.py) | 自定义模板过滤器 |
-| [documents/templating/utils.py](documents/templating/utils.py) | 旧格式到新格式的转换 |
-| [documents/signals/handlers.py](documents/signals/handlers.py) | 自动重命名/移动、删除清理 |
-| [documents/consumer.py](documents/consumer.py) | 消费流程中的文件落盘 |
-| [documents/models.py](documents/models.py) | Document / StoragePath 模型定义及 path 属性 |
-| [documents/management/commands/document_thumbnails.py](documents/management/commands/document_thumbnails.py) | 缩略图重新生成命令 |
-| [paperless/settings/__init__.py](paperless/settings/__init__.py#L65-L88) | 目录配置和全局模板配置 |
+| [documents/file_handling.py](src/documents/file_handling.py) | 文件名生成、目录创建、空目录清理 |
+| [documents/templating/filepath.py](src/documents/templating/filepath.py) | 模板上下文构建、渲染、验证 |
+| [documents/templating/environment.py](src/documents/templating/environment.py) | Jinja2 沙箱环境配置 |
+| [documents/templating/filters.py](src/documents/templating/filters.py) | 自定义模板过滤器 |
+| [documents/templating/utils.py](src/documents/templating/utils.py) | 旧格式到新格式的转换 |
+| [documents/signals/handlers.py](src/documents/signals/handlers.py) | 自动重命名/移动、删除清理 |
+| [documents/consumer.py](src/documents/consumer.py) | 消费流程中的文件落盘 |
+| [documents/models.py](src/documents/models.py) | Document / StoragePath 模型定义及 path 属性 |
+| [documents/management/commands/document_thumbnails.py](src/documents/management/commands/document_thumbnails.py) | 缩略图重新生成命令 |
+| [paperless/settings/__init__.py](src/paperless/settings/__init__.py#L65-L88) | 目录配置和全局模板配置 |
