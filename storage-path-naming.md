@@ -269,7 +269,165 @@ def set_storage_path(doc_ids, storage_path):
     return "OK"
 ```
 
-关键点：`QuerySet.update()` **不发送 Django signals**，所以必须手动触发后续流程——通过 Celery 任务 `bulk_update_documents` 逐个对文档 `save()` 以触发 `post_save` → `update_filename_and_move_files()`。
+关键点：`QuerySet.update()` **不发送 Django signals**，所以必须手动触发后续流程——通过 Celery 任务 `bulk_update_documents` 逐个对文档触发信号 → `update_filename_and_move_files()`。
+
+#### 批量编辑完整时序：API → 异步任务 → 两次重命名
+
+**阶段 1：API 层（同步执行）**
+
+[documents/views.py](src/documents/views.py#L2733-L2776) 的 `_execute_document_action()` 处理批量编辑请求：
+
+```
+HTTP 请求 → BulkEditViewSet
+  └─ _resolve_document_ids()           解析待处理的文档 ID
+  └─ _has_document_permissions()       鉴权检查
+  └─ method(documents, **parameters)   调用 bulk_edit.set_storage_path()
+       └─ QuerySet.update(storage_path=X)   ← 直接写 DB，无信号
+       └─ bulk_update_documents.apply_async(document_ids=affected_docs)
+```
+
+所有会修改文档元数据的批量操作（`set_correspondent` / `set_storage_path` / `set_document_type` / `add_tag` / `remove_tag` / `modify_tags` / `modify_custom_fields` / `set_permissions`）最终都会调用 `bulk_update_documents.apply_async()`，**每个操作都单独触发一次异步任务**。
+
+**阶段 2：Celery Worker（异步执行 bulk_update_documents）**
+
+[documents/tasks.py](src/documents/tasks.py#L253-L275)：
+
+```python
+@shared_task
+def bulk_update_documents(document_ids) -> None:
+    documents = Document.objects.filter(id__in=document_ids)
+    for doc in documents:
+        clear_document_caches(doc.pk)                      # ① 清缓存
+        document_updated.send(                              # ② 发送变更通知信号
+            sender=None, document=doc, logging_group=uuid.uuid4(),
+        )
+        post_save.send(Document, instance=doc, created=False)  # ③ 手动发 post_save
+
+    with get_backend().batch_update() as batch:             # ④ 批量更新搜索索引
+        for doc in documents:
+            batch.add_or_update(doc)
+
+    if ai_config.llm_index_enabled:                          # ⑤ 可选：更新 LLM 索引
+        update_llm_index(rebuild=False)
+```
+
+对**每个文档**按顺序发送两个信号：先 `document_updated`，后 `post_save`。
+
+---
+
+#### ② `document_updated` 信号的接收者与执行顺序
+
+信号接收者在 [documents/apps.py](src/documents/apps.py#L32-L33) 注册，按连接顺序执行：
+
+```
+document_updated.connect(run_workflows_updated)          # 第 1 位
+document_updated.connect(send_websocket_document_updated) # 第 2 位
+```
+
+**接收者 1：run_workflows_updated → run_workflows(DOCUMENT_UPDATED)**
+
+[documents/signals/handlers.py](src/documents/signals/handlers.py#L819-L829) → [run_workflows()](src/documents/signals/handlers.py#L854-L998)：
+
+```
+1. document.refresh_from_db()    ← 从 DB 重新拉取，避免并发覆盖
+2. matching.document_matches_workflow()  判断哪些 Workflow 命中
+3. 对每个命中的 Workflow 按 action.order 执行：
+   ├─ ASSIGNMENT → apply_assignment_to_document()  可能再次修改 storage_path
+   ├─ REMOVAL    → apply_removal_to_document()     可能清空 storage_path
+   ├─ EMAIL / WEBHOOK / PASSWORD_REMOVAL / MOVE_TO_TRASH
+   └─ ...
+4. document.save(
+       update_fields=[
+           "title", "correspondent", "document_type",
+           "storage_path", "owner", "modified",
+       ]                           ← ★ 重要：刻意排除 filename / archive_filename
+   )
+   └─ 触发 @receiver(models.signals.post_save, sender=Document)
+      → update_filename_and_move_files()           ★ 第一次重命名
+```
+
+**关键设计细节** [handlers.py#L966-L984](src/documents/signals/handlers.py#L966-L984)：
+> `update_fields` 刻意**不包含 `filename` 和 `archive_filename`**——因为这两个字段由 `update_filename_and_move_files` 独占管理。如果这里把内存中旧值写回 DB，会覆盖并发重命名任务刚写入的新路径，导致 DB 指向旧路径而文件已在新路径（issue #12386）。
+
+**接收者 2：send_websocket_document_updated**
+
+[documents/signals/handlers.py](src/documents/signals/handlers.py#L832-L851)：
+- 先 `document.refresh_from_db()` 确保拿到 Workflow 执行后最新的 DB 状态
+- 通过 DocumentsStatusManager 发送 WebSocket 消息通知前端刷新
+
+---
+
+#### ③ `post_save.send()` 触发第二次重命名
+
+`bulk_update_documents` 在 `document_updated` 的所有接收者执行完毕后，显式调用：
+
+```python
+post_save.send(Document, instance=doc, created=False)
+```
+
+这个信号匹配 [handlers.py#L431-L433](src/documents/signals/handlers.py#L431-L433) 的装饰器：
+
+```python
+@receiver(models.signals.post_save, sender=CustomFieldInstance, weak=False)
+@receiver(models.signals.m2m_changed, sender=Document.tags.through, weak=False)
+@receiver(models.signals.post_save, sender=Document, weak=False)   # ← 命中这个
+def update_filename_and_move_files(sender, instance, **kwargs):
+```
+
+触发 **第二次重命名** `update_filename_and_move_files()`，对 Workflow 执行后可能再次变化的 `storage_path` / `correspondent` / `document_type` / `tags` / 自定义字段等做最终兜底计算。
+
+---
+
+#### 批量编辑完整时序总结图
+
+```
+用户在前端执行"批量设置 StoragePath"
+  │
+  ▼
+views._execute_document_action()          [API 线程，同步]
+  │
+  ├─ bulk_edit.set_storage_path(doc_ids, sp)
+  │    ├─ QS.update(storage_path=sp)       ── DB 已变更，无信号
+  │    └─ bulk_update_documents.apply_async()
+  │
+  ▼  HTTP 200 返回前端（用户看到"操作成功"）
+─────────────────────────────────────────────────────────────
+  │
+  ▼  [Celery Worker 线程，异步]
+tasks.bulk_update_documents(document_ids)
+  │
+  └─ for each doc:
+       │
+       ├─ clear_document_caches(doc.pk)
+       │
+       ├─ document_updated.send(doc)    ── 第 1 个信号
+       │    │
+       │    ├─ [接收者 1] run_workflows_updated
+       │    │    ├─ doc.refresh_from_db()
+       │    │    ├─ 执行匹配的 DOCUMENT_UPDATED Workflow
+       │    │    │   └─ apply_assignment_to_document()  可能改 storage_path
+       │    │    ├─ doc.save(update_fields=[...])   ── 不含 filename!
+       │    │    │   └─ post_save → update_filename_and_move_files()  ★ 第 1 次重命名
+       │    │    └─ WorkflowRun.objects.create(...)
+       │    │
+       │    └─ [接收者 2] send_websocket_document_updated
+       │         ├─ doc.refresh_from_db()
+       │         └─ WebSocket 通知前端
+       │
+       └─ post_save.send(Document, instance=doc)   ── 第 2 个信号
+            └─ update_filename_and_move_files()             ★ 第 2 次重命名（兜底）
+```
+
+#### 关键结论
+
+| 问题 | 结论 |
+|------|------|
+| 为什么重命名执行两次？ | 第一次在 Workflow 内部 save 时（应对 Workflow 对元数据的二次修改），第二次在 bulk_update_documents 末尾兜底（应对 Workflow 不存在或未修改的情况） |
+| 为什么不直接在 bulk_edit 里 `doc.save()`？ | 为了**先跑 Workflow**：让 DOCUMENT_UPDATED 触发器的 Workflow 有机会进一步修改元数据，再统一做重命名 |
+| `document_updated` 和 `post_save` 谁先执行？ | `document_updated` 先（含 Workflow + WebSocket），全部完成后才发 `post_save` |
+| Workflow 能覆盖批量编辑的 StoragePath 吗？ | **可以**——如果 DOCUMENT_UPDATED Workflow 的 ASSIGNMENT 动作设置了 `assign_storage_path`，会覆盖批量编辑设置的值（Workflow 的 order 越靠后越晚生效） |
+| 两次重命名会不会冲突？ | 不会——都通过 `MEDIA_LOCK` 互斥，且第二次用 `document.refresh_from_db()` 从 DB 读到的是最新状态 |
+| 前端何时拿到通知？ | `document_updated` 的第 2 个接收者发 WebSocket，**在第一次重命名之后、第二次重命名之前**。但前端收到后刷新时第二次重命名通常已完成（同一进程顺序执行） |
 
 ---
 
@@ -640,11 +798,32 @@ thumbnail = document_parser.get_thumbnail(self.working_copy, mime_type)
 
 ### 9.1 触发信号
 
-位于 [documents/signals/handlers.py](src/documents/signals/handlers.py#L431-L668) 的 `update_filename_and_move_files()` 监听以下信号：
+位于 [documents/signals/handlers.py](src/documents/signals/handlers.py#L431-L668) 的 `update_filename_and_move_files()` 通过 `@receiver` 装饰器监听三个 Django 内置信号：
 
-- `post_save` (Document) - 文档保存后（最主要入口，涵盖手动编辑、retagger、消费流程最终 save）
-- `m2m_changed` (Document.tags.through) - 标签变更时（若模板中使用了 `tag_list` 等变量）
+```python
+@receiver(models.signals.post_save, sender=CustomFieldInstance, weak=False)
+@receiver(models.signals.m2m_changed, sender=Document.tags.through, weak=False)
+@receiver(models.signals.post_save, sender=Document, weak=False)
+def update_filename_and_move_files(sender, instance, **kwargs):
+```
+
+三个触发源：
+- `post_save` (Document) - 文档保存后（最主要入口，涵盖手动编辑、retagger、消费流程最终 save、Workflow 内部 save、bulk_update_documents 手动发送）
+- `m2m_changed` (Document.tags.through) - 标签增删改时（若模板中使用了 `tag_list` 等变量）
 - `post_save` (CustomFieldInstance) - 自定义字段值变更时（仅当模板使用了 custom_fields，通过 `_filename_template_uses_custom_fields()` 判断）
+
+> `weak=False` 是关键：防止 receiver 被 Python GC 过早回收。
+
+#### `document_updated` 信号 vs Django `post_save` 信号
+
+项目中存在两个"文档更新"相关的信号，职责不同：
+
+| 信号 | 定义位置 | 触发方式 | 用途 |
+|------|---------|---------|------|
+| `document_updated` | [documents/signals/__init__.py](src/documents/signals/__init__.py) | 应用层代码**显式调用** `.send()` | 变更通知（Workflow、WebSocket），不直接触发文件操作 |
+| `models.signals.post_save` | Django 内置 | Django ORM 在 `Model.save()` 后**自动发送**，或手动 `.send()` | 文件重命名/移动 |
+
+两者的关系：批量编辑等场景中，`document_updated` 先发送（跑 Workflow + 通知前端），其内部 Workflow 的 `save()` 会自动触发 `post_save` → 第一次重命名；随后 `bulk_update_documents` 再显式发一次 `post_save` → 第二次兜底重命名。
 
 ### 9.2 模板是否依赖自定义字段的检测
 
@@ -720,15 +899,18 @@ def _filename_template_uses_custom_fields(doc):
 | 文件 | 主要职责 |
 |------|---------|
 | [documents/matching.py](src/documents/matching.py) | MatchingModel 规则匹配、match_storage_paths() |
-| [documents/apps.py](src/documents/apps.py) | 信号连接注册（消费完成信号顺序） |
+| [documents/apps.py](src/documents/apps.py) | 信号连接注册（消费完成信号顺序、document_updated 接收者） |
+| [documents/signals/__init__.py](src/documents/signals/__init__.py) | 自定义信号定义（document_consumption_started/finished、document_updated） |
+| [documents/tasks.py](src/documents/tasks.py#L253-L275) | bulk_update_documents 异步任务（document_updated + post_save 两次信号发送） |
 | [documents/workflows/mutations.py](src/documents/workflows/mutations.py) | Workflow 赋值/移除动作（含 storage_path） |
-| [documents/bulk_edit.py](src/documents/bulk_edit.py) | 批量 set_storage_path + 异步任务触发 |
+| [documents/bulk_edit.py](src/documents/bulk_edit.py) | 批量 set_storage_path 等操作 + 异步任务触发 |
+| [documents/views.py](src/documents/views.py#L2733-L2776) | 批量编辑 API 入口 _execute_document_action() |
 | [documents/file_handling.py](src/documents/file_handling.py) | 文件名生成、目录创建、空目录清理 |
 | [documents/templating/filepath.py](src/documents/templating/filepath.py) | 模板上下文构建、渲染、验证 |
 | [documents/templating/environment.py](src/documents/templating/environment.py) | Jinja2 沙箱环境配置 |
 | [documents/templating/filters.py](src/documents/templating/filters.py) | 自定义模板过滤器 |
 | [documents/templating/utils.py](src/documents/templating/utils.py) | 旧格式到新格式的转换 |
-| [documents/signals/handlers.py](src/documents/signals/handlers.py) | set_storage_path / update_filename_and_move_files / 删除清理 |
+| [documents/signals/handlers.py](src/documents/signals/handlers.py) | set_storage_path / update_filename_and_move_files / run_workflows / 删除清理 |
 | [documents/consumer.py](src/documents/consumer.py) | 消费流程时序、_store()、落盘逻辑 |
 | [documents/models.py](src/documents/models.py) | Document / StoragePath / MatchingModel 定义 |
 | [documents/management/commands/document_thumbnails.py](src/documents/management/commands/document_thumbnails.py) | 缩略图重新生成命令 |
