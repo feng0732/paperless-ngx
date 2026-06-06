@@ -35,11 +35,355 @@ class StoragePath(MatchingModel):
 - `path` 字段存储 Jinja2 模板字符串，用于为每个文档生成相对路径
 - `Document` 模型通过外键 `storage_path` 关联到 StoragePath
 
+### 2.1 MatchingModel 基类与匹配规则详解
+
+StoragePath 的自动分配能力来源于其基类 `MatchingModel`，定义在 [documents/models.py](src/documents/models.py#L46-L93)：
+
+```python
+class MatchingModel(ModelWithOwner):
+    MATCH_NONE = 0       # 不匹配
+    MATCH_ANY = 1        # 任意词匹配
+    MATCH_ALL = 2        # 所有词匹配
+    MATCH_LITERAL = 3    # 精确字符串匹配
+    MATCH_REGEX = 4      # 正则表达式匹配
+    MATCH_FUZZY = 5      # 模糊匹配
+    MATCH_AUTO = 6       # 机器学习自动分类
+
+    name = models.CharField(max_length=128)
+    match = models.CharField(max_length=256, blank=True)
+    matching_algorithm = models.PositiveSmallIntegerField(default=MATCH_ANY)
+    is_insensitive = models.BooleanField(default=True)
+```
+
+核心匹配函数 `matches()` 位于 [documents/matching.py](src/documents/matching.py#L169-L263)，按匹配算法分别处理：
+
+| 算法 | 匹配逻辑 |
+|------|---------|
+| `MATCH_NONE` | 直接返回 False |
+| `MATCH_ANY` | 关键词按空格/引号分词，文档内容包含**任意一个**词即匹配 |
+| `MATCH_ALL` | 文档内容必须**包含所有**分词 |
+| `MATCH_LITERAL` | 精确字符串匹配（加 `\b` 词边界） |
+| `MATCH_REGEX` | `match` 字段作为正则表达式执行 |
+| `MATCH_FUZZY` | rapidfuzz `partial_ratio ≥ 90` 即匹配 |
+| `MATCH_AUTO` | 此处返回 False，实际匹配在 `match_storage_paths()` 中结合分类器预测 |
+
+### 2.2 match_storage_paths() — StoragePath 专用匹配函数
+
+位于 [documents/matching.py](src/documents/matching.py#L137-L166)：
+
+```python
+def match_storage_paths(document, classifier, user=None):
+    pred_id = classifier.predict_storage_path(document.suggestion_content) if classifier else None
+    # 按用户权限过滤 StoragePath 列表
+    return list(filter(
+        lambda o: matches(o, document)
+                  or (o.pk == pred_id and o.matching_algorithm == MATCH_AUTO),
+        storage_paths
+    ))
+```
+
+匹配条件是 **OR** 关系：
+1. 基于内容/关键词的规则匹配成功（`matches()` 返回 True）
+2. 或该 StoragePath 设置为 `MATCH_AUTO` 且分类器预测的 ID 与之匹配
+
+### 2.3 set_storage_path() — 分配执行函数
+
+位于 [documents/signals/handlers.py](src/documents/signals/handlers.py#L280-L338)：
+
+```python
+def set_storage_path(sender, document, *, logging_group=None, classifier=None,
+                     replace=False, use_first=True, dry_run=False, **kwargs):
+    if document.storage_path and not replace:
+        return None                           # 已有值且不覆盖则跳过
+    potential_storage_paths = match_storage_paths(document, classifier)
+    # 多匹配时：use_first=True 取第一个，否则不分配
+    selected = potential_storage_paths[0] if potential_storage_paths else None
+    if not dry_run:
+        document.storage_path = selected
+        document.save(update_fields=("storage_path",))   # ← 触发 post_save
+    return selected
+```
+
+关键点：
+- `replace=False`（默认）时，若文档已有关联 StoragePath，**不会被覆盖**
+- 多个 StoragePath 同时匹配时，按 `use_first` 决定取第一个还是不分配
+- `document.save(update_fields=("storage_path",))` 会**触发 `post_save` 信号**，进而可能触发重命名
+
 ---
 
-## 三、路径模板（Path Template）实现机制
+## 三、StoragePath 的六大分配入口
 
-### 3.1 模板引擎配置
+StoragePath 分配到 Document 有六条独立的代码路径，每条最终都会通过不同机制触发文件重命名：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    StoragePath 分配入口总览                            │
+├──────────────┬──────────────────────────┬───────────────────────────┤
+│ 入口         │ 分配函数                 │ 触发重命名机制             │
+├──────────────┼──────────────────────────┼───────────────────────────┤
+│ ① 消费前 Workflow │ apply_assignment_to_overrides │ _store() 前写入 metadata │
+│ ② 消费完成信号   │ set_storage_path()     │ document.save() → post_save │
+│ ③ 消费后 Workflow │ apply_assignment_to_document │ document.save() → post_save │
+│ ④ 手动/API 编辑  │ Document.save()        │ post_save 信号              │
+│ ⑤ 批量编辑       │ bulk_edit.set_storage_path() │ bulk_update_documents 任务 │
+│ ⑥ retagger 命令  │ set_storage_path()     │ document.save() → post_save │
+└──────────────┴──────────────────────────┴───────────────────────────┘
+```
+
+---
+
+### 入口 ①：消费前 Workflow（CONSUMPTION 触发器）
+
+**时序位置：文档落盘之前，解析阶段之前**
+
+#### 代码路径
+
+1. 插件注册：`WorkflowTriggerPlugin` 在 [documents/consumer.py](src/documents/consumer.py#L67-L88) 的 `run()` 方法中最先执行
+2. 调用 `run_workflows(trigger_type=CONSUMPTION)` → [handlers.py](src/documents/signals/handlers.py#L854-L999)
+3. 命中 WorkflowAction.ASSIGNMENT 时执行 [apply_assignment_to_overrides()](src/documents/workflows/mutations.py#L113-L192)：
+
+```python
+if action.assign_storage_path:
+    overrides.storage_path_id = action.assign_storage_path.pk
+```
+
+4. Consumer 的 `_store()` 方法中 [apply_overrides()](src/documents/consumer.py#L877-L938)：
+
+```python
+if self.metadata.storage_path_id:
+    document.storage_path = StoragePath.objects.get(pk=self.metadata.storage_path_id)
+```
+
+5. `document.save()` 时 storage_path 已写入数据库，紧接着进入下一步"消费完成信号"
+
+#### 对命名的影响
+
+由于在 `_store()` 阶段就已设置好 `storage_path`，当 consumer 首次调用 `generate_unique_filename(document)` 时（见 [consumer.py](src/documents/consumer.py#L671)），就能直接用 StoragePath 的模板生成路径——**减少一次文件移动**。
+
+---
+
+### 入口 ②：消费完成信号 document_consumption_finished
+
+**时序位置：`_store()` 创建 Document 之后，文件落盘之前**
+
+#### 信号注册
+
+在 [documents/apps.py](src/documents/apps.py#L10-L33) 的 `ready()` 中按如下顺序连接：
+
+```python
+document_consumption_finished.connect(add_inbox_tags)           # 1
+document_consumption_finished.connect(set_correspondent)        # 2
+document_consumption_finished.connect(set_document_type)        # 3
+document_consumption_finished.connect(set_tags)                 # 4
+document_consumption_finished.connect(set_storage_path)         # 5 ← 我们关心的
+document_consumption_finished.connect(add_to_index)             # 6
+document_consumption_finished.connect(run_workflows_added)      # 7
+document_consumption_finished.connect(add_or_update_document_in_llm_index)  # 8
+```
+
+#### 代码执行路径
+
+Consumer 在 [consumer.py](src/documents/consumer.py#L658-L666) 发送信号：
+
+```python
+document_consumption_finished.send(
+    sender=self.__class__,
+    document=document,
+    logging_group=self.logging_group,
+    classifier=classifier,      # ← 带训练好的分类器
+    ...
+)
+```
+
+`set_storage_path()` 使用传入的 `classifier` 做 MATCH_AUTO 预测 + 规则匹配，执行 `document.save(update_fields=("storage_path",))`。
+
+#### 对命名的影响
+
+此时文件**尚未写入 ORIGINALS_DIR**（仍在 MEDIA_LOCK 外等待）。consumer 下一步获得锁后才会调用 `generate_unique_filename()`，所以 StoragePath 的模板同样能在首次落盘时生效，无需额外移动。
+
+> 注意：若 入口①（消费前 Workflow）已设置了 storage_path，`set_storage_path()` 因默认 `replace=False` 会直接 `return None`，不会覆盖。
+
+---
+
+### 入口 ③：消费后 Workflow（DOCUMENT_ADDED 触发器）
+
+**时序位置：消费完成信号的最后一个 handler**
+
+信号链第 7 个 `run_workflows_added` 会触发 [run_workflows(DOCUMENT_ADDED)](src/documents/signals/handlers.py#L803-L817)，命中 ASSIGNMENT 动作时执行 [apply_assignment_to_document()](src/documents/workflows/mutations.py#L16-L111)：
+
+```python
+if action.assign_storage_path:
+    document.storage_path = action.assign_storage_path
+```
+
+在 [handlers.py](src/documents/signals/handlers.py#L975-L984)，run_workflows 末尾会显式保存：
+
+```python
+document.save(update_fields=[
+    "title", "correspondent", "document_type", "storage_path",
+    "owner", "modified",
+])
+```
+
+#### 对命名的影响
+
+**关键点：此时文件可能已经落盘到临时路径。**
+
+整个消费流程在同一个数据库事务中（[consumer.py](src/documents/consumer.py#L587) 的 `with transaction.atomic()`）。run_workflows_added 执行完 `document.save()` 后，consumer 继续执行到获取 MEDIA_LOCK，再调用 `generate_unique_filename(document)` 时读取到的已是最新 storage_path，**仍然可以首次落盘即用正确路径**。
+
+但若 Workflow 触发的是文档**更新**（DOCUMENT_UPDATED 触发器，已有文件），则 save() 触发的 `post_save` → `update_filename_and_move_files()` 会执行真实的文件移动。
+
+---
+
+### 入口 ④：手动编辑 / REST API
+
+**时序位置：任意时刻用户通过前端或 API 修改**
+
+API 层在 [documents/views.py](src/documents/views.py) 中通过标准 DRF serializer 保存 Document。当 `storage_path` 字段被修改时，`Document.save()` 触发 `post_save` 信号。
+
+#### 对命名的影响
+
+由 [update_filename_and_move_files()](src/documents/signals/handlers.py#L434-L668)（已注册为 `post_save` receiver）统一处理：
+- 重新计算 `generate_filename()`
+- 对比旧路径，必要时 `shutil.move()` 移动原始文件和归档文件
+- 清理空目录
+
+---
+
+### 入口 ⑤：批量编辑 Bulk Edit
+
+**时序位置：用户通过批量编辑 API 修改多个文档的 StoragePath**
+
+[documents/bulk_edit.py](src/documents/bulk_edit.py#L134-L153)：
+
+```python
+def set_storage_path(doc_ids, storage_path):
+    qs = Document.objects.filter(Q(id__in=doc_ids) & ~Q(storage_path=storage_path))
+    affected_docs = list(qs.values_list("pk", flat=True))
+    qs.update(storage_path=storage_path)             # ← 用 QuerySet.update，不触发 post_save
+
+    bulk_update_documents.apply_async(               # ← 抛到异步任务
+        kwargs={"document_ids": affected_docs},
+        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
+    )
+    return "OK"
+```
+
+关键点：`QuerySet.update()` **不发送 Django signals**，所以必须手动触发后续流程——通过 Celery 任务 `bulk_update_documents` 逐个对文档 `save()` 以触发 `post_save` → `update_filename_and_move_files()`。
+
+---
+
+### 入口 ⑥：document_retagger 管理命令
+
+**时序位置：管理员手动执行重跑匹配**
+
+[documents/management/commands/document_retagger.py](src/documents/management/commands/document_retagger.py#L317-L328)：
+
+```python
+if do_storage_path:
+    storage_path = set_storage_path(
+        None, document, classifier=classifier,
+        replace=overwrite, use_first=use_first, dry_run=suggest,
+    )
+```
+
+带 `--storage_path` 参数运行时，对每个文档调用与信号相同的 `set_storage_path()` 函数，内部 `document.save(update_fields=("storage_path",))` 自然触发 `post_save` → 文件重命名。
+
+---
+
+## 四、消费流程中 StoragePath → 命名 → 重命名的完整时序
+
+以下是一个新文档被消费时，StoragePath 分配与文件命名之间精确到代码行的时序：
+
+```
+Consumer.run()
+  │
+  ├─ [408] WorkflowTriggerPlugin.run()                         入口①
+  │    └─ run_workflows(CONSUMPTION)
+  │         └─ apply_assignment_to_overrides()
+  │              → overrides.storage_path_id = X
+  │
+  ├─ [500-553] 解析文档，提取文本/日期/缩略图/归档文件
+  │
+  ├─ transaction.atomic() ─────────────────────────────────────┐
+  │                                                              │
+  ├─ [644] _store()                                             │
+  │    ├─ [860] Document.objects.create(                        │
+  │    │       filename=None,  ← 注意：此时 filename 为空        │
+  │    │       storage_path=None,  ← 未设置                     │
+  │    │       ...)                                             │
+  │    ├─ [871] apply_overrides(document)                       │
+  │    │    └─ [892] if metadata.storage_path_id:               │
+  │    │            document.storage_path = StoragePath(...)    │
+  │    └─ [873] document.save()                                 │
+  │         └─ post_save → update_filename_and_move_files()     │
+  │              └─ [465] if not instance.filename: return      │
+  │                 ↑ filename 仍为空，提前返回！不做任何操作     │
+  │                                                              │
+  ├─ [658] document_consumption_finished.send()                 │ 入口②
+  │    ├─ handlers.set_correspondent()                          │
+  │    ├─ handlers.set_document_type()                          │
+  │    ├─ handlers.set_tags()                                   │
+  │    ├─ handlers.set_storage_path()                           │
+  │    │    └─ 若 document.storage_path 已有值（入口①设置的）     │
+  │    │       且 replace=False → return None                    │
+  │    │    └─ 否则匹配并设置 storage_path                       │
+  │    │       document.save(update_fields=("storage_path",))   │
+  │    │         └─ post_save → update_filename_and_move_files  │
+  │    │              └─ filename 仍为空 → return               │
+  │    │                                                         │
+  │    └─ handlers.run_workflows_added()                        │ 入口③
+  │         └─ apply_assignment_to_document()                   │
+  │            document.save(update_fields=["storage_path"...]) │
+  │              └─ post_save → update_filename_and_move_files  │
+  │                 └─ filename 仍为空 → return                  │
+  │                                                              │
+  ├─ [670] with FileLock(MEDIA_LOCK):                            │
+  │    │                                                         │
+  │    ├─ [671] generated_filename =                             │
+  │    │       generate_unique_filename(document)               │ ★ 首次命名
+  │    │    └─ generate_filename()                               │
+  │    │         └─ if context_doc.storage_path is not None:    │
+  │    │              filename_format = storage_path.path       │ ← 读取模板
+  │    │         └─ format_filename() → 渲染 Jinja2             │
+  │    │                                                         │
+  │    ├─ [684] create_source_path_directory(source_path)       │
+  │    ├─ [686] _write(working_copy, source_path)               │ ★ 写入原始文件
+  │    │                                                         │
+  │    ├─ [693] _write(thumbnail, thumbnail_path)               │ ★ 写入缩略图
+  │    │                                                         │
+  │    └─ [698] if archive_path:                                │
+  │         ├─ generate_unique_filename(archive=True)           │ ★ 归档命名
+  │         └─ _write(archive_path, document.archive_path)      │ ★ 写入归档
+  │                                                              │
+  ├─ [729] document.save()  ← 离开 MEDIA_LOCK 后保存            │
+  │    └─ post_save → update_filename_and_move_files()          │ ★ 二次检查/重命名
+  │         └─ [465] if not instance.filename: return → NO      │
+  │            filename 已不为空，执行完整流程：                   │
+  │            1) 从 DB 刷新数据                                 │
+  │            2) generate_filename() 重新计算（可能变了）         │
+  │            3) validate_move 安全检查                         │
+  │            4) shutil.move() 移动文件（如需要）                │
+  │            5) delete_empty_directories() 清理                │
+  │                                                              │
+  └─ transaction.commit() ──────────────────────────────────────┘
+```
+
+### 时序关键结论
+
+1. **filename 为空是重要的"门禁"**：`update_filename_and_move_files()` [handlers.py#L465](src/documents/signals/handlers.py#L465) 开头检查 `if not instance.filename: return`。这保证了消费过程中多次 `document.save()`（存储路径、标签等更新）不会反复尝试移动不存在的文件。
+
+2. **StoragePath 越早设置越高效**：入口①（消费前 Workflow）和入口②（消费完成信号）都是在文件落盘前设置 StoragePath，因此 `generate_unique_filename()` 可直接使用模板生成正确路径，**零文件移动**。
+
+3. **document.save() 离开锁后再触发一次重命名**：[consumer.py#L729](src/documents/consumer.py#L729) 的 save 是有意为之——释放 MEDIA_LOCK 后让 `update_filename_and_move_files()` 以"最终状态"（所有元数据都已稳定）做一次最终的文件名计算和必要的移动。
+
+4. **MEDIA_LOCK 保证互斥**：consumer 内落盘和 `update_filename_and_move_files()` 都获取同一个 `MEDIA_LOCK`，防止并发移动冲突。
+
+---
+
+## 五、路径模板（Path Template）实现机制
+
+### 5.1 模板引擎配置
 
 模板系统基于 Jinja2 的沙箱环境，定义在 [documents/templating/environment.py](src/documents/templating/environment.py)：
 
@@ -57,7 +401,7 @@ _template_environment = JinjaEnvironment(
 )
 ```
 
-### 3.2 自定义 FilePathTemplate 类
+### 5.2 自定义 FilePathTemplate 类
 
 在 [documents/templating/filepath.py](src/documents/templating/filepath.py#L34-L52) 中定义：
 
@@ -72,7 +416,7 @@ class FilePathTemplate(Template):
         return clean_filepath(original_render)
 ```
 
-### 3.3 模板可用变量
+### 5.3 模板可用变量
 
 模板上下文通过多个函数构建，位于 [documents/templating/filepath.py](src/documents/templating/filepath.py)：
 
@@ -122,7 +466,7 @@ custom_fields.<字段名>.value  - 字段值
 
 通过 `document` 变量可访问：`id`, `pk`, `title`, `content`, `page_count`, `created`, `added`, `modified`, `archive_serial_number`, `mime_type`, `checksum`, `archive_checksum`, `filename`, `archive_filename`, `original_filename`, `owner`, `tags`, `correspondent`, `document_type`, `storage_path`
 
-### 3.4 可用过滤器
+### 5.4 可用过滤器
 
 注册在 [documents/templating/filepath.py](src/documents/templating/filepath.py#L101-L107)：
 
@@ -131,7 +475,7 @@ custom_fields.<字段名>.value  - 字段值
 - `slugify` - Django slug 化
 - `localize_date(format, locale)` - Babel 本地化日期
 
-### 3.5 模板验证与渲染
+### 5.5 模板验证与渲染
 
 核心函数 `validate_filepath_template_and_render` 在 [filepath.py](src/documents/templating/filepath.py#L345-L412)：
 
@@ -140,15 +484,15 @@ custom_fields.<字段名>.value  - 字段值
 3. 使用 `FilePathTemplate` 渲染模板
 4. 安全检查：确保渲染结果是**相对路径**且不包含 `..` 遍历
 
-### 3.6 旧格式兼容
+### 5.6 旧格式兼容
 
 [documents/templating/utils.py](src/documents/templating/utils.py) 中的 `convert_format_str_to_template_format()` 将旧的 Python `{var}` 格式转换为 Jinja2 `{{ var }}` 格式。
 
 ---
 
-## 四、文件命名生成流程
+## 六、文件命名生成流程
 
-### 4.1 核心函数调用链
+### 6.1 核心函数调用链
 
 ```
 generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件名
@@ -157,7 +501,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
               └── validate_filepath_template_and_render()  # filepath.py
 ```
 
-### 4.2 `generate_filename()` 详细逻辑
+### 6.2 `generate_filename()` 详细逻辑
 
 位于 [documents/file_handling.py](src/documents/file_handling.py#L125-L185)：
 
@@ -188,7 +532,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 例如: 0000001.pdf, 0000001_v1_01.pdf
 ```
 
-### 4.3 `generate_unique_filename()` 冲突避免
+### 6.3 `generate_unique_filename()` 冲突避免
 
 位于 [documents/file_handling.py](src/documents/file_handling.py#L44-L99)：
 
@@ -196,7 +540,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 2. 若目标路径已存在且不等于旧路径，counter++ 重试（`_01`, `_02`, ...）
 3. 对于归档文件，优先尝试与原始文件同名的 `.pdf` 版本
 
-### 4.4 `format_filename()` 后处理
+### 6.4 `format_filename()` 后处理
 
 位于 [documents/file_handling.py](src/documents/file_handling.py#L102-L122)：
 
@@ -208,9 +552,9 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 
 ---
 
-## 五、归档副本（Archive）管理
+## 七、归档副本（Archive）管理
 
-### 5.1 是否生成归档的判断逻辑
+### 7.1 是否生成归档的判断逻辑
 
 [documents/consumer.py](src/documents/consumer.py#L124-L189) 中的 `should_produce_archive()`：
 
@@ -224,7 +568,7 @@ generate_unique_filename()    # file_handling.py - 生成唯一不冲突文件�
 | `auto` + 原生数字 PDF（有结构标签/文本足够） | ❌ 不生成 |
 | `auto` + 扫描 PDF（无文本/文本极少） | ✅ 生成 |
 
-### 5.2 归档文件存储路径
+### 7.2 归档文件存储路径
 
 Document 模型属性 [models.py](src/documents/models.py#L440-L453)：
 
@@ -246,9 +590,9 @@ def archive_path(self) -> Path | None:
 
 ---
 
-## 六、缩略图（Thumbnail）管理
+## 八、缩略图（Thumbnail）管理
 
-### 6.1 缩略图路径规则
+### 8.1 缩略图路径规则
 
 Document 模型属性 [models.py](src/documents/models.py#L478-L488)：
 
@@ -270,8 +614,9 @@ THUMBNAIL_DIR / {doc_pk:07}.webp
 - 固定使用 WebP 格式
 - 命名仅依赖文档主键，7位数字补零
 - **不使用路径模板**，无分级目录结构
+- StoragePath 变更**不会触发缩略图移动**（与原始文件和归档文件不同）
 
-### 6.2 缩略图生成
+### 8.2 缩略图生成
 
 两种生成方式：
 
@@ -291,115 +636,101 @@ thumbnail = document_parser.get_thumbnail(self.working_copy, mime_type)
 
 ---
 
-## 七、文件自动重命名与移动机制
+## 九、文件自动重命名与移动机制
 
-### 7.1 触发信号
+### 9.1 触发信号
 
 位于 [documents/signals/handlers.py](src/documents/signals/handlers.py#L431-L668) 的 `update_filename_and_move_files()` 监听以下信号：
 
-- `post_save` (Document) - 文档保存后
-- `m2m_changed` (Document.tags.through) - 标签变更时
-- `post_save` (CustomFieldInstance) - 自定义字段值变更时（仅当模板使用了 custom_fields）
+- `post_save` (Document) - 文档保存后（最主要入口，涵盖手动编辑、retagger、消费流程最终 save）
+- `m2m_changed` (Document.tags.through) - 标签变更时（若模板中使用了 `tag_list` 等变量）
+- `post_save` (CustomFieldInstance) - 自定义字段值变更时（仅当模板使用了 custom_fields，通过 `_filename_template_uses_custom_fields()` 判断）
 
-### 7.2 执行流程
+### 9.2 模板是否依赖自定义字段的检测
+
+[handlers.py](src/documents/signals/handlers.py#L417-L427) 避免不必要的重命名：
+
+```python
+def _filename_template_uses_custom_fields(doc):
+    template = doc.storage_path.path if doc.storage_path else settings.FILENAME_FORMAT
+    return template and "custom_fields" in template
+```
+
+### 9.3 执行流程
 
 ```
-1. 获取 FileLock(settings.MEDIA_LOCK) 锁
-2. 从数据库刷新文档数据
-3. 调用 generate_filename() 计算新路径
-   - 若路径超长，跳过
-   - 若目标已存在且校验和匹配，视为已移动
-   - 若目标已存在且非同一文件，调用 generate_unique_filename()
-4. 对原始文件和归档文件分别计算
-5. validate_move() 安全检查：
-   - 新路径必须在 ORIGINALS_DIR / ARCHIVE_DIR 内
+1. if isinstance(instance, CustomFieldInstance):
+     若模板不含 custom_fields → return
+     否则 instance = instance.document
+
+2. if not instance.filename: return   ← 消费过程中的 save 均被此门禁拦截
+
+3. 获取 FileLock(settings.MEDIA_LOCK) 锁
+4. 从数据库刷新文档数据（等待锁期间可能被其他进程更新）
+5. 调用 generate_filename() 计算新路径
+   - 若路径超过 MAX_STORED_FILENAME_LENGTH (1024) → 抛出异常
+   - 若目标已存在且校验和匹配 → 视为已移动（original_already_moved=True）
+   - 若目标已存在且非同一文件 → 调用 generate_unique_filename()
+6. 对原始文件和归档文件分别计算
+7. validate_move() 安全检查：
+   - 新路径必须在 ORIGINALS_DIR / ARCHIVE_DIR 内（不能越界）
    - 旧文件必须存在
    - 新文件不能已存在
-6. create_source_path_directory() 创建父目录
-7. shutil.move() 执行文件移动
-8. Document.objects.filter(pk=...).update() 更新数据库（避免触发 save 递归）
-9. delete_empty_directories() 清理空目录
-10. 若为根文档，同步处理所有版本文档
+8. create_source_path_directory() 创建父目录
+9. shutil.move() 执行文件移动
+10. Document.objects.filter(pk=...).update() 更新数据库
+    ↑ 用 QuerySet.update 而非 save()，避免触发 post_save 导致无限递归
+11. delete_empty_directories() 清理空目录
+12. 若为根文档（root_document_id is None）：
+    递归调用 update_filename_and_move_files() 同步所有版本文档
 ```
 
-### 7.3 异常回滚
+### 9.4 异常回滚
 
 若移动或保存过程中出现异常：
 1. 尝试将文件移回原位置
 2. 恢复 instance 的旧 filename / archive_filename 值
-3. 记录警告日志
+3. 记录警告日志（文件不一致由 sanity_checker 后续处理）
 
-### 7.4 目录清理
+### 9.5 目录清理
 
 `delete_empty_directories()` 在 [file_handling.py](src/documents/file_handling.py#L15-L41)：
 - 从文件所在目录开始向上遍历
 - 遇到空目录则删除
 - 到达根目录（ORIGINALS_DIR / ARCHIVE_DIR）停止
-- 确保不越界删除根目录外的内容
+- 确保不越界删除根目录外的内容（通过 `is_relative_to(root)` 校验）
 
 ---
 
-## 八、消费流程中的完整文件处理
-
-[documents/consumer.py](src/documents/consumer.py#L586-L784) 中的文件落盘流程：
-
-```
-事务开始
-  │
-  ├─ 1. _store() 创建 Document 数据库记录（filename 此时为空）
-  │
-  ├─ 2. document_consumption_finished 信号
-  │     └─ 自动分配 correspondent / document_type / tags / storage_path
-  │
-  ├─ 3. 获取 MEDIA_LOCK
-  │     │
-  │     ├─ 3a. generate_unique_filename(document) → filename
-  │     │    超长则回退到 use_format=False 的默认命名
-  │     ├─ 3b. 创建父目录
-  │     ├─ 3c. 写入原始文件 → document.source_path
-  │     │
-  │     ├─ 3d. 写入缩略图 → document.thumbnail_path
-  │     │
-  │     └─ 3e. 若有归档文件：
-  │           generate_unique_filename(archive_filename=True) → archive_filename
-  │           创建父目录
-  │           写入归档文件 → document.archive_path
-  │           计算 archive_checksum
-  │
-  ├─ 4. 释放锁，调用 document.save()
-  │     └─ 触发 post_save → update_filename_and_move_files()
-  │        （此时 filename 已有值，会根据最新 storage_path 等重新计算并移动）
-  │
-  └─ 5. 删除临时文件（原始/工作副本/unmodified_original/shadow file）
-事务结束
-```
-
----
-
-## 九、文档删除时的文件清理
+## 十、文档删除时的文件清理
 
 [documents/signals/handlers.py](src/documents/signals/handlers.py#L342-L402) 的 `cleanup_document_deletion()`：
 
 1. 获取 MEDIA_LOCK
 2. 若配置了 EMPTY_TRASH_DIR：
-   - 将原始文件移动到回收站目录（自动处理同名冲突）
+   - 将原始文件移动到回收站目录（自动处理同名冲突，追加 `_01`, `_02` 等）
    - 归档文件和缩略图直接删除
 3. 否则三个文件全部直接删除
 4. 清理原始文件和归档文件所在的空目录
 
 ---
 
-## 十、核心文件索引
+## 十一、核心文件索引
 
 | 文件 | 主要职责 |
 |------|---------|
+| [documents/matching.py](src/documents/matching.py) | MatchingModel 规则匹配、match_storage_paths() |
+| [documents/apps.py](src/documents/apps.py) | 信号连接注册（消费完成信号顺序） |
+| [documents/workflows/mutations.py](src/documents/workflows/mutations.py) | Workflow 赋值/移除动作（含 storage_path） |
+| [documents/bulk_edit.py](src/documents/bulk_edit.py) | 批量 set_storage_path + 异步任务触发 |
 | [documents/file_handling.py](src/documents/file_handling.py) | 文件名生成、目录创建、空目录清理 |
 | [documents/templating/filepath.py](src/documents/templating/filepath.py) | 模板上下文构建、渲染、验证 |
 | [documents/templating/environment.py](src/documents/templating/environment.py) | Jinja2 沙箱环境配置 |
 | [documents/templating/filters.py](src/documents/templating/filters.py) | 自定义模板过滤器 |
 | [documents/templating/utils.py](src/documents/templating/utils.py) | 旧格式到新格式的转换 |
-| [documents/signals/handlers.py](src/documents/signals/handlers.py) | 自动重命名/移动、删除清理 |
-| [documents/consumer.py](src/documents/consumer.py) | 消费流程中的文件落盘 |
-| [documents/models.py](src/documents/models.py) | Document / StoragePath 模型定义及 path 属性 |
+| [documents/signals/handlers.py](src/documents/signals/handlers.py) | set_storage_path / update_filename_and_move_files / 删除清理 |
+| [documents/consumer.py](src/documents/consumer.py) | 消费流程时序、_store()、落盘逻辑 |
+| [documents/models.py](src/documents/models.py) | Document / StoragePath / MatchingModel 定义 |
 | [documents/management/commands/document_thumbnails.py](src/documents/management/commands/document_thumbnails.py) | 缩略图重新生成命令 |
+| [documents/management/commands/document_retagger.py](src/documents/management/commands/document_retagger.py) | retagger 批量重新匹配命令 |
 | [paperless/settings/__init__.py](src/paperless/settings/__init__.py#L65-L88) | 目录配置和全局模板配置 |
