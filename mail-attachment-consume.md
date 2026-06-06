@@ -262,7 +262,7 @@ TextDocumentParser → RemoteDocumentParser → TikaDocumentParser → MailDocum
 | **RasterisedDocumentParser**（Tesseract OCR）<br>[tesseract.py#L47-L95](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/tesseract.py#L47-L95) | `application/pdf` → .pdf<br>`image/jpeg` → .jpg<br>`image/png` → .png<br>`image/tiff` → .tif<br>`image/gif` → .gif<br>`image/bmp` → .bmp<br>`image/webp` → .webp<br>`image/heic` | 10 | 始终启用 |
 | **RemoteDocumentParser**（Azure AI 等远程 OCR）<br>[remote.py#L35-L149](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/remote.py#L35-L149) | `application/pdf` → .pdf<br>`image/png` → .png<br>`image/jpeg` → .jpg<br>`image/tiff` → .tiff<br>`image/bmp` → .bmp<br>`image/gif` → .gif<br>`image/webp` | 20 | `REMOTE_OCR_ENGINE` + API Key + Endpoint 必须完整配置；<br>分数比 Tesseract 高，配置生效时自动优先 |
 | **TikaDocumentParser**（办公文档，需 Tika + Gotenberg）<br>[tika.py#L42-L135](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/tika.py#L42-L135) | `application/msword` → .doc<br>`application/vnd.openxmlformats-officedocument.wordprocessingml.document` → .docx<br>`application/vnd.ms-excel` → .xls<br>`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` → .xlsx<br>`application/vnd.ms-powerpoint` → .ppt<br>`application/vnd.openxmlformats-officedocument.presentationml.presentation` → .pptx<br>`application/vnd.openxmlformats-officedocument.presentationml.slideshow` → .ppsx<br>`application/vnd.oasis.opendocument.presentation` → .odp<br>`application/vnd.oasis.opendocument.spreadsheet` → .ods<br>`application/vnd.oasis.opendocument.text` → .odt<br>`application/vnd.oasis.opendocument.graphics` → .odg<br>`text/rtf` → .rtf | 10 | `TIKA_ENABLED=True` 且 Gotenberg 可用 |
-| **MailDocumentParser**（.eml 邮件文件）<br>[mail.py#L57-L59](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/mail.py#L57-L59) | `message/rfc822` → .eml | — | — |
+| **MailDocumentParser**（.eml 邮件文件）<br>[mail.py#L109-L133](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/mail.py#L109-L133) | `message/rfc822` → .eml | 10 | 始终启用 |
 | **TextDocumentParser**（纯文本）<br>[text.py#L34-L105](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless/parsers/text.py#L34-L105) | `text/plain` → .txt<br>`text/csv` → .csv<br>`application/csv` → .csv | 10 | 始终启用 |
 
 > **结论**：邮件附件能被接收的 MIME 覆盖范围 = 以上五个内置解析器（以及任何已安装的第三方插件解析器）的 MIME 并集，且对应解析器的 `score()` 不返回 `None`（即启用条件满足）。
@@ -339,44 +339,120 @@ Correspondent 来源（`_get_correspondent`）：[mail.py#L512-L538](file:///d:/
 - `FROM_CUSTOM`：`rule.assign_correspondent` 指定
 - `FROM_NOTHING`：不指定
 
-### 6.4 queue_consumption_tasks — Chord 编排
+### 6.4 queue_consumption_tasks — Chord 编排与参数传递
 
 定义位置：[mail.py#L334-L358](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L334-L358)
 
+`queue_consumption_tasks` 是关键字-only 函数（签名中 `*` 之后所有参数必须以关键字方式传入）：
+
 ```python
-def queue_consumption_tasks(consume_tasks, rule, message):
-    mail_action_task = apply_mail_action.s(
-        rule_id=rule.pk,
-        uid=message.uid,
-        folder=rule.folder,
-        subject=message.subject,
-        date=message.date,
-    )
-    chord(header=consume_tasks, body=mail_action_task) \
-        .on_error(error_callback.s(rule_id=rule.pk, ...)) \
-        .delay()
+def queue_consumption_tasks(
+    *,
+    consume_tasks: list[Signature],   # consume_file.s() 的签名列表
+    rule: MailRule,                   # 当前匹配的规则
+    message: MailMessage,             # 当前处理的邮件对象
+) -> None:
 ```
 
-单个 Chord 的执行模式：
+#### 参数传递链：从 queue_consumption_tasks 到 apply_mail_action / error_callback
+
+```
+queue_consumption_tasks(consume_tasks=..., rule=R, message=M)
+  │
+  ├─ 构造 apply_mail_action.s() 的签名（body）
+  │   apply_mail_action.s(
+  │       rule_id          = R.pk,           # int：规则 ID
+  │       message_uid      = M.uid,          # str：IMAP UID（来自 message.uid）
+  │       message_subject  = M.subject,      # str：邮件主题（来自 message.subject）
+  │       message_date     = M.date,         # datetime：邮件日期（来自 message.date）
+  │   )
+  │   ⚠️  注意：folder 并未作为参数传入 apply_mail_action
+  │
+  ├─ 构造 error_callback.s() 的签名（on_error 回调）
+  │   error_callback.s(
+  │       rule_id          = R.pk,
+  │       message_uid      = M.uid,
+  │       message_subject  = M.subject,
+  │       message_date     = M.date,
+  │   )
+  │
+  └─ chord(header=consume_tasks, body=apply_mail_action_sig)
+         .on_error(error_callback_sig)
+         .delay()
+```
+
+#### apply_mail_action 函数签名与内部取 folder 的方式
+
+`apply_mail_action` 定义：[mail.py#L240-L304](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L240-L304)
+
+```python
+@shared_task
+def apply_mail_action(
+    result: list,              # Celery Chord body 自动注入：所有 header 任务的返回值列表
+    rule_id: int,              # ← 来自 queue_consumption_tasks 的 R.pk
+    message_uid: str,          # ← 来自 M.uid
+    message_subject: str,      # ← 来自 M.subject
+    message_date: datetime.datetime,  # ← 来自 M.date
+) -> None:
+```
+
+内部通过 `rule_id` 反向查 rule 再取 `rule.folder`，而不是接收显式参数：
+
+```python
+rule = MailRule.objects.get(pk=rule_id)           # 查数据库取 rule
+...
+ProcessedMail.objects.create(
+    rule    = rule,
+    folder  = rule.folder,        # ⚠️ folder 从 rule 对象上取，不是参数传入
+    uid     = message_uid,
+    subject = message_subject,
+    received= message_date,
+    status  = "SUCCESS",
+)
+```
+
+`error_callback` 定义：[mail.py#L307-L331](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L307-L331)
+
+```python
+@shared_task
+def error_callback(
+    request,                    # Celery on_error 自动注入：失败任务的 request
+    exc,                        # Celery on_error 自动注入：异常对象
+    tb,                         # Celery on_error 自动注入：traceback
+    rule_id: int,               # ← 来自 queue_consumption_tasks
+    message_uid: str,
+    message_subject: str,
+    message_date: datetime.datetime,
+) -> None:
+```
+
+内部同样通过 `rule = MailRule.objects.get(pk=rule_id)` 取 `rule.folder` 写入 ProcessedMail。
+
+#### 单个 Chord 的执行模式：
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
 │  header（并行）：所有 consume_file 任务                       │
 │    consume_file(附件1)  consume_file(附件2)  ...                  │
 └───────────────────────────┬────────────────────────────────────────┘
-                            │ 全部成功完成
+                            │ 全部成功完成 → result = [ret1, ret2, ...]
                             ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│  body：apply_mail_action                                      │
-│    1. 重新连接 IMAP                                         │
-│    2. action.post_consume() 执行邮件动作（MARK_READ 等）            │
-│    3. ProcessedMail.objects.create(status="SUCCESS")                │
+│  body：apply_mail_action(result, rule_id, message_uid,             │
+│                           message_subject, message_date)            │
+│    1. rule = MailRule.objects.get(pk=rule_id)                       │
+│    2. 重新连接 IMAP，M.folder.set(rule.folder)                      │
+│    3. action.post_consume(M, message_uid, rule.action_parameter)    │
+│    4. ProcessedMail.objects.create(                                 │
+│          folder=rule.folder,  uid=message_uid, ...)                 │
 └────────────────────────────────────────────────────────────────────┘
                             │ 任一 header 任务失败
                             ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│  error_callback：error_callback                                   │
-│    - ProcessedMail.objects.create(status="FAILED", error=traceback) │
+│  error_callback(request, exc, tb, rule_id, message_uid, ...)       │
+│    1. rule = MailRule.objects.get(pk=rule_id)                       │
+│    2. ProcessedMail.objects.create(                                 │
+│          folder=rule.folder, status="FAILED", error=traceback)      │
 └────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -402,19 +478,23 @@ if rule.consumption_scope in (ATTACHMENTS_ONLY, EVERYTHING):
 _handle_message()
   │
   ├─ _process_eml()
-  │   └─ queue_consumption_tasks([eml_consume_task], ...)
+  │   └─ queue_consumption_tasks(consume_tasks=[eml_consume_task], rule=R, message=M)
   │        └─ Chord A：
   │           ├─ header = [consume_file(eml)]
-  │           ├─ body   = apply_mail_action(rule, uid, folder, ...)   ← 写 1 条 ProcessedMail(SUCCESS/FAILED)
-  │           └─ .on_error(error_callback(...))
+  │           ├─ body   = apply_mail_action(result, rule_id, message_uid, message_subject, message_date)
+  │           │            内部通过 rule_id 查 rule 后取 rule.folder
+  │           │            ← 写 1 条 ProcessedMail(SUCCESS/FAILED)
+  │           └─ .on_error(error_callback(request, exc, tb, rule_id, message_uid, ...))
   │
   └─ _process_attachments()
       ├─ 遍历附件，构造 consume_tasks = [att1_task, att2_task, ...]
-      └─ queue_consumption_tasks(consume_tasks, ...)
+      └─ queue_consumption_tasks(consume_tasks=consume_tasks, rule=R, message=M)
            └─ Chord B：
               ├─ header = [consume_file(att1), consume_file(att2), ...]
-              ├─ body   = apply_mail_action(rule, uid, folder, ...)   ← 再写 1 条 ProcessedMail(SUCCESS/FAILED)
-              └─ .on_error(error_callback(...))
+              ├─ body   = apply_mail_action(result, rule_id, message_uid, message_subject, message_date)
+              │            内部通过 rule_id 查 rule 后取 rule.folder
+              │            ← 再写 1 条 ProcessedMail(SUCCESS/FAILED)
+              └─ .on_error(error_callback(request, exc, tb, rule_id, message_uid, ...))
 ```
 
 **两个 Chord 之间没有任何同步或依赖关系**，Celery 会并行调度它们各自的 header。
@@ -444,14 +524,34 @@ _handle_message()
 
 定义位置：[mail.py#L240-L304](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L240-L304)
 
+函数签名：
+```python
+def apply_mail_action(
+    result: list,              # Chord body 自动注入：header 任务返回值列表
+    rule_id: int,              # ← 来自 queue_consumption_tasks
+    message_uid: str,          # ← 来自 message.uid
+    message_subject: str,      # ← 来自 message.subject
+    message_date: datetime.datetime,  # ← 来自 message.date
+) -> None:
 ```
-1. 重新连接邮箱（与 handle_mail_account 相同逻辑）
-2. rule.action.post_consume(M, uid) 执行 IMAP 操作
-3. ProcessedMail.objects.create(
-       rule=rule, folder=rule.folder, uid=uid,
-       subject=subject, received=date,
+
+执行流程：
+```
+1. rule = MailRule.objects.get(pk=rule_id)   # 用 rule_id 反查 rule，取 rule.folder
+2. account = MailAccount.objects.get(pk=rule.account.pk)
+3. 重新连接邮箱（与 handle_mail_account 相同逻辑）
+4. M.folder.set(rule.folder)                  # folder 来自 rule，非参数传入
+5. action.post_consume(M, message_uid, rule.action_parameter)  执行 IMAP 动作
+6. ProcessedMail.objects.create(
+       owner=rule.owner,
+       rule=rule,
+       folder=rule.folder,      # folder 来自 rule 对象
+       uid=message_uid,         # 来自参数 message_uid
+       subject=message_subject, # 来自参数 message_subject
+       received=message_date,   # 来自参数 message_date（自动补 timezone）
        status="SUCCESS",
    )
+7. 异常时：写入 status="FAILED" 且带上 traceback
 ```
 
 ### 6.7 无合格附件时的处理
@@ -516,7 +616,7 @@ process_mail_accounts() [Celery Task]
                            │         ├─ 写临时 .eml
                            │         ├─ ConsumableDocument(MailFetch)
                            │         ├─ DocumentMetadataOverrides
-                           │         └─ queue_consumption_tasks([eml_task])  ← Chord A 入队
+                           │         └─ queue_consumption_tasks(consume_tasks=[eml_task], rule=R, message=M)  ← Chord A 入队
                            │
                            └─ ATTACHMENTS_ONLY / EVERYTHING:
                                 └─ _process_attachments()
@@ -530,10 +630,10 @@ process_mail_accounts() [Celery Task]
                                           │       ConsumableDocument + Overrides
                                           │       consume_file.s() 加入列表
                                           └─ 全部附件处理完毕：
-                                               ├─ 有任务：queue_consumption_tasks([att1, att2, ...]) ← Chord B 入队
+                                               ├─ 有任务：queue_consumption_tasks(consume_tasks=[att1, att2...], rule=R, message=M)  ← Chord B 入队
                                                └─ 无任务：ProcessedMail(PROCESSED_WO_CONSUMPTION) （需 .eml 侧尚未写入）
 ```
 
 Chord A 和 Chord B 在 Celery 中独立执行，各自完成后分别：
-- 执行一次 `apply_mail_action`（IMAP 动作 + 写 `ProcessedMail`）
-- 出错时通过 `error_callback` 写 `ProcessedMail(FAILED)`
+- 执行 `apply_mail_action(result, rule_id, message_uid, message_subject, message_date)`：内部通过 rule_id 查 rule 得到 folder，再执行 IMAP 动作并写 `ProcessedMail(SUCCESS/FAILED)`
+- 出错时通过 `error_callback(request, exc, tb, rule_id, message_uid, message_subject, message_date)` 写 `ProcessedMail(FAILED)`
