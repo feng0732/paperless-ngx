@@ -654,7 +654,132 @@ def __str__(self) -> str:
 
 ---
 
-## 七、完整调用链总览
+### 6.6 CustomFieldInstance 删除后的审计记录可见性
+
+CustomFieldInstance 继承自 `django-soft-delete` 的 `SoftDeleteModel`，其删除行为分为软删（`.delete()`）和硬删（`.hard_delete()`）两种，不同场景下 LogEntry 的生成和 history 接口的可见性存在显著差异。
+
+#### 6.6.1 前置知识：django-soft-delete 与 django-auditlog 的交互
+
+根据 `django-soft-delete~=1.0.18` 的实现：
+
+| 操作 | 执行方式 | 触发的 Django Signal | django-auditlog 行为 |
+|------|----------|------|------|
+| **软删** `.delete()` | UPDATE `is_deleted=True, deleted_at=now()` | `pre_save` + `post_save` | 生成 **UPDATE** action LogEntry，记录 `is_deleted` 和 `deleted_at` 字段变化 |
+| **硬删** `.hard_delete()` | 真正的 SQL DELETE | `pre_delete` + `post_delete` | 生成 **DELETE** action LogEntry，`changes` 记录删除前各字段值 |
+
+三个 Manager 的过滤范围：
+| Manager | 过滤条件 | 包含软删 | 包含硬删 |
+|------|------|------|------|
+| `objects`（SoftDeleteManager，默认） | `is_deleted=False` | ❌ | ❌ |
+| `deleted_objects`（DeletedManager） | `is_deleted=True` | ✅ | ❌ |
+| `global_objects`（GlobalManager） | 无过滤 | ✅ | ❌ |
+
+**关键边界**：反向 FK 关联（`doc.custom_fields`）遵循目标模型的默认 Manager，即 `SoftDeleteManager`。因此 `doc.custom_fields.all()` 只返回 `is_deleted=False` 的实例。
+
+#### 6.6.2 场景一：普通 Document 更新（PATCH/PUT）
+
+代码路径：[DocumentSerializer.update()](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/serialisers.py#L1130-L1211)
+
+```python
+# 步骤 1: NestedUpdateMixin 处理嵌套 custom_fields 更新
+# drf-writable-nested 的 NestedUpdateMixin 会对"请求中未传入的旧实例"调用 .delete()
+with set_actor(self.user):
+    super().update(instance, validated_data)   # 包含软删操作
+
+# 步骤 2: 对软删的实例执行硬删清理
+CustomFieldInstance.deleted_objects.filter(document=instance).delete()
+```
+
+**两阶段删除过程详解**：
+
+| 阶段 | 操作 | 删除类型 | Signal | LogEntry 生成 | changes 内容 |
+|------|------|----------|------|------|------|
+| 1 | `instance.delete()`（NestedUpdateMixin 内部） | 软删 | `post_save` | ✅ UPDATE action | `{"is_deleted": [false, true], "deleted_at": [null, "<timestamp>"], ...}` |
+| 2 | `deleted_objects.filter(...).delete()` | 硬删 | `pre_delete` | ✅ DELETE action | `{"document": [42, null], "field": [7, null], "value_text": ["old", null], ...}` |
+
+**history 接口可见性**：
+
+history API 查询逻辑（[views.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/views.py#L1778-L1780)）：
+```python
+for entry in LogEntry.objects.get_for_objects(doc.custom_fields.all()):
+```
+
+`doc.custom_fields.all()` 只返回未被软删的实例。对于一个被完整删除的 CustomFieldInstance：
+
+- 在阶段 1（软删）之后：实例已被标记 `is_deleted=True`，不在 `doc.custom_fields.all()` 中 → 阶段 1 产生的 UPDATE LogEntry **不可见**
+- 在阶段 2（硬删）之后：实例已从数据库移除，当然也不在 `doc.custom_fields.all()` 中 → 阶段 2 产生的 DELETE LogEntry **不可见**
+- 该实例在被删除之前产生的所有 CREATE / UPDATE LogEntry（如创建时、修改值时），同样因为 `doc.custom_fields.all()` 不含该实例而**全部不可见**
+
+**结论**：通过普通 Document PATCH/PUT 移除的自定义字段，其完整审计历史从 history 接口中**完全消失**，尽管两条 LogEntry 仍存在于 `auditlog_logentry` 表中。
+
+#### 6.6.3 场景二：批量编辑 modify_custom_fields（remove_custom_fields）
+
+代码路径：[bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/bulk_edit.py#L345-L349)
+
+```python
+CustomFieldInstance.objects.filter(
+    document_id__in=affected_docs,
+    field_id__in=remove_custom_fields,
+).hard_delete()
+```
+
+| 操作 | 删除类型 | Signal | LogEntry 生成 |
+|------|----------|------|------|
+| `.hard_delete()` | 直接硬删 | `pre_delete` | ✅ DELETE action |
+
+同时，[BulkEditView.post()](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/views.py#L2889-L2907) 还会在 Document 上手动生成一条分流 B 的手动日志：
+
+```python
+changes={"custom_fields": [old_pk, [new_pk_list]]}
+```
+
+**history 接口可见性**：
+
+| 日志来源 | 可见性 | 原因 |
+|------|------|------|
+| CustomFieldInstance 的 DELETE LogEntry（分流 C） | ❌ **不可见** | `doc.custom_fields.all()` 不含已硬删的实例 |
+| Document 上的手动 LogEntry（分流 B） | ✅ **可见** | 挂在 Document 上，通过 `LogEntry.objects.get_for_object(doc)` 查询 |
+
+**结论**：批量移除自定义字段时，只有 Document 级别的手动日志（显示 pk ID 列表）可见，CustomFieldInstance 自身的完整变更历史（含 DELETE action）从 history 接口中不可见。
+
+#### 6.6.4 场景三：工作流突变 remove_custom_fields
+
+代码路径：[workflows/mutations.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/workflows/mutations.py#L266-L272)
+
+```python
+if action.remove_all_custom_fields:
+    CustomFieldInstance.objects.filter(document=document).hard_delete()
+elif action.has_remove_custom_fields:
+    CustomFieldInstance.objects.filter(
+        field__in=action.remove_custom_fields.all(),
+        document=document,
+    ).hard_delete()
+```
+
+与场景二完全一致：直接 `.hard_delete()` → DELETE action LogEntry。
+
+| 日志来源 | 可见性 |
+|------|------|
+| CustomFieldInstance 的 DELETE LogEntry（分流 C） | ❌ **不可见** |
+| Document 级别的日志 | ❌ 不生成（工作流不调用 BulkEditView 的手动日志逻辑） |
+
+**结论**：工作流移除自定义字段时，history 接口上**没有任何该删除操作的痕迹**——既没有 CustomFieldInstance 自身的 DELETE 日志，也没有 Document 级别的手动日志。只有在删除前通过其他路径（普通 API 更新、批量编辑）已经生成并挂载到 Document 上的日志才可能保留。
+
+#### 6.6.5 四种场景的可见性对比总表
+
+| 场景 | 软删阶段 UPDATE LogEntry | 硬删阶段 DELETE LogEntry | Document 级手动日志 | history 接口实际可见内容 |
+|------|------|------|------|------|
+| **普通 Document PATCH/PUT** | ✅ 生成但 ❌ 不可见 | ✅ 生成但 ❌ 不可见 | ❌ 不生成 | 无任何删除痕迹 |
+| **批量编辑 remove** | ❌ 无软删阶段 | ✅ 生成但 ❌ 不可见 | ✅ 生成且 ✅ 可见 | 只有 `Custom Fields: [pk 列表]` 一条 |
+| **工作流 remove** | ❌ 无软删阶段 | ✅ 生成但 ❌ 不可见 | ❌ 不生成 | 无任何删除痕迹 |
+| **仅修改值（不删除）** | N/A | N/A | N/A | ✅ 完整可见（实例存在于 `doc.custom_fields.all()`） |
+
+**根因分析**：
+history API 依赖 `doc.custom_fields.all()` 来确定需要查询哪些 CustomFieldInstance 的 LogEntry，但默认 `SoftDeleteManager` 过滤掉了已软删/硬删的实例，导致这些实例的所有历史记录都无法通过 `LogEntry.objects.get_for_objects()` 查询到。`get_for_objects()` 的实现是按 content_type + object_id 列表过滤，传入的实例集合中不包含已删除对象，因此它们的 LogEntry 永远不会被匹配到。
+
+---
+
+## 八、完整调用链总览
 
 ```
 用户操作
