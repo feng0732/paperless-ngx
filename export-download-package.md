@@ -2,13 +2,14 @@
 
 ## 一、整体架构概览
 
-Paperless-ngx 的导出/下载功能分为 **四条主要链路**：
+Paperless-ngx 的导出/下载功能分为 **四条主要链路**（分享链接打包含 create / rebuild 两个入口）：
 
 | 链路 | 入口 | 场景 | 核心文件 |
 |------|------|------|----------|
 | **单文档下载** | `GET /api/documents/{id}/download/` | 用户下载单个文档 | [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py) |
 | **批量打包下载** | `POST /api/documents/bulk_download/` | 用户多选文档打包成 ZIP | [bulk_download.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/bulk_download.py), [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L3714-L3771) |
-| **分享链接打包** | 先 `POST /api/share_link_bundles/` 创建 → Celery 任务 `build_share_link_bundle` 异步打包 | 生成对外分享 ZIP | [tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/tasks.py#L657-L745), [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4284-L4372) |
+| **分享链接打包 — 创建** | `POST /api/share_link_bundles/` → Celery `build_share_link_bundle` | 新建对外分享 ZIP | [tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/tasks.py#L657-L745), [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4284-L4372) |
+| **分享链接打包 — 重新打包** | `POST /api/share_link_bundles/{id}/rebuild/` | 重建已存在分享 ZIP | [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4374-L4405) |
 | **CLI 全量导出** | `python manage.py document_exporter` 管理命令 | 运维人员做数据备份迁移 | [document_exporter.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/management/commands/document_exporter.py) |
 
 路由注册在 [paperless/urls.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/paperless/urls.py#L186-L189)。
@@ -283,9 +284,9 @@ def add_document(self, doc):
     self.zipf.write(doc.source_path, self.make_unique_filename(doc, folder="originals/"))
 ```
 
-### 4.2 分享链接打包 — 两段式流程
+### 4.2 分享链接打包 — 三段式流程
 
-分享链接打包分**同步创建校验**和**异步打包执行**两个阶段。
+分享链接打包分 **同步创建校验** → **异步打包执行** → **公开下载** 三个阶段，另有独立的 **重新打包（rebuild）** 入口。
 
 #### 阶段一：创建时同步校验 — ShareLinkBundleViewSet.create
 
@@ -293,7 +294,8 @@ def add_document(self, doc):
 
 ```python
 class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
-    permission_classes = (IsAuthenticated, PaperlessObjectPermissions)  # Bundle 对象本身的 CRUD 权限
+    permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
+    # PaperlessObjectPermissions 要求：全局 add_sharelinkbundle 权限 + 对象级 owner/guardian
     filter_backends = (..., ObjectOwnedOrGrantedPermissionsFilter)
 
     def create(self, request, *args, **kwargs):
@@ -301,7 +303,6 @@ class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
         serializer.is_valid(raise_exception=True)
         document_ids = serializer.validated_data["document_ids"]
         documents_qs = Document.objects.filter(pk__in=document_ids).select_related("owner")
-        # ...
 
         documents = list(documents_qs)
         for document in documents:
@@ -310,8 +311,51 @@ class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
                 raise ValidationError({"document_ids": _("Insufficient permissions to share document %(id)s.")})
 
         # ... 保存 bundle，owner=request.user
-        build_share_link_bundle.apply_async(kwargs={"bundle_id": bundle.pk})  # 提交异步任务
+        build_share_link_bundle.apply_async(kwargs={"bundle_id": bundle.pk})
 ```
+
+#### 阶段一点五：重新打包（Rebuild） — ShareLinkBundleViewSet.rebuild
+
+位置：[views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4374-L4405)
+
+```python
+@action(detail=True, methods=["post"])
+def rebuild(self, request, pk=None):
+    # ⚠️ 先通过 self.get_object() 触发 DRF 的两层权限校验：
+    #   1) check_permissions  → PaperlessObjectPermissions.has_permission
+    #                         → 必须有全局 documents.change_sharelinkbundle 权限
+    #   2) check_object_permissions → PaperlessObjectPermissions.has_object_permission
+    #                         → 必须是 bundle.owner 或有 guardian 对象级 change 授权
+    bundle = self.get_object()
+    if bundle.status == ShareLinkBundle.Status.PROCESSING:
+        return Response({"detail": _("Bundle is already being processed.")}, status=400)
+
+    bundle.remove_file()
+    bundle.status = ShareLinkBundle.Status.PENDING
+    bundle.last_error = None
+    bundle.size_bytes = None
+    bundle.built_at = None
+    bundle.file_path = ""
+    bundle.save(update_fields=["status", "last_error", "size_bytes", "built_at", "file_path"])
+
+    # ⚠️ rebuild 不再对 bundle.documents 做任何逐文档权限校验
+    #    既不复验 view_document，也不检查文档是否仍然存在 / 可访问
+    #    完全信任 bundle 创建时校验的结果（即使文档已被删除或权限已被撤销）
+    build_share_link_bundle.apply_async(
+        kwargs={"bundle_id": bundle.pk},
+        headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
+    )
+    serializer = self.get_serializer(bundle)
+    return Response(serializer.data)
+```
+
+**Rebuild 与 Create 的权限差异**：
+| 校验点 | Create | Rebuild |
+|--------|--------|---------|
+| 全局 add/change_sharelinkbundle 权限 | ✅ PaperlessObjectPermissions | ✅ PaperlessObjectPermissions（change） |
+| bundle 对象级 owner / guardian 授权 | ✅ PaperlessObjectPermissions | ✅ PaperlessObjectPermissions |
+| bundle.documents 逐文档 view_document | ✅ 逐条 has_perms_owner_aware | ❌ **完全不复验** |
+| documents 是否仍然存在 | ✅ 通过 Document.objects.filter 隐式校验 | ❌ 不复验 |
 
 #### 阶段二：Celery 异步任务执行 — build_share_link_bundle
 
@@ -441,49 +485,200 @@ def copy_document_files(self, document, original_target, thumbnail_target, archi
 
 ### 5.1 权限判定核心函数
 
+Paperless-ngx 有 **两套独立的权限判定体系**，适用场景和对全局权限的态度完全不同。
+
+#### 5.1.1 体系 A：has_perms_owner_aware / get_objects_for_user_owner_aware
+
 位置：[permissions.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/permissions.py#L258-L288)
 
 ```python
 def get_objects_for_user_owner_aware(user, perms, Model, *, include_deleted=False):
-    """返回用户拥有、无归属、或被显式授权的对象集合（用于 QuerySet 级过滤）"""
+    """QuerySet 级过滤（all=true 的预过滤场景）"""
     objects_owned = manager.filter(owner=user)              # ① 自己是所有者
     objects_unowned = manager.filter(owner__isnull=True)     # ② 对象无主（公开）
-    objects_with_perms = get_objects_for_user(               # ③ django-guardian 显式授权
-        user=user, perms=perms, klass=manager.all(), accept_global_perms=False
+    objects_with_perms = get_objects_for_user(               # ③ django-guardian 显式对象级授权
+        user=user, perms=perms, klass=manager.all(),
+        accept_global_perms=False,  # ⚠️ 关键：明确拒绝全局权限
     )
     return objects_owned | objects_unowned | objects_with_perms
 
 
 def has_perms_owner_aware(user, perms, obj):
-    """判断用户对单个对象是否有权限（逐条校验）"""
+    """单对象逐条校验（逐文档校验场景）"""
     checker = ObjectPermissionChecker(user)
-    return (obj.owner is None            # ① 无主对象人人可访问
-            or obj.owner == user          # ② 自己是所有者
-            or checker.has_perm(perms, obj))  # ③ django-guardian 显式授权
+    return (
+        obj.owner is None                           # ① 无主公开
+        or obj.owner == user                         # ② 自己是所有者
+        or checker.has_perm(perms, obj)              # ③ guardian 对象级授权
+    )
 ```
 
-**权限三元组**：无主公开 ∨ 所有者 ∨ django-guardian 显式授权。三条满足任意一条即可。
+**核心特征**：
+- **完全不考虑全局权限**（`accept_global_perms=False`、不调用 `user.has_perm()`）
+- 权限三元组：无主公开 ∨ 所有者 ∨ guardian 对象级显式授权，三者满足任意一条即可
+- 用于：单文档下载、批量下载逐文档校验、分享链接创建逐文档校验、all=true 时的 QuerySet 预过滤
+
+#### 5.1.2 体系 B：PaperlessObjectPermissions（继承 DjangoObjectPermissions）
+
+位置：[permissions.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/permissions.py#L28-L51)
+
+```python
+class PaperlessObjectPermissions(DjangoObjectPermissions):
+    perms_map = {
+        "GET": ["%(app_label)s.view_%(model_name)s"],
+        "POST": ["%(app_label)s.add_%(model_name)s"],
+        "PUT/PATCH": ["%(app_label)s.change_%(model_name)s"],
+        "DELETE": ["%(app_label)s.delete_%(model_name)s"],
+    }
+
+    def has_permission(self, request, view):
+        # ⚠️ 继承自 DjangoObjectPermissions：检查全局权限
+        # → request.user.has_perms(perms_map[method])
+        return super().has_permission(request, view)
+
+    def has_object_permission(self, request, view, obj):
+        if hasattr(obj, "owner") and obj.owner is not None:
+            if request.user == obj.owner:
+                return True                         # ① 所有者直接放行
+            else:
+                return super().has_object_permission(  # ② guardian 对象级授权检查
+                    request, view, obj
+                )
+        else:
+            return True  # ③ 无主对象人人可操作
+```
+
+**核心特征**：
+- **必须先有全局权限，再有对象级权限**，两层同时满足
+  - 第一层 `has_permission`（全局）：`user.has_perm("documents.view_sharelinkbundle")` / `add_xxx` / `change_xxx` / `delete_xxx`
+  - 第二层 `has_object_permission`（对象级）：所有者 ∨ 无主 ∨ guardian 对象级授权
+- 用于：ShareLinkViewSet、ShareLinkBundleViewSet、CorrespondentViewSet 等非 Document 的常规 ViewSet CRUD
+
+#### 5.1.3 两套体系对比
+
+| 维度 | has_perms_owner_aware | PaperlessObjectPermissions |
+|------|----------------------|---------------------------|
+| 全局权限（user.has_perm） | ❌ 完全不考虑 | ✅ 必须满足（第一层） |
+| 对象无主（owner is None） | ✅ 放行 | ✅ 放行 |
+| 自己是所有者 | ✅ 放行 | ✅ 放行 |
+| guardian 对象级显式授权 | ✅ 放行 | ✅ 放行 |
+| superuser | ✅ 通过 guardian 隐式处理 | ✅ DRF/Django 隐式放行 |
+| 适用对象 | Document 为主 | ShareLink / ShareLinkBundle / Correspondent / Tag 等 |
 
 ### 5.2 各链路权限校验对比
 
-| 链路 | 校验位置 | 校验权限 | 备注 |
-|------|---------|---------|------|
-| **单文档下载** | `_resolve_request_and_root_doc` → `has_perms_owner_aware` [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L1273-L1277) | `view_document` | 基础只读权限 |
-| **批量下载 — ID 选择阶段（all=true）** | `_resolve_document_ids` → `get_objects_for_user_owner_aware` [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L2625-L2629) | `view_document`（默认值） | 只在全选匹配时生效，做预过滤 |
-| **批量下载 — ID 选择阶段（all=false）** | 无 | — | 直接透传前端传入的 ID，完全不做权限过滤 |
-| **批量下载 — 逐文档最终校验** | `BulkDownloadView.post` 手写 for 循环 [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L3732-L3734) | `change_document` | ⚠️ 比单下载更严格；独立实现，**不使用** `DocumentOperationPermissionMixin` |
-| **分享链接打包 — 创建阶段** | `ShareLinkBundleViewSet.create` 逐文档校验 [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4328-L4337) | `view_document` | 和单文档下载一致 |
-| **分享链接打包 — Celery 执行阶段** | 无 | — | 完全信任创建阶段的校验结果，不复验 |
-| **分享链接打包 — Bundle 对象本身** | `PaperlessObjectPermissions` + `ObjectOwnedOrGrantedPermissionsFilter` | 对象级 CRUD | 控制谁能查看/修改/删除 bundle 记录 |
-| **分享链接公开下载（SharedLinkView）** | 无 | — | `authentication_classes=[]`, `permission_classes=[]`；只校验 slug 存在 + expiration 未过期 |
-| **CLI 全量导出** | 无 | — | Django management command，不经过用户权限体系，由 OS 控制谁可运行 |
+| 链路 | 校验位置 | 校验权限 | 全局权限基线 | 逐文档校验 | 备注 |
+|------|---------|---------|-------------|-----------|------|
+| **单文档下载** | `_resolve_request_and_root_doc` → `has_perms_owner_aware` [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L1273-L1277) | `view_document` | ❌ 无 | ✅ 每条 | 只通过体系 A |
+| **批量下载 — ID 选择（all=true）** | `_resolve_document_ids` → `get_objects_for_user_owner_aware` [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L2625-L2629) | `view_document`（默认值） | ❌ 无 | ✅ QuerySet 级 | 只在全选匹配时生效，做预过滤 |
+| **批量下载 — ID 选择（all=false）** | 无 | — | ❌ 无 | ❌ 无 | 直接透传前端传入的 ID，完全不做权限过滤 |
+| **批量下载 — 逐文档最终校验** | `BulkDownloadView.post` 手写 for 循环 [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L3732-L3734) | `change_document` | ❌ **无全局基线** | ✅ 每条 `has_perms_owner_aware` | ⚠️ 比单下载更严格但**缺少全局 change_document 检查** |
+| **分享链接打包 — Create** | `ShareLinkBundleViewSet.create` 两处 [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4308-L4337) | 体系 B + 体系 A 组合 | ✅ `add_sharelinkbundle`（体系 B） | ✅ 每条 `view_document`（体系 A） | 先全局+对象级 bundle 权限，再逐文档 view_document |
+| **分享链接打包 — Rebuild** | `ShareLinkBundleViewSet.rebuild` → `self.get_object()` [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4374-L4405) | 体系 B 仅 bundle 对象 | ✅ `change_sharelinkbundle`（体系 B） | ❌ **不复验文档** | 只校验 bundle 对象权限，文档权限完全信任创建时结果 |
+| **分享链接打包 — Celery 执行** | 无 | — | — | — | 完全信任创建/rebuild 阶段的校验结果 |
+| **分享链接打包 — Bundle 列表/详情** | `PaperlessObjectPermissions` + `ObjectOwnedOrGrantedPermissionsFilter` | 体系 B | ✅ `view_sharelinkbundle` | — | 控制谁能查看/修改/删除 bundle 记录本身 |
+| **分享链接公开下载（SharedLinkView）** | 无 | — | — | — | `authentication_classes=[]`, `permission_classes=[]`；只校验 slug + expiration |
+| **CLI 全量导出** | 无 | — | — | — | Django management command，不经过用户权限体系 |
 
-**与其他批量操作的权限实现对比**：
+### 5.3 三层权限模型：全局基线与逐文档校验的关系
 
-- `BulkEditView` / `DeleteDocumentsView` / `ReprocessDocumentsView` 等继承 `DocumentOperationPermissionMixin`，该 Mixin 的 `_has_document_permissions` [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L2659-L2731) 除了逐文档校验 `change_document` 之外，对破坏性操作（delete/rotate/edit_pdf/set_permissions 等）还额外要求用户必须是**全部文档的所有者**，并对创建/删除文档额外校验全局 `add_document` / `delete_document` 权限。
-- `BulkDownloadView` **不继承** `DocumentOperationPermissionMixin`，而是自己手写了一个简单的 for 循环只校验 `change_document`，没有所有者要求。
+整个导出/下载相关代码中存在 **三种独立的权限校验实现**，它们对「全局权限基线」和「逐文档校验」的态度各不相同：
 
-### 5.3 批量下载权限测试验证
+#### 实现一：BulkDownloadView（最轻量）
+
+位置：[views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L3732-L3734)
+
+```python
+for document in documents:
+    if not has_perms_owner_aware(request.user, "change_document", document):
+        return HttpResponseForbidden("Insufficient permissions")
+```
+
+- **全局权限基线**：❌ **完全没有**。即使用户没有全局 `documents.change_document` 权限，只要他是单条文档的 owner / 文档无主 / 被单独 grant 了对象级权限，就能通过。
+- **逐文档校验**：✅ 每条调用 `has_perms_owner_aware("change_document")`
+- **所有者要求**：❌ 不要求必须是全部文档的所有者
+- **适用操作**：仅批量下载
+
+#### 实现二：DocumentOperationPermissionMixin（最严格）
+
+位置：[views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L2658-L2731)
+
+```python
+def _has_document_permissions(self, *, user, documents, method, parameters):
+    if user.is_superuser:
+        return True
+
+    document_objs = Document.objects.select_related("owner").filter(pk__in=documents)
+    user_is_owner_of_all_documents = all(
+        (doc.owner == user or doc.owner is None) for doc in document_objs
+    )
+
+    # ① 全局 change_document 权限 + 逐文档 has_perms_owner_aware
+    has_perms = user.has_perm("documents.change_document") and all(
+        has_perms_owner_aware(user, "change_document", doc) for doc in document_objs
+    )
+
+    # ② 破坏性操作额外要求：必须是全部文档的所有者
+    if has_perms and method in [set_permissions, delete, rotate, delete_pages, edit_pdf, remove_password]:
+        has_perms = user_is_owner_of_all_documents
+    if has_perms and method in [merge, split] and parameters.get("delete_originals"):
+        has_perms = user_is_owner_of_all_documents
+    if has_perms and method == edit_pdf and parameters.get("update_document"):
+        has_perms = user_is_owner_of_all_documents
+
+    # ③ 创建新文档额外要求：全局 add_document 权限
+    if has_perms and (method in [split, merge] or ...) and not user.has_perm("documents.add_document"):
+        has_perms = False
+
+    # ④ 删除文档额外要求：全局 delete_document 权限
+    if has_perms and (method == delete or ...) and not user.has_perm("documents.delete_document"):
+        has_perms = False
+
+    return has_perms
+```
+
+- **全局权限基线**：✅ `user.has_perm("documents.change_document")` 必须为真（superuser 例外）
+- **逐文档校验**：✅ 每条 `has_perms_owner_aware("change_document")`
+- **所有者要求**：✅ 对破坏性操作（delete/rotate/edit_pdf/set_permissions 等）额外要求用户是**全部**文档的所有者
+- **额外全局权限**：创建文档需要 `add_document`，删除文档需要 `delete_document`
+- **适用操作**：BulkEditView（标签/分类/日期等编辑）、DeleteDocumentsView、ReprocessDocumentsView、SplitMergeView、RotateView 等
+
+#### 实现三：ShareLinkBundleViewSet（两套体系组合）
+
+```
+请求进入
+  │
+  ├─ DRF dispatch: check_permissions()
+  │   └─ PaperlessObjectPermissions.has_permission()   ← 体系 B
+  │       └─ 必须有全局 add_sharelinkbundle / change_sharelinkbundle
+  │
+  ├─ DRF dispatch: check_object_permissions()（仅 detail 路由：rebuild/update/delete）
+  │   └─ PaperlessObjectPermissions.has_object_permission()  ← 体系 B
+  │       ├─ bundle.owner == user → ✅
+  │       ├─ bundle.owner is None → ✅
+  │       └─ guardian 对象级 change_sharelinkbundle → ✅
+  │
+  └─ View 内部业务逻辑校验
+      ├─ Create: 逐文档 has_perms_owner_aware("view_document")  ← 体系 A
+      └─ Rebuild: ❌ 不复验文档
+```
+
+- **全局权限基线**：✅ 体系 B 的 `has_permission` 检查全局 `add_sharelinkbundle` / `change_sharelinkbundle`
+- **逐文档校验**：✅ Create 时用体系 A 的 `has_perms_owner_aware("view_document")`；❌ Rebuild 时不复验
+- **Bundle 对象级**：✅ 体系 B 的 `has_object_permission`（owner / 无主 / guardian）
+- **适用操作**：分享链接 / 分享包 CRUD
+
+#### 三种实现的横向对比
+
+| 维度 | BulkDownloadView | DocumentOperationPermissionMixin | ShareLinkBundleViewSet |
+|------|------------------|----------------------------------|------------------------|
+| 全局 change_document / 对应权限 | ❌ 无 | ✅ 必须有 | ✅ 体系 B 全局 add/change_sharelinkbundle |
+| 逐文档 has_perms_owner_aware | ✅ change_document | ✅ change_document | ✅ Create: view_document；❌ Rebuild: 无 |
+| 全部文档所有者要求 | ❌ 无 | ✅ 破坏性操作要求 | ❌ 无（bundle.owner 只校验 bundle 对象） |
+| 全局 add_document / delete_document | ❌ 无 | ✅ 对应操作要求 | ❌ 无 |
+| superuser 直通 | ✅ 通过体系 A 隐式 | ✅ 显式 early return | ✅ 通过体系 B 隐式 |
+
+### 5.4 批量下载权限测试验证
 
 位置：[test_api_bulk_download.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/tests/test_api_bulk_download.py#L327-L341)
 
@@ -506,7 +701,7 @@ def test_download_insufficient_permissions(self):
 
 只要列表中**任意一个文档**权限不足，整个请求返回 403。注意这个测试用的是 `all=false` 模式（显式传 ID），此时 `_resolve_document_ids` 不做预过滤，完全由逐文档的 `change_document` 校验拦下来。
 
-### 5.4 序列化器参数
+### 5.5 序列化器参数
 
 [BulkDownloadSerializer](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/serialisers.py#L2297-L2320) 定义了请求参数：
 
@@ -564,13 +759,20 @@ class BulkDownloadSerializer(DocumentSelectionSerializer):
 浏览器: saveAs(blob, "documents.zip")
 ```
 
-### 6.2 分享链接打包（两段式）
+### 6.2 分享链接打包（三段式：Create / Rebuild / Public Download）
+
+#### 6.2.1 Create 流程
 
 ```
 前端 → POST /api/share_link_bundles/
   ▼
 ShareLinkBundleViewSet.create
   │  permission_classes: (IsAuthenticated, PaperlessObjectPermissions)
+  │
+  │  体系 B —— 全局层：
+  │  check_permissions() → user.has_perm("documents.add_sharelinkbundle")
+  │
+  │  体系 A —— 业务层：
   │  1. serializer.is_valid()
   │  2. for doc in documents:
   │  │     if not has_perms_owner_aware(user, "view_document", doc) → ValidationError
@@ -584,7 +786,38 @@ Celery Worker: build_share_link_bundle(bundle_id)
   │  3. ZIP 构建（复用 BulkArchiveStrategy）
   │  4. shutil.move 到 SHARE_LINK_BUNDLE_DIR
   │  5. bundle.status = READY
+```
+
+#### 6.2.2 Rebuild 流程
+
+```
+前端 → POST /api/share_link_bundles/{id}/rebuild/
   ▼
+ShareLinkBundleViewSet.rebuild
+  │  permission_classes: (IsAuthenticated, PaperlessObjectPermissions)
+  │
+  │  体系 B —— 全局层：
+  │  check_permissions() → user.has_perm("documents.change_sharelinkbundle")
+  │
+  │  体系 B —— 对象层（由 self.get_object() 触发）：
+  │  check_object_permissions(bundle)
+  │    ├─ bundle.owner == request.user → ✅
+  │    ├─ bundle.owner is None → ✅
+  │    └─ guardian 对象级 change_sharelinkbundle → ✅
+  │
+  │  业务层 —— ⚠️ 不复验文档：
+  │  1. if bundle.status == PROCESSING → 400
+  │  2. bundle.remove_file() / reset status fields / save()
+  │  3. build_share_link_bundle.apply_async(bundle_id=bundle.pk)
+  │     （不检查文档是否仍可访问 / 权限是否仍有效）
+  ▼
+Celery Worker: build_share_link_bundle(bundle_id)
+  │  ⚠️ 不做任何权限校验，同 Create
+```
+
+#### 6.2.3 公开下载流程
+
+```
 外部匿名用户 → GET /share/{slug}/
   ▼
 SharedLinkView.get
@@ -592,5 +825,6 @@ SharedLinkView.get
   │  permission_classes = []
   │  1. 按 slug 查找 ShareLink / ShareLinkBundle
   │  2. 校验 expiration 未过期
-  │  3. 直接 FileResponse 返回文件 / ZIP
+  │  3. 若 bundle 仍在处理中 → 202 Accepted
+  │  4. 直接 FileResponse 返回文件 / ZIP
 ```
