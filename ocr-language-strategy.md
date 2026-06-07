@@ -81,13 +81,33 @@ class OcrConfig(OutputTypeConfig):
 2. 若为空（`None` 或空字符串），回退到 `settings.OCR_LANGUAGE`（即环境变量 `PAPERLESS_OCR_LANGUAGE`）
 3. 环境变量也未设置时，使用硬编码默认值 `"eng"`
 
-**配置合法性检查**（`src/paperless/checks.py:357-386`）：
+**配置合法性检查（生效边界：仅校验环境变量）**（`src/paperless/checks.py:357-386`）：
 
-系统启动时运行 `check_default_language_available()` 诊断检查：
-- 若 `OCR_LANGUAGE` 为空，发出 Warning 提示 Tesseract 将回退到英语
-- 调用 `tesseract --list-langs` 获取已安装语言包
-- 逐一校验 `OCR_LANGUAGE` 中用 `+` 分隔的每个语言是否都已安装
-- 缺失则报 Error，提示修复 `PAPERLESS_OCR_LANGUAGE`
+系统启动时 Django 会运行 `check_default_language_available()` 诊断检查，但该函数**只读取 `settings.OCR_LANGUAGE`（即环境变量 `PAPERLESS_OCR_LANGUAGE`），完全不读取数据库中的 `ApplicationConfiguration.language`**。
+
+```python
+@register()
+def check_default_language_available(app_configs, **kwargs):
+    errs = []
+    if not settings.OCR_LANGUAGE:   # ← 只读 settings.OCR_LANGUAGE（环境变量）
+        errs.append(Warning("No OCR language has been specified with PAPERLESS_OCR_LANGUAGE..."))
+        return errs
+
+    if shutil.which("tesseract") is not None:
+        installed_langs = get_tesseract_langs()
+        # ← 同样只 split settings.OCR_LANGUAGE，不碰数据库
+        specified_langs = [x.strip() for x in settings.OCR_LANGUAGE.split("+")]
+        for lang in specified_langs:
+            if lang not in installed_langs:
+                errs.append(Error(f"The selected ocr language {lang} is not installed..."))
+    return errs
+```
+
+**校验链路的生效边界问题**：
+- 若环境变量 `PAPERLESS_OCR_LANGUAGE=eng`（合法，已安装），但管理员在后台把 language 改成 `chi_sim`（未安装语言包）
+- 启动检查 **不会报错**（因为只校验环境变量的 `eng`）
+- 问题直到 Tesseract 实际解析文档时才会暴露（OCRmyPDF 会因为找不到 `chi_sim` 训练数据而失败，抛出 `ParseError`）
+- dateparser、NLTK、搜索语言各自有独立的取值链路，也均不受启动检查保护（详见第 3 节）
 
 ### 2.2 语言代码格式
 
@@ -313,19 +333,20 @@ SEARCH_LANGUAGE: str | None = _get_search_language_setting(OCR_LANGUAGE)
   - 如果使用默认推导：必须修改 `PAPERLESS_OCR_LANGUAGE` 环境变量并重启服务，且需要重建搜索索引
   - 如果使用显式配置：必须修改 `PAPERLESS_SEARCH_LANGUAGE` 环境变量并重启服务，且需要重建搜索索引
 
-### 3.4 语言配置链路汇总（后台配置生效边界表）
+### 3.4 语言配置链路汇总（取值边界 + 校验边界全表）
 
-| 组件 | 第一优先级 | 第二优先级 | 推导时机 | 是否读取后台配置 | 是否支持多语言 |
-|------|-----------|-----------|---------|----------------|---------------|
-| **Tesseract OCR** | 数据库 `ApplicationConfiguration.language`（每次实时读） | `PAPERLESS_OCR_LANGUAGE`（默认 `eng`） | 运行时每次解析 new `OcrConfig()` | ✅ 实时生效 | ✅ `eng+fra+deu` |
-| **dateparser** | `PAPERLESS_DATE_PARSER_LANGUAGES`（设了就完全绕过 OCR 配置） | 数据库 `ApplicationConfiguration.language` + `PAPERLESS_OCR_LANGUAGE`（通过 `OcrConfig` 实时读） | 运行时每次创建解析器 new `OcrConfig()` | ✅ 实时生效 | ✅ 完整保留 |
-| **NLTK** | —（无独立配置） | `PAPERLESS_OCR_LANGUAGE` **第一个** 主语言（只读环境变量，不读数据库） | Django 启动加载 settings 时（仅一次，永久固化） | ❌ 完全不读 | ❌ 仅第一语言 |
-| **搜索 (Tantivy)** | `PAPERLESS_SEARCH_LANGUAGE`（只读环境变量） | `PAPERLESS_OCR_LANGUAGE` **第一个** 主语言（只读环境变量，不读数据库） | Django 启动加载 settings 时（仅一次，永久固化） | ❌ 完全不读 | ❌ 仅第一语言 |
+| 组件 | 第一优先级 | 第二优先级 | 推导时机 | 是否读取后台配置 | 启动时是否被校验 | 非法配置暴露时机 |
+|------|-----------|-----------|---------|----------------|----------------|----------------|
+| **Tesseract OCR** | 数据库 `ApplicationConfiguration.language`（每次实时读） | `PAPERLESS_OCR_LANGUAGE`（默认 `eng`） | 运行时每次解析 new `OcrConfig()` | ✅ 实时生效 | ❌ 启动只校验环境变量 | 文档解析时（OCRmyPDF 报错） |
+| **dateparser** | `PAPERLESS_DATE_PARSER_LANGUAGES`（设了就完全绕过 OCR 配置） | 数据库 `ApplicationConfiguration.language` + `PAPERLESS_OCR_LANGUAGE`（通过 `OcrConfig` 实时读） | 运行时每次创建解析器 new `OcrConfig()` | ✅ 实时生效 | ❌ 无启动校验 | 日期解析时（locale 映射失败或解析异常） |
+| **NLTK** | —（无独立配置） | `PAPERLESS_OCR_LANGUAGE` **第一个** 主语言（只读环境变量，不读数据库） | Django 启动加载 settings 时（仅一次，永久固化） | ❌ 完全不读 | ❌ 无启动校验 | 文档分类时（语言不在支持列表则为 None，无报错但不启用分词） |
+| **搜索 (Tantivy)** | `PAPERLESS_SEARCH_LANGUAGE`（只读环境变量） | `PAPERLESS_OCR_LANGUAGE` **第一个** 主语言（只读环境变量，不读数据库） | Django 启动加载 settings 时（仅一次，永久固化） | ❌ 完全不读 | ❌ 仅显式设 `PAPERLESS_SEARCH_LANGUAGE` 时校验 | 搜索索引构建时（语言不在列表则为 None，不分词干） |
 
-> **生效边界总结**：
-> 1. **Tesseract 和 dateparser**：通过每次 new `OcrConfig()` 实时读取数据库，管理员在后台改 language **立即生效**，无需重启。
-> 2. **NLTK 和搜索语言**：在 Django 启动时直接从环境变量 `os.environ` 读取，**代码路径完全绕过 `OcrConfig`，因此数据库里的 `ApplicationConfiguration.language` 对这两个组件没有任何影响**。
-> 3. 若仅在后台修改 OCR 语言：Tesseract OCR 和日期解析会使用新语言，但文档分类（NLTK）和搜索词干还原仍使用启动时的旧语言，直到修改环境变量并重启 Django 服务（搜索还需重建索引）。
+> **生效边界总结（取值 + 校验）**：
+> 1. **Tesseract 和 dateparser**：通过每次 new `OcrConfig()` 实时读取数据库，管理员在后台改 language **立即生效**，无需重启。但**启动时不会校验数据库里的语言是否合法**，填了未安装的语言包要等到实际解析文档时才会报错。
+> 2. **NLTK 和搜索语言**：在 Django 启动时直接从环境变量 `os.environ` 读取，**代码路径完全绕过 `OcrConfig`，因此数据库里的 `ApplicationConfiguration.language` 对这两个组件没有任何影响**。启动时也不会校验从 OCR 语言推导出来的值是否合法。
+> 3. **启动校验的盲区**：`check_default_language_available()` 只校验 `settings.OCR_LANGUAGE`（环境变量）。对于四个组件，只要语言最终取值和环境变量不一致（无论是通过后台配置还是通过独立变量），就完全脱离了启动校验的保护。
+> 4. 若仅在后台修改 OCR 语言：Tesseract OCR 和日期解析会使用新语言，但文档分类（NLTK）和搜索词干还原仍使用启动时的旧语言，直到修改环境变量并重启 Django 服务（搜索还需重建索引）。
 
 ---
 
