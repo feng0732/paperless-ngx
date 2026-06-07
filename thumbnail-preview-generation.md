@@ -402,10 +402,47 @@ export class AppComponent implements OnInit, OnDestroy {
 }
 ```
 
-### 3.7 阶段七：Toast 渲染与错误样式
+### 3.7 阶段七：ToastService → ToastsComponent → ToastComponent 完整容器层链路
+
+本阶段梳理 Toast 从触发到屏幕渲染的完整数据流：
+```
+AppComponent.failedSubscription
+    │
+    ▼
+toastService.showError(content)           ← 3.7.1  错误 Toast 入口
+    │  classname: 'error', delay: 10000
+    ▼
+toastService.show(toast)                  ← 3.7.2  Toast 对象入列
+    │  this.showToast.next(toast)
+    ▼
+ToastsComponent (pngx-toasts)            ← 3.7.3  容器订阅
+    │  ngOnInit: showToast.subscribe → this.toasts = [toast]
+    │  template: <pngx-toast [toast]="toast" [autohide]="true">
+    ▼
+ToastComponent (pngx-toast)              ← 3.7.4  单个 Toast 渲染
+    │  <ngb-toast [autohide]="autohide"
+    │             [delay]="toast.delay"
+    │             [class]="toast.classname">   ← 'error' class 从这里传入
+    │
+    ├─ 图标：exclamation-triangle (toast.error 为真)
+    ├─ 内容：{{ toast.content }}
+    ├─ 错误详情：<details> + 复制剪贴板按钮
+    └─ 进度条：ngb-progressbar 显示 delayRemaining
+    │
+    ▼
+toast.component.scss                     ← 3.7.5  错误样式
+    ::ng-deep .toast.error {
+        border-color: hsla(350, 79%, 40%, 0.4);
+    }
+    ::ng-deep .toast.error .toast-body {
+        background-color: hsla(350, 79%, 40%, 0.8);
+    }
+```
+
+#### 3.7.1 ToastService.showError() — 错误 Toast 入口
 
 - 仓库相对路径：`src-ui/src/app/services/toast.service.ts`
-- 稳定位置：`ToastService.showError()` 方法、`Toast` 接口
+- 稳定位置：`Toast` 接口、`ToastService.showError()` 方法
 - 行号范围：L1-L21（Toast 接口）、L57-L64（showError）
 
 ```typescript
@@ -416,42 +453,245 @@ export interface Toast {
   delayRemaining?: number
   action?: any
   actionName?: string
-  classname?: string
+  classname?: string   // ← 传入 'error' 控制红色样式
   error?: any
 }
 
 showError(content: string, error: any = null, delay: number = 10000) {
   this.show({
     content: content,
-    delay: delay,
-    classname: 'error',    // ← 关键：传入 error class
+    delay: delay,          // 默认 10 秒
+    classname: 'error',    // ← 关键：将 class 注入 Toast 对象
     error,
   })
 }
 ```
 
+#### 3.7.2 ToastService.show() — 推入 Subject
+
+- 仓库相对路径：`src-ui/src/app/services/toast.service.ts`
+- 稳定位置：`ToastService.showToast` Subject、`ToastService.show()` 方法
+- 行号范围：L37-L39（Subject 声明）、L41-L55（show 方法）
+
+```typescript
+export class ToastService {
+  private toasts: Toast[] = []
+  private toastsSubject: Subject<Toast[]> = new Subject()
+  public showToast: Subject<Toast> = new Subject()  // ← 容器订阅此 Subject
+
+  show(toast: Toast) {
+    if (!toast.id) {
+      toast.id = uuidv4()
+    }
+    if (typeof toast.error === 'string') {
+      try {
+        toast.error = JSON.parse(toast.error)
+      } catch (e) {}
+    }
+    this.toasts.unshift(toast)
+    if (!this._suppressPopupToasts) {
+      this.showToast.next(toast)   // ← 推送给容器层
+    }
+    this.toastsSubject.next(this.toasts)
+  }
+}
+```
+
+#### 3.7.3 AppComponent 挂载点 → ToastsComponent 容器
+
+**AppComponent 模板中注册全局容器：**
+
+- 仓库相对路径：`src-ui/src/app/app.component.html`
+- 稳定位置：`<pngx-toasts></pngx-toasts>`（全局唯一 Toast 容器）
+- 行号：L1
+
+```html
+<pngx-toasts></pngx-toasts>     <!-- 全局 Toast 容器 -->
+<pngx-file-drop>
+  <ng-container content>
+    <router-outlet></router-outlet>
+  </ng-container>
+</pngx-file-drop>
+```
+
+**ToastsComponent 订阅 showToast Subject：**
+
+- 仓库相对路径：`src-ui/src/app/components/common/toasts/toasts.component.ts`
+- 稳定位置：`ToastsComponent.ngOnInit()` 中 `toastService.showToast.subscribe(...)`
+- 行号范围：L33-L37（订阅）、L39-L42（closeToast）
+
+```typescript
+export class ToastsComponent implements OnInit, OnDestroy {
+  toastService = inject(ToastService)
+  private subscription: Subscription
+  public toasts: Toast[] = []   // 数组驱动变更检测
+
+  ngOnInit(): void {
+    this.subscription = this.toastService.showToast.subscribe((toast) => {
+      this.toasts = toast ? [toast] : []   // 只保留最新一条
+    })
+  }
+
+  closeToast() {
+    this.toastService.closeToast(this.toasts[0])
+    this.toasts = []
+  }
+}
+```
+
+**ToastsComponent 模板向子组件传递输入：**
+
+- 仓库相对路径：`src-ui/src/app/components/common/toasts/toasts.component.html`
+- 稳定位置：`<pngx-toast [toast]="toast" [autohide]="true" (closed)="closeToast()">`
+- 行号范围：L1-L3
+
+```html
+@for (toast of toasts; track toast.id) {
+  <pngx-toast [toast]="toast" [autohide]="true" (closed)="closeToast()"></pngx-toast>
+}
+```
+
+关键输入：
+- `[toast]="toast"`：传递完整 Toast 对象（含 content、delay、classname='error'、error）
+- `[autohide]="true"`：开启自动消失
+
+#### 3.7.4 ToastComponent — 单个 Toast 渲染
+
+**组件接收输入：**
+
+- 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.ts`
+- 稳定位置：`@Input() toast`、`@Input() autohide`
+- 行号范围：L26-L32（@Input 声明）
+
+```typescript
+export class ToastComponent {
+  @Input() toast: Toast
+  @Input() autohide: boolean = true
+  @Output() hidden: EventEmitter<Toast> = new EventEmitter<Toast>()
+  @Output() closed: EventEmitter<Toast> = new EventEmitter<Toast>()
+}
+```
+
+**模板传递到 ngb-toast（bootstrap-ng 的 Toast 组件）：**
+
 - 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.html`
-- 稳定位置：`<ngb-toast [class]="toast.classname">`
-- 行号范围：L1-L6
+- 稳定位置：`<ngb-toast [autohide]="autohide" [delay]="toast.delay" [class]="toast.classname">`
+- 行号范围：L1-L7
+
+```html
+<ngb-toast
+    [autohide]="autohide"           <!-- 来自 ToastsComponent 传入的 true -->
+    [delay]="toast.delay"           <!-- 来自 Toast.delay（10000ms） -->
+    [class]="toast.classname"       <!-- 来自 Toast.classname（'error'）→ 控制红色样式 -->
+    [class.mb-2]="true"
+    (shown)="onShown(toast)"
+    (hidden)="hidden.emit(toast)">
+```
+
+**内部渲染细节：**
+
+- 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.html`
+- 稳定位置：图标分支、错误详情 `<details>`、复制按钮、进度条
+- 行号范围：L8-L55
+
+```html
+<!-- 自动消失进度条 -->
+@if (autohide) {
+    <ngb-progressbar ... type="dark"
+        [max]="toast.delay"
+        [value]="toast.delayRemaining"></ngb-progressbar>
+}
+
+<div class="d-flex align-items-top">
+    <!-- 图标分支 -->
+    @if (!toast.error) {
+        <i-bs ... name="info-circle"></i-bs>            <!-- 普通信息 -->
+    }
+    @if (toast.error) {
+        <i-bs ... name="exclamation-triangle"></i-bs>   <!-- 错误警告三角 -->
+    }
+
+    <div>
+        <!-- 主内容 -->
+        <p class="ms-2 mb-0 text-break">{{toast.content}}</p>
+
+        <!-- 错误详情折叠区（仅 toast.error 为真时显示） -->
+        @if (toast.error) {
+        <details class="ms-2">
+            <div class="mt-2 ms-n4 me-n2 small">
+            @if (isDetailedError(toast.error)) {
+                <dl class="row mb-0">
+                    <dt>URL</dt>      <dd>{{ toast.error.url }}</dd>
+                    <dt>Status</dt>   <dd>{{ toast.error.status }} <em>{{ toast.error.statusText }}</em></dd>
+                    <dt>Error</dt>    <dd>{{ getErrorText(toast.error) }}</dd>
+                </dl>
+            }
+            <!-- 复制原始错误按钮 -->
+            <button (click)="copyError(toast.error)">
+                <i-bs name="clipboard"></i-bs> Copy Raw Error
+            </button>
+            </div>
+        </details>
+        }
+
+        <!-- 操作按钮（如"Open document"） -->
+        @if (toast.action) {
+            <button (click)="closed.emit(toast); toast.action()">{{toast.actionName}}</button>
+        }
+    </div>
+
+    <button type="button" class="btn-close ..." (click)="closed.emit(toast);"></button>
+</div>
+```
+
+**错误工具方法：**
+
+- 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.ts`
+- 稳定位置：`isDetailedError()`、`getErrorText()`（截断 200 字符）、`copyError()`（复制剪贴板）
+- 行号范围：L52-L75
+
+```typescript
+public isDetailedError(error: any): boolean {
+  return (
+    typeof error === 'object' &&
+    'status' in error && 'statusText' in error &&
+    'url' in error && 'message' in error && 'error' in error
+  )
+}
+getErrorText(error: any) {
+  let text: string = error.error?.detail ?? error.error ?? ''
+  if (typeof text === 'object') text = JSON.stringify(text)
+  return `${text.slice(0, 200)}${text.length > 200 ? '...' : ''}`   // 截断 200 字符
+}
+copyError(error: any) {
+  this.clipboard.copy(JSON.stringify(error))
+}
+```
+
+#### 3.7.5 错误样式（CSS）
 
 - 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.scss`
-- 稳定位置：`::ng-deep .toast.error` 红色错误样式
+- 稳定位置：`::ng-deep .toast.error` 红色错误样式规则
 - 行号范围：L5-L15
 
 ```scss
 ::ng-deep .toast.error {
-    border-color: hsla(350, 79%, 40%, 0.4);  // 红色边框
+    border-color: hsla(350, 79%, 40%, 0.4);       // 红色边框（半透明）
 }
 ::ng-deep .toast.error .toast-body {
-    background-color: hsla(350, 79%, 40%, 0.8);  // 红色半透明背景
+    background-color: hsla(350, 79%, 40%, 0.8);   // 红色半透明背景
+    border-top-left-radius: inherit;
+    border-top-right-radius: inherit;
+    border-bottom-left-radius: inherit;
+    border-bottom-right-radius: inherit;
+}
+.progress {
+    background-color: var(--pngx-primary);
+    opacity: .07;
 }
 ```
 
-- 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.ts`
-- 稳定位置：`ToastComponent.getErrorText()`（截断 200 字符）、`copyError()`（复制剪贴板）、`isDetailedError()`（判断是否 HTTP 错误）
-- 行号范围：L52-L75
-
-**用户可见表现**：页面右下角弹出红色 Toast，显示 "Could not add <文件名>: <错误消息>"，10 秒后自动消失，进度条显示剩余时间。
+**用户可见表现**：页面右下角弹出红色 Toast（红框 + 红色半透明背景 + 黄色警告三角图标），显示 "Could not add <文件名>: <错误消息>"，10 秒内自动消失，底部进度条动态显示剩余时间；若附带 error 对象，可展开 `<details>` 查看 URL / Status / Error 详情并一键复制原始错误到剪贴板。
 
 ### 3.8 阶段八：Celery 失败入库 → PaperlessTask(FAILURE)
 
