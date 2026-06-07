@@ -493,30 +493,84 @@ overrides.custom_fields = {
 
 [serialisers.py L2088-L2255](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py#L2088-L2255)
 
-`custom_fields` 字段定义为 `serializers.JSONField`，支持两种输入格式，由 `validate_custom_fields()` 方法校验：
+`custom_fields` 字段定义为 `serializers.JSONField`，支持两种输入格式，由 `validate_custom_fields()` 方法校验。
 
 **格式一：dict `{field_id: value, ...}`** — 每个字段指定具体值
+
 ```python
 # 校验流程：
 for field_id, value in custom_fields.items():
     1. field_id 转为 int，失败抛错
     2. CustomField.objects.get(id=field_id_int)，不存在抛错
     3. ★ 调用 CustomFieldInstanceSerializer.validate({field, value})
-       → 执行完整类型校验（URL、整数范围、货币格式、SELECT id 合法性、DocumentLink 权限等）
     4. 存入 normalized {field_id_int: value}
 ```
 
+> **⚠️ 关键边界：DocumentLink 在上传阶段不校验用户权限**
+>
+> `validate_custom_fields()` 中调用序列化器验证的方式是：
+> ```python
+> custom_field_serializer = CustomFieldInstanceSerializer()  # 未传 context！
+> custom_field_serializer.validate({"field": field, "value": value})
+> ```
+>
+> 由于 `context` 为空，在 `CustomFieldInstanceSerializer.validate()` 中：
+> ```python
+> request = self.context.get("request")  # 返回 None
+> validate_documentlink_targets(
+>     getattr(request, "user", None) if request is not None else None,  # user = None
+>     doc_ids,
+> )
+> ```
+>
+> `validate_documentlink_targets` 函数逻辑：
+> ```python
+> if Document.objects.filter(id__in=doc_ids).count() != len(doc_ids):
+>     raise ValidationError("Some documents ... don't exist or were specified twice.")
+> if user is None:
+>     return  # ← 直接返回，跳过权限校验！
+> # 以下权限校验（has_perms_owner_aware）在上传阶段不会执行
+> ```
+>
+> **结论**：上传阶段 DocumentLink 只校验**目标文档存在且不重复**，不校验当前用户对目标文档的 `change_document` 权限。
+> 这与 API 文档更新（PUT/PATCH）路径不同——PUT/PATCH 通过 DocumentSerializer 嵌套字段传入，context 被正确传递，会执行完整权限校验。
+
 **格式二：list `[field_id, ...]`** — 字段值全为 None
+
 ```python
 # 校验流程：
 1. 全部元素转为 int，失败抛错
-2. CustomField.objects.filter(id__in=ids).count() == len(set(ids))
-   → 不存在或重复则抛错
-3. 直接返回 ids 列表（后续由 views.py 转为 {id: None} dict）
+2. CustomField.objects.filter(id__in=ids).count() != len(set(ids)) → 抛错
+3. 直接返回 ids 列表
 ```
 
-> **事实核对**：API 上传阶段就已经通过 `CustomFieldInstanceSerializer.validate()` 做了**完整的类型校验**。
-> 但 ConsumerPlugin 最终落库时不会再次校验。
+> **⚠️ 关键边界：list 格式重复字段检测条件有缺陷，重复 id 不会被检测到**
+>
+> 判断条件为：
+> ```python
+> if CustomField.objects.filter(id__in=ids).count() != len(set(ids)):
+>     raise ValidationError("Some custom fields don't exist or were specified twice.")
+> ```
+>
+> `set(ids)` 在比较之前就已经去除了重复。举例验证：
+>
+> | 输入 ids | len(ids) | len(set(ids)) | DB count | 条件结果 | 实际行为 |
+> |----------|----------|---------------|----------|----------|----------|
+> | `[1, 2, 3]`（正常） | 3 | 3 | 3 | `3 != 3` → False | ✅ 通过 |
+> | `[1, 1, 2]`（id=1 重复） | 3 | **2**（set 去重） | 2 | `2 != 2` → False | ✅ **通过（漏检！）** |
+> | `[1, 2, 999]`（id=999 不存在） | 3 | 3 | 2 | `2 != 3` → True | ❌ 抛错 |
+>
+> 后续在 [views.py L3134-L3135](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/views.py#L3134-L3135)：
+> ```python
+> elif isinstance(cf, list) and cf:
+>     custom_fields = dict.fromkeys(cf, None)  # dict key 自动去重
+> ```
+>
+> **结论**：list 格式中**重复的自定义字段 id 不会触发校验错误**，会被 `dict.fromkeys()` 静默合并为单个键（值为 None）。
+> 错误消息中写的 "were specified twice" 实际上无法检测到，只有不存在的 id 会被检测到。
+
+> **事实核对**：API 上传阶段就已经通过 `CustomFieldInstanceSerializer.validate()` 做了类型校验（dict 格式），
+> 但存在两个边界：① DocumentLink 不校验用户权限；② list 格式重复 id 无法检测。ConsumerPlugin 最终落库时不会再次校验。
 
 #### 阶段二：views.py 组装 overrides 并投递任务
 
@@ -893,16 +947,16 @@ def update_filename_and_move_files(sender, instance, **kwargs):
 
 并非所有路径都经过第4章描述的序列化器验证。以下是完整对比：
 
-| 保存路径 | 是否经过 CustomFieldInstanceSerializer 验证 | 是否处理 DocumentLink 对称链接 | 值为 None 时行为 |
-|----------|------------------------------------------|-----------------------------|------------------|
-| **API 文档更新**（PUT/PATCH，DocumentSerializer.custom_fields） | ✅ 内部调用 CustomFieldInstanceSerializer，完整验证 | ✅ `reflect_doclinks`（create 时） + `remove_doclink`（移除 DOCUMENTLINK 字段时） | 清空该字段值 |
-| **API 上传阶段一**（POST /post_document，PostDocumentSerializer） | ✅ dict 格式的值完整验证（CustomFieldInstanceSerializer.validate）；list 格式仅校验 id 存在和唯一性 | N/A（还未落库） | N/A（还未落库） |
-| **API 上传阶段二**（Celery 消费，ConsumerPlugin.apply_overrides） | ❌ 不再验证（信任 PostDocumentSerializer 的前置校验 + 工作流值） | ❌ | 创建值为 None 的实例 |
-| **批量编辑**（bulk_edit.modify_custom_fields） | ❌ 无验证 | ✅ `reflect_doclinks`（仅 add） | 清值或创建空实例 |
-| **工作流 apply_assignment_to_document** | ❌ 无验证 | ❌ | 不更新已有实例（静默跳过） |
-| **工作流 apply_removal_to_document** | N/A（删除） | ❌ | hard_delete |
-| **document_importer 导入** | ❌ 无验证，信任导出数据 | ❌ | 按导出值原样写入 |
-| **SELECT 定义变更→process_cf_select_update** | ❌ 只清理失效选项 id | N/A | 失效选项置为 None |
+| 保存路径 | 是否经过 CustomFieldInstanceSerializer 验证 | 是否校验 DocumentLink 目标权限 | 是否处理 DocumentLink 对称链接 | 值为 None 时行为 |
+|----------|------------------------------------------|---------------------------|-----------------------------|------------------|
+| **API 文档更新**（PUT/PATCH，DocumentSerializer.custom_fields） | ✅ 内部调用，完整验证 | ✅ 校验当前用户 `change_document` 权限 | ✅ `reflect_doclinks` + `remove_doclink` | 清空该字段值 |
+| **API 上传阶段一**（POST /post_document，PostDocumentSerializer） | ✅ dict 格式完整验证；list 格式仅校验 id 存在 | ⚠️ **不校验权限**（context 为空，user=None），仅校验文档存在且不重复 | N/A（还未落库） | N/A（还未落库） |
+| **API 上传阶段二**（Celery 消费，ConsumerPlugin.apply_overrides） | ❌ 不再验证（信任上游） | ❌ | ❌ | 创建值为 None 的实例 |
+| **批量编辑**（bulk_edit.modify_custom_fields） | ❌ 无验证 | ❌ | ✅ `reflect_doclinks`（仅 add） | 清值或创建空实例 |
+| **工作流 apply_assignment_to_document** | ❌ 无验证 | ❌ | ❌ | 不更新已有实例（静默跳过） |
+| **工作流 apply_removal_to_document** | N/A（删除） | N/A | ❌ | hard_delete |
+| **document_importer 导入** | ❌ 无验证，信任导出数据 | ❌ | ❌ | 按导出值原样写入 |
+| **SELECT 定义变更→process_cf_select_update** | ❌ 只清理失效选项 id | N/A | N/A | 失效选项置为 None |
 
 > **事实核对**：不存在独立的 "CustomFieldInstanceViewSet"。API 路由 [paperless/urls.py L88](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/paperless/urls.py#L88) 仅注册 `custom_fields`（CustomField 定义 CRUD）。
 > CustomFieldInstance 只能通过 DocumentSerializer 的嵌套 `custom_fields` 字段写入，由第三方库 `drf_writable_nested.NestedUpdateMixin` 调度。
@@ -912,10 +966,21 @@ def update_filename_and_move_files(sender, instance, **kwargs):
 1. **DocumentLink 不对称**：通过消费者/工作流写入的文档链接不会自动创建反向链接。只有 API 文档更新和批量编辑路径会调用 `reflect_doclinks()`。
    - 修复方式：在这些路径手动调用，或接受「非 API 路径产生的链接是单向的」。
 
-2. **非法值可落库**：消费者和工作流路径没有类型检查。如果工作流配置了非法的日期字符串或超出 int4 范围的整数，会触发数据库层 IntegrityError 或静默产生脏数据。
+2. **DocumentLink 权限边界（上传 vs 更新）**：
+   - 上传阶段（POST `/post_document/`）不校验用户对目标文档的权限，可能让用户创建指向无权限文档的链接
+   - 文档更新阶段（PUT/PATCH）会校验，是因为 DocumentSerializer 嵌套序列化器自动传递了 `context`（含 request.user）
+   - 代码根因：PostDocumentSerializer 中手动实例化 `CustomFieldInstanceSerializer()` 时**未传 context**，导致 `self.context.get("request")` 返回 None
+   - 代码位置：[serialisers.py L2212-L2234](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py#L2212-L2234)
+
+3. **list 格式重复字段漏检**：
+   - 重复的自定义字段 id 不会触发校验错误（`set()` 在比较前已去重），会被 `dict.fromkeys()` 静默合并
+   - 错误消息 "were specified twice" 具有误导性，实际该条件只能检测到不存在的 id
+   - 代码位置：[serialisers.py L2246-L2249](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py#L2246-L2249)
+
+4. **非法值可落库**：消费者和工作流路径没有类型检查。如果工作流配置了非法的日期字符串或超出 int4 范围的整数，会触发数据库层 IntegrityError 或静默产生脏数据。
    - 设计考量：工作流的字段值是管理员在后台配置的，假设其可信；消费者的 metadata 来源也是受控的（API 或工作流）。
 
-3. **SELECT 无效值**：除了 API 路径会校验 option id 是否存在，其他路径都不校验。但 `process_cf_select_update` 会在字段定义变更时做一次兜底清理。
+5. **SELECT 无效值**：除了 API 路径会校验 option id 是否存在，其他路径都不校验。但 `process_cf_select_update` 会在字段定义变更时做一次兜底清理。
 
 ### 9.2 保存与搜索索引的关系
 
@@ -1057,20 +1122,30 @@ document_updated.connect(send_websocket_document_updated)
 
 #### 关系一：API 上传校验与最终落库的"一次校验"原则
 
-API 上传的 custom_fields 值在 **PostDocumentSerializer.validate_custom_fields()** 阶段就完成了完整校验（dict 格式），之后的链路：
+API 上传的 custom_fields 值在 **PostDocumentSerializer.validate_custom_fields()** 阶段完成校验（dict 格式），之后的链路：
 
 ```
-PostDocumentSerializer.validate()  ✅ 完整校验（仅一次）
+PostDocumentSerializer.validate_custom_fields()  ✅ 校验（仅一次，有两处边界）
+  ├─ dict 格式：CustomFieldInstanceSerializer.validate() 完整类型校验
+  │   └─ DocumentLink：只校验目标存在，不校验用户权限（context 为空）
+  └─ list 格式：仅校验 id 存在性，重复 id 无法检测（set() 先去重）
   ↓ 值封装进 DocumentMetadataOverrides
   ↓ Celery 异步任务 consume_file()
-  ↓ WorkflowTriggerPlugin 可能追加工作流值  ⚠️ 不校验
+  ↓ WorkflowTriggerPlugin 可能追加工作流值  ⚠️ 完全不校验
   ↓ ConsumerPlugin.apply_overrides()  ❌ 不再校验，直接 create()
   ↓ Document.save()
   ↓ document_consumption_finished → add_to_index ✅ 写入搜索索引
 ```
 
 **设计意图**：校验只在 API 入口做一次，后续各环节（Celery、插件链、落库）信任上游数据，追求性能。
-**风险点**：WorkflowTriggerPlugin 注入的工作流值完全不校验，如果管理员在工作流中配置了非法值，会直接导致数据库异常或脏数据。
+
+**风险点汇总（三处校验不完整）**：
+
+| 风险 | 位置 | 说明 |
+|------|------|------|
+| DocumentLink 未校验权限 | PostDocumentSerializer（dict 格式） | 手动实例化 `CustomFieldInstanceSerializer()` 未传 context，`request` 为 None → `validate_documentlink_targets` 中 `user is None` 直接 return，跳过 `has_perms_owner_aware` 权限检查。PUT/PATCH 更新路径无此问题（嵌套序列化器自动传递 context） |
+| list 格式重复 id 漏检 | PostDocumentSerializer（list 格式） | 判断条件 `DB.count() != len(set(ids))` 中 `set()` 已去重，重复 id 无法触发错误，后续由 `dict.fromkeys()` 静默合并 |
+| 工作流注入值不校验 | WorkflowTriggerPlugin → apply_assignment_to_overrides | 管理员配置的工作流值直接写入 overrides dict，无任何类型校验 |
 
 #### 关系二：落库与搜索索引的时序
 
