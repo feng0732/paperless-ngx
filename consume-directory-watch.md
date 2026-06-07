@@ -41,7 +41,8 @@ Consume Directory 监控功能由以下核心组件协同工作：
 ┌───────────────────────────────────────────────────────────────────┐
 │ 阶段 4: 消费阶段 SHA256 查重 (ConsumerPreflightPlugin)             │
 │   行为: 计算 SHA256，查询 Document.global_objects                  │
-│   ★ 不是"避免重复入队"，是"避免重复入库"（任务已入队，已在执行）    │
+│   ★ 不是"避免重复入队"；仅在非并发时拦截已入库的重复内容             │
+│   ★ 无数据库唯一约束，并发预检同时通过时可能写入多条 Document       │
 └────────────────────────────┬──────────────────────────────────────┘
                              ↓
 ┌───────────────────────────────────────────────────────────────────┐
@@ -211,7 +212,7 @@ def _consume_file(filepath: Path, ...) -> None:
 
 **源文件**：`src/documents/consumer.py`
 
-**这不是"避免重复入队"的机制 —— 任务已经入队并在 Celery Worker 中执行了。** 它避免的是"重复入库"（即同一内容在 Document 表中创建多条记录）。
+**这不是"避免重复入队"的机制 —— 任务已经入队并在 Celery Worker 中执行了。** 它尝试在消费前拦截已入库的重复内容，但**不能保证并发场景下只写入一条 Document 记录**。
 
 ```python
 def pre_check_duplicate(self) -> None:
@@ -234,14 +235,16 @@ def pre_check_duplicate(self) -> None:
 | `Document.archive_checksum` | PDF/A 归档文件的 SHA256 |
 | `Document.global_objects` | 包括已软删除（回收站）的文档，不遗漏 |
 
+> **重要代码事实**：`checksum` 和 `archive_checksum` 字段均未设置 `unique=True`，Document.Meta 中也没有关于这两个字段的 UniqueConstraint。数据库层面不阻止相同 checksum 的多条记录写入。
+
 #### 本阶段去重能力评估
 
 | 维度 | 说明 |
 |------|------|
 | 是否避免重复入队 | ❌ **否** — 任务已经在执行，已经浪费了一次 Worker 调度和 SHA256 计算 |
-| 是否避免重复入库 | ✅ **是** — 防止同一内容创建多条 Document 记录 |
-| 生效前提 | 之前相同内容的文件已经被**成功消费并入库**（Document 记录已写入 DB） |
-| 失效场景 | 如果之前的任务只是 PENDING/STARTED，Document 尚未写入数据库，则 SHA256 查重检测不到。此时多个重复任务会同时通过查重，并行执行解析。最终只有第一条成功写入的任务会留下 Document，其余在写入时可能因后续流程发现冲突或报错 |
+| 是否避免重复入库 | ⚠️ **仅在非并发场景下能拦截已入库的重复内容** — 只有当查重查询时 Document 已存在于 DB 中才能拦截；并发预检同时通过时，因无数据库唯一约束，**多条相同 checksum 的 Document 可能全部成功写入** |
+| 生效前提 | 之前相同内容的文件已经被**成功消费并入库**（Document 记录已写入 DB），且在本次查重查询前已提交 |
+| 失效场景 | 如果之前的任务只是 PENDING/STARTED，Document 尚未写入数据库，则 SHA256 查重检测不到。此时多个重复任务会同时通过查重，并行执行解析。**因 checksum 字段无数据库唯一约束，所有并发任务都可能成功写入 Document 表，产生多条重复记录** |
 | 与 CONSUMER_DELETE_DUPLICATES 的关系 | **仅当已有相同 Document 记录存在时**，设为 True 才会在查重命中时主动删除源文件（从而减少后续重启再次触发的概率）。对于 PENDING/STARTED 窗口，Document 尚未入库，SHA256 查重检测不到重复，CONSUMER_DELETE_DUPLICATES 完全不起作用。设为 False 时，仅记录警告，文件仍在 consume 目录中 |
 
 ---
@@ -281,10 +284,10 @@ if Path(shadow_file).is_file():
 | watch 模式下同一文件写入过程中触发多次 added/modified 事件 | ❌ 不会 | FileStabilityTracker 以 Path 为键合并事件，稳定后 pop 移除。与 CONSUMER_DELETE_DUPLICATES 无关 |
 | watch 模式下文件稳定入队后，用户再次修改该文件（源文件尚未被消费删除） | ✅ **会** | 稳定文件已从 `_tracked` 中 pop，新的 modified 事件会重新跟踪并在稳定后再次入队。**CONSUMER_DELETE_DUPLICATES 能否生效取决于第一次任务是否已成功入库**：若 Document 已写入 DB，第二次消费时 SHA256 查重命中，设为 True 会删除源文件；若第一次任务仍为 PENDING/STARTED，则查重检测不到，CONSUMER_DELETE_DUPLICATES 无效 |
 | 单次启动，oneshot 模式 | ❌ 不会 | glob 扫描时逐个处理，单次遍历不重复。与 CONSUMER_DELETE_DUPLICATES 无关 |
-| 消费任务还在 PENDING/STARTED，监控进程重启 | ✅ **会！** | 启动扫描重新发现源文件（尚未被成功消费删除），再次调用 `_consume_file`。Document 尚未入库，SHA256 查重检测不到。**CONSUMER_DELETE_DUPLICATES 在此场景完全无效**。多个相同任务会并行执行解析 |
-| 消费任务已 SUCCESS，但源文件未被删除（极端异常） | ✅ **会！** | 启动扫描再次发现文件。此时 Document 已存在，SHA256 查重能拦截重复入库。**CONSUMER_DELETE_DUPLICATES=True 会删除源文件，避免后续再次触发；设为 False 则文件仍在，每次重启都会重复入队** |
-| 消费者进程崩溃，文件停留在 consume 目录 | ✅ **会！** | 每次重启都会重新发现。**CONSUMER_DELETE_DUPLICATES 的效果取决于崩溃时机**：若崩溃前 Document 已写入 DB，则后续消费时查重命中，设为 True 会删除文件；若崩溃时 Document 尚未写入 DB，则与 PENDING 重启场景相同，CONSUMER_DELETE_DUPLICATES 无效 |
-| 用户手动将同一文件复制两次到 consume 目录（不同文件名） | ✅ **会** | 两个不同路径（即使内容相同）是不同的 TrackedFile。**第二次消费时，若第一次已成功入库，CONSUMER_DELETE_DUPLICATES=True 会删除第二个文件；若第一次仍在 PENDING，则无效** |
+| 消费任务还在 PENDING/STARTED，监控进程重启 | ✅ **会！** | 启动扫描重新发现源文件（尚未被成功消费删除），再次调用 `_consume_file`。Document 尚未入库，SHA256 查重检测不到。**CONSUMER_DELETE_DUPLICATES 在此场景完全无效**。多个相同任务会并行执行解析。**因 checksum 字段无数据库唯一约束，所有并发任务都可能成功写入 Document 表，产生多条重复记录** |
+| 消费任务已 SUCCESS，但源文件未被删除（极端异常） | ✅ **会！** | 启动扫描再次发现文件。此时 Document 已存在，SHA256 查重能拦截后续重复消费（非并发场景）。**CONSUMER_DELETE_DUPLICATES=True 会删除源文件，避免后续再次触发；设为 False 则文件仍在，每次重启都会重复入队** |
+| 消费者进程崩溃，文件停留在 consume 目录 | ✅ **会！** | 每次重启都会重新发现。**CONSUMER_DELETE_DUPLICATES 的效果取决于崩溃时机**：若崩溃前 Document 已写入 DB，则后续消费时查重命中，设为 True 会删除文件；若崩溃时 Document 尚未写入 DB，则与 PENDING 重启场景相同，CONSUMER_DELETE_DUPLICATES 无效，且并发时可能写入多条重复 Document |
+| 用户手动将同一文件复制两次到 consume 目录（不同文件名） | ✅ **会** | 两个不同路径（即使内容相同）是不同的 TrackedFile。**第二次消费时，若第一次已成功入库且不是并发执行，CONSUMER_DELETE_DUPLICATES=True 会删除第二个文件；若第一次仍在 PENDING 或两次并发执行，则无效且可能写入多条重复 Document** |
 
 ---
 
@@ -565,18 +568,22 @@ _watch_directory() 进入无限循环
 
 ---
 
-### 第二类：防重复入库（任务已入队，在 Celery Worker 中拦截 Document 重复写入）
+### 第二类：拦截已入库重复内容（任务已入队，在 Celery Worker 中预检已存在的 Document）
 
 **唯一机制**：ConsumerPreflightPlugin.pre_check_duplicate() 的 SHA256 查重（阶段 4）
 
+**数据库事实**：`Document.checksum` 和 `Document.archive_checksum` 字段均**未设置数据库唯一约束**（无 `unique=True`，Meta 中无 UniqueConstraint）。应用层 `document.save()` 前也无二次查重。
+
 **有效边界**：
+- ✅ 非并发场景下，若相同内容的 Document 已存在于 DB，则能拦截后续重复消费
 - ✅ 跨进程、跨重启（基于数据库中的 Document 记录）
 - ✅ 不依赖文件路径，按文件内容哈希比对
 - ✅ 包括已软删除（回收站）的文档
 - ❌ 不防重复入队 — 任务已经执行到 Worker，浪费了调度和计算资源
-- ❌ 仅当之前相同内容的 Document 已成功写入 DB 后才生效；若之前的任务仍为 PENDING/STARTED，则检测不到，多个重复任务会并行执行
+- ❌ 仅当之前相同内容的 Document 已成功写入 DB 后才生效；若之前的任务仍为 PENDING/STARTED，则检测不到
+- ❌ **并发预检同时通过时，因无数据库唯一约束，多条相同 checksum 的 Document 可能全部成功写入，产生重复记录**
 
-**实际作用**：即使因进程重启等原因导致同一内容被多次入队，也不会在数据库中产生重复的 Document 记录。
+**实际作用**：在非并发场景下，即使因进程重启等原因导致同一内容被多次入队，已入库的 Document 能被检测到并拦截后续消费。但**不能保证并发场景下只留下一条 Document 记录**。
 
 **关于 CONSUMER_DELETE_DUPLICATES 的边界**：
 - ✅ 仅当已有相同 Document 记录存在于数据库时，设为 True 才会在查重命中时主动删除源文件，从而减少后续重启或扫描时的再次触发
@@ -604,17 +611,18 @@ _watch_directory() 进入无限循环
                                    │
          ┌─────────────────────────┼─────────────────────────┐
          ▼                         ▼                         ▼
-  【防重复入队】              【防重复入库】            【成功后减少再次触发】
+  【防重复入队】           【拦截已入库重复内容】      【成功后减少再次触发】
   FileStabilityTracker      SHA256 查重              unlink() 删除源文件
   (阶段 2)                  (阶段 4)                  (阶段 5)
          │                         │                         │
          ▼                         ▼                         ▼
-  合并同一进程内的          即使入队了也不写          消费成功后文件消失，
-  多次事件为一次入队       重复 Document             未来扫描不再发现
+  合并同一进程内的          非并发时能拦截           消费成功后文件消失，
+  多次事件为一次入队       已入库的重复内容；       未来扫描不再发现
+                           并发时可能写入多条
          │                         │                         │
          ▼                         ▼                         ▼
-  边界：watch模式、             边界：之前的任务           边界：必须消费成功，
-  同进程、未重新修改            已成功入库                 PENDING 期间有窗口
+  边界：watch模式、             边界：Document             边界：必须消费成功，
+  同进程、未重新修改            已存在；无DB唯一约束        PENDING 期间有窗口
 ```
 
 **最危险的重复入队窗口**：监控进程崩溃重启，且上次提交的任务仍为 PENDING/STARTED（源文件未删、Document 未入库）。此时三类机制全部失效：
@@ -622,7 +630,7 @@ _watch_directory() 进入无限循环
 2. SHA256 查重：Document 尚未入库，检测不到重复
 3. `CONSUMER_DELETE_DUPLICATES`：**在此场景完全无效**，因为它依赖于 SHA256 查重先命中
 
-最终结果是多个相同任务会并行执行解析。只有当第一轮任务率先完成并写入 Document 后，后续轮次的任务在消费阶段才能被 SHA256 查重拦截（此时 CONSUMER_DELETE_DUPLICATES=True 才能删除源文件，防止更多轮次的重复入队）。
+最终结果是多个相同任务会并行执行解析。**且因 checksum 字段无数据库唯一约束，所有并发任务都可能成功写入 Document 表，产生多条 checksum 相同的重复记录**。只有当某一轮任务率先完成并写入 Document 后，后续轮次的任务在非并发消费阶段才能被 SHA256 查重拦截（此时 CONSUMER_DELETE_DUPLICATES=True 才能删除源文件，防止更多轮次的重复入队）。
 
 ---
 
@@ -656,7 +664,8 @@ ConsumerFilter 过滤
 ┌─ 阶段 4: Celery Worker 执行 ───────────────────────────────┐
 │  ConsumerPreflightPlugin.pre_check_file_exists()           │
 │  ConsumerPreflightPlugin.pre_check_duplicate()             │
-│    [SHA256 查重：防重复入库 ✅，不防重复入队 ❌]             │
+│    [SHA256 查重：非并发时拦截已入库重复内容 ✅；              │
+│     不防重复入队 ❌；无DB唯一约束，并发时可能写入多条]       │
 │    [CONSUMER_DELETE_DUPLICATES=True 时，仅当已存在相同      │
 │     Document 时才会删除源文件；PENDING/STARTED 窗口无效]    │
 └────────────────────────────────────────────────────────────┘
