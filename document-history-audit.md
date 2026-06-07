@@ -126,10 +126,44 @@ for entry in LogEntry.objects.get_for_objects(doc.custom_fields.all()):
 
 前端在 [document-history.component.html](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src-ui/src/app/components/document-detail/document-history/document-history.component.html#L30-L56) 中根据 `changes` 的结构分支渲染：
 
-- **普通字段**：`change.value` 是一个二元数组 `[old, new]`，使用 `getPrettyName()` 对关联对象 ID 进行名称解析
-- **M2M 字段**：`change.value["type"] === 'm2m'`，显示 operation + objects
-- **自定义字段**：`change.value["type"] === 'custom_field'`，直接显示 field + value
-- **content 字段**：截取前 100 字符避免 UI 爆炸
+#### 2.3.1 普通字段：只展示新值，不展示旧值
+
+这是一个需要注意的关键边界：**普通字段的 UI 只展示 `change.value[1]`（新值），完全不展示 `change.value[0]`（旧值）**。
+
+```html
+<!-- 普通字段分支 -->
+@else {
+    <li>
+        <span>{{ change.key | titlecase }}</span>:&nbsp;
+        @if (change.key === 'content') {
+            <code class="text-primary">{{ change.value[1]?.substring(0,100) }}...</code>
+        } @else {
+            <code class="text-primary">{{ getPrettyName(change.key, change.value[1]) | async }}</code>
+        }
+    </li>
+}
+```
+
+具体行为：
+- **content 字段**：`change.value[1]?.substring(0,100)` — 取新值的前 100 个字符
+- **其他普通字段**：`getPrettyName(change.key, change.value[1])` — 对**新值**的 ID 进行名称解析
+
+`getPrettyName()` 方法在 [document-history.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src-ui/src/app/components/document-detail/document-history/document-history.component.ts#L66-L113) 中的解析规则：
+
+| 字段类型（change.key） | 解析方式 | 回退 |
+|------|----------|------|
+| `correspondent` | `CorrespondentService.getCached(id).name` | 直接显示 ID |
+| `document_type` | `DocumentTypeService.getCached(id).name` | 直接显示 ID |
+| `storage_path` | `StoragePathService.getCached(id).path` | 直接显示 ID |
+| `owner` | `UserService.getCached(id).username` | 直接显示 ID |
+| **其他所有**（title、tags、custom_fields、deleted_at 等） | 直接原值显示 | - |
+
+注意：`DataType.Tag` 和 `DataType.CustomField` 在 `getPrettyName()` 中**没有分支处理**，因为这两类变更走的是下方的 `type === 'm2m'` 和 `type === 'custom_field'` 特殊分支。
+
+#### 2.3.2 M2M 字段与自定义字段的特殊展示
+
+- **M2M 字段（tags）**：`change.value["type"] === 'm2m'`，显示 `operation`（add/remove，首字母大写）+ 字段名 + `objects.join(', ')`（直接是 tag 名称字符串，无需二次解析）
+- **自定义字段**：`change.value["type"] === 'custom_field'`，直接显示 `field`（字段名）+ `value`（字段值）
 
 ---
 
@@ -234,14 +268,76 @@ Notes 变更（[views.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-n
        elif isinstance(new_value, Manager):
            new_value = list(new_value.values_list("pk", flat=True))
 
-       LogEntry.objects.log_create(
-           instance=doc,
-           changes={modified_field: [old_value, new_value]},
-           action=LogEntry.Action.UPDATE,
-           actor=user,
-           additional_data={"reason": f"Bulk edit: {method.__name__}"},
-       )
+       LogEntry.objects.log_create(...)
    ```
+
+#### 4.2.1 快照取值的关键边界：tags 与 custom_fields
+
+`.values()` 对不同类型字段返回的数据形态不同，这是理解批量编辑快照的核心：
+
+| 字段类型 | 示例字段 | `.values()` 返回值形态 | 示例 |
+|------|------|----------|------|
+| 普通字段 / FK | `correspondent`, `deleted_at`, `checksum` | 字段实际值（FK 为 pk） | `{"correspondent": 5}` |
+| **M2M 字段** | **`tags`** | **单个关联对象的 pk（见下方详述）** | `{"tags": 3}` |
+| **反向 OneToMany** | **`custom_fields`** | **单个关联对象的 pk（见下方详述）** | `{"custom_fields": 12}` |
+
+**Django `.values()` 对 M2M 和反向关联的展开行为**：
+
+Django 的 `QuerySet.values()` 在遇到 M2M 字段或反向 OneToMany 字段时，会执行 **SQL JOIN 展开**——一个文档如果关联了 N 个对象，就会产生 N 行结果，每行包含一个关联对象的 pk。
+
+例如某文档关联了 tag_id=3、tag_id=7、tag_id=9 三个标签：
+
+```
+.values("pk", "tags") 的原始返回：
+[
+    {"pk": 1, "tags": 3},   // 第 1 行，对应 tag #3
+    {"pk": 1, "tags": 7},   // 第 2 行，对应 tag #7
+    {"pk": 1, "tags": 9},   // 第 3 行，对应 tag #9
+]
+```
+
+但外层使用 **字典推导式** `{obj["pk"]: obj ...}`，相同 pk 会发生键冲突**覆盖**，最终只保留**最后一行**的单个 pk：
+
+```python
+old_documents = {
+    1: {"pk": 1, "tags": 9, ...}   // 只保留了最后一个 tag_id=9
+}
+```
+
+#### 4.2.2 快照值 vs 新值的数据结构不一致
+
+快照取值和新值取值使用了完全不同的方式，导致 `changes` 数组的前后两项数据结构不一致：
+
+```
+old_value (来自 .values() + dict 覆盖)   →  单个 pk 整数  例如: 9
+new_value (来自 Manager.values_list())    →  pk 整数列表    例如: [3, 7, 9, 11]
+```
+
+最终写入 `LogEntry.changes` 的结构为：
+
+```python
+{
+    "tags": [9, [3, 7, 9, 11]]           // old: 单个 int, new: list[int]
+    "custom_fields": [12, [12, 15, 18]]  // 同理
+}
+```
+
+**对前端展示的影响**：
+
+普通字段分支只读取 `change.value[1]`（新值，列表形式），然后调用 `getPrettyName("tags", [3, 7, 9, 11])`。由于 `tags` 不在 `getPrettyName()` 的 switch 分支中，且 `parseInt("[3, 7, 9, 11]")` 返回 `NaN`，最终**回退为直接显示原始字符串**，例如显示为 `3,7,9,11` 或数组的字符串形式。
+
+#### 4.2.3 普通 FK 字段的取值一致性
+
+对比而言，普通 FK 字段的快照和新值是一致的：
+
+- 快照：`old_documents[doc.pk]["correspondent"]` → FK 的 pk 整数
+- 新值：`doc.correspondent` → `Correspondent` 对象 → `.pk` → 整数
+
+两者均为单个整数，前后结构统一。
+
+#### 4.2.4 测试覆盖的缺失
+
+在 [test_api_bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/tests/test_api_bulk_edit.py#L1782-L1838) 中，`test_bulk_edit_audit_log_enabled_tags` 和 `test_bulk_edit_audit_log_enabled_custom_fields` **仅断言了 LogEntry 的条数**（1 条、2 条），并未对 `changes` 字段的实际内容做断言，因此快照取值的结构不一致问题未被测试捕获。
 
 ### 4.3 粒度特征：文档级独立日志
 
