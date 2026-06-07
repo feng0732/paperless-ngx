@@ -489,7 +489,36 @@ overrides.custom_fields = {
 
 这是最常见的入口：用户在 WebUI 上传文件或通过 REST API POST `/api/documents/post_document/`。
 
-#### 入口代码：views.py DocumentViewSet.post_document()
+#### 阶段一：PostDocumentSerializer 校验（上传入口）
+
+[serialisers.py L2088-L2255](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py#L2088-L2255)
+
+`custom_fields` 字段定义为 `serializers.JSONField`，支持两种输入格式，由 `validate_custom_fields()` 方法校验：
+
+**格式一：dict `{field_id: value, ...}`** — 每个字段指定具体值
+```python
+# 校验流程：
+for field_id, value in custom_fields.items():
+    1. field_id 转为 int，失败抛错
+    2. CustomField.objects.get(id=field_id_int)，不存在抛错
+    3. ★ 调用 CustomFieldInstanceSerializer.validate({field, value})
+       → 执行完整类型校验（URL、整数范围、货币格式、SELECT id 合法性、DocumentLink 权限等）
+    4. 存入 normalized {field_id_int: value}
+```
+
+**格式二：list `[field_id, ...]`** — 字段值全为 None
+```python
+# 校验流程：
+1. 全部元素转为 int，失败抛错
+2. CustomField.objects.filter(id__in=ids).count() == len(set(ids))
+   → 不存在或重复则抛错
+3. 直接返回 ids 列表（后续由 views.py 转为 {id: None} dict）
+```
+
+> **事实核对**：API 上传阶段就已经通过 `CustomFieldInstanceSerializer.validate()` 做了**完整的类型校验**。
+> 但 ConsumerPlugin 最终落库时不会再次校验。
+
+#### 阶段二：views.py 组装 overrides 并投递任务
 
 [views.py L3100-L3160](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/views.py#L3100-L3160)
 
@@ -534,7 +563,7 @@ plugin.run()
 overrides = plugin.metadata   # 覆盖，支持链式修改
 ```
 
-#### WorkflowTriggerPlugin：消费阶段的工作流注入
+#### WorkflowTriggerPlugin：消费阶段的工作流注入（可能引入未校验的值）
 
 [consumer.py L74-L87](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/consumer.py#L74-L87)
 
@@ -550,15 +579,21 @@ class WorkflowTriggerPlugin:
             self.metadata.update(overrides)  # 与 API 传入的合并
 ```
 
-注意这里传入的是一个**全新的空 overrides**，消费阶段工作流的赋值通过 `update()` 与 API 传入的值合并。
+> **事实核对**：
+> 1. 这里传入的是一个**全新的空 overrides**，消费阶段工作流的赋值通过 `update()` 与 API 传入的值合并
+> 2. ⚠️ **工作流注入的 custom_fields 值完全不经过校验**。`run_workflows → apply_assignment_to_overrides` 直接把工作流配置中的值写入 overrides dict
+> 3. 如果工作流配置了非法值（如无效日期、超出 int4 范围的整数），会直接通过后续的落库逻辑写入数据库，可能触发数据库层异常或产生脏数据
 
-#### ConsumerPlugin.apply_overrides()：最终落库
+#### ConsumerPlugin.apply_overrides()：最终落库（信任上游数据）
 
 [consumer.py L877-L938](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/consumer.py#L877-L938)
 
 Document 对象创建后，调用 `apply_overrides()` 将 `metadata.custom_fields` 写入数据库：
 
 ```python
+# 先设置 document 自身的字段（correspondent、document_type、tags、storage_path、asn、权限等）
+...
+# 最后处理 custom_fields
 if self.metadata.custom_fields:
     for field in CustomField.objects.filter(
         id__in=self.metadata.custom_fields.keys(),
@@ -575,9 +610,26 @@ if self.metadata.custom_fields:
 ```
 
 **关键特征**：
-- 使用 `objects.create()` 直接插入，**不经过序列化器验证**
-- 不处理 DocumentLink 的对称链接（`reflect_doclinks`）
-- 如果字段已存在（虽理论上不会发生，因为文档刚创建），会触发 UniqueConstraint 异常
+- 使用 `CustomFieldInstance.objects.create()` 直接插入，**完全不经过序列化器验证**
+- 不处理 DocumentLink 的对称链接（不调用 `reflect_doclinks`）
+- 由于文档刚创建，UniqueConstraint 理论上不会触发；若同一 custom_fields 中存在重复 key，由 `filter().distinct()` 去重
+- 写入发生在 Document.save() **之前**（`apply_overrides` 修改完 document 后，外部才调用 `document.save()`）
+
+**API 上传 → 落库的完整校验链路：**
+
+```
+API 上传
+  ↓ PostDocumentSerializer.validate_custom_fields()
+  ↓ ✅ CustomFieldInstanceSerializer.validate() 完整校验（仅 dict 格式的值）
+  ↓ 封装为 DocumentMetadataOverrides
+  ↓ Celery consume_file()
+  ↓ WorkflowTriggerPlugin（消费阶段工作流）
+  ↓ ⚠️ 工作流注入的值不校验，直接 update() 合并
+  ↓ ConsumerPlugin.apply_overrides()
+  ↓ ❌ 不再校验，直接 CustomFieldInstance.objects.create()
+  ↓ document.save()
+  ↓ document_consumption_finished 信号
+```
 
 ---
 
@@ -596,22 +648,40 @@ if self.metadata.custom_fields:
 
 使用 Django 标准序列化器，导出**所有字段值（含软删除）**。
 
-#### 导入：document_importer.py load_data_to_database()
+#### 导入：document_importer.py
 
-[document_importer.py L354-L430](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/management/commands/document_importer.py#L354-L430)
+完整执行流程在 `_run_import()` 方法：[document_importer.py L451-L509](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/management/commands/document_importer.py#L451-L509)
 
-使用 `bulk_create(..., update_conflicts=True)` 按 PK 批量 upsert。**关键特征**：
+使用 `bulk_create(..., update_conflicts=True)` 按 PK 批量 upsert（`load_data_to_database` L354-L430）。
 
-1. **禁用信号**：导入时禁用以下信号以避免性能损耗和级联副作用
-   - `update_filename_and_move_files`（Document + CustomFieldInstance）
-   - `check_paths_and_prune_custom_fields`（CustomField）
-   - auditlog 全部模型
+**关键特征**：
 
-2. **禁用约束检查**：`connection.constraint_checks_disabled()` 允许乱序导入
+1. **禁用的信号列表**（`_run_import` 中通过 `disable_signal()` context manager 精确禁用）：
+   - `post_save → update_filename_and_move_files`（sender=Document）
+   - `m2m_changed → update_filename_and_move_files`（sender=Document.tags.through）
+   - `post_save → update_filename_and_move_files`（sender=CustomFieldInstance）
+   - `post_save → check_paths_and_prune_custom_fields`（sender=CustomField）
+   - auditlog：unregister Document、Correspondent、Tag、DocumentType、Note、CustomField、CustomFieldInstance
 
-3. **排除 GeneratedField**：`value_monetary_amount` 由数据库自动生成，不手动写入
+2. **不禁用的信号**：
+   - 自定义信号 `document_consumption_finished` 和 `document_updated`（导入过程中也不会发送）
+   - CustomFieldInstance 的其他 post_save receiver（如果有）
 
-4. **不做任何验证**：直接反序列化写入，信任导出文件的完整性
+3. **禁用约束检查**：`connection.constraint_checks_disabled()` 允许乱序导入
+
+4. **排除 GeneratedField**：`value_monetary_amount` 由数据库自动生成，不手动写入
+
+5. **不做任何验证**：直接反序列化写入，信任导出文件的完整性
+
+6. **导入结束自动重建索引**：
+   ```python
+   # 在 with disable_signal(...) 上下文之外执行
+   self.stdout.write("Updating search index...")
+   call_command("document_index", "reindex", no_progress_bar=self.no_progress_bar)
+   ```
+   > **事实核对**：document_importer **在禁用信号的上下文退出后**，自动调用 `document_index reindex` 重建搜索索引。
+   > 这与之前描述的"需手动调用"不同，实际是自动完成的。
+   > 之所以在信号禁用上下文之外调用，是因为 reindex 命令本身可能需要发送信号。
 
 ---
 
@@ -825,9 +895,10 @@ def update_filename_and_move_files(sender, instance, **kwargs):
 
 | 保存路径 | 是否经过 CustomFieldInstanceSerializer 验证 | 是否处理 DocumentLink 对称链接 | 值为 None 时行为 |
 |----------|------------------------------------------|-----------------------------|------------------|
-| **API 文档更新**（DocumentSerializer.custom_fields 嵌套字段） | ✅ 内部调用 CustomFieldInstanceSerializer，完整验证 | ✅ `reflect_doclinks`（create 时） + `remove_doclink`（移除 DOCUMENTLINK 字段时） | 清空该字段值 |
+| **API 文档更新**（PUT/PATCH，DocumentSerializer.custom_fields） | ✅ 内部调用 CustomFieldInstanceSerializer，完整验证 | ✅ `reflect_doclinks`（create 时） + `remove_doclink`（移除 DOCUMENTLINK 字段时） | 清空该字段值 |
+| **API 上传阶段一**（POST /post_document，PostDocumentSerializer） | ✅ dict 格式的值完整验证（CustomFieldInstanceSerializer.validate）；list 格式仅校验 id 存在和唯一性 | N/A（还未落库） | N/A（还未落库） |
+| **API 上传阶段二**（Celery 消费，ConsumerPlugin.apply_overrides） | ❌ 不再验证（信任 PostDocumentSerializer 的前置校验 + 工作流值） | ❌ | 创建值为 None 的实例 |
 | **批量编辑**（bulk_edit.modify_custom_fields） | ❌ 无验证 | ✅ `reflect_doclinks`（仅 add） | 清值或创建空实例 |
-| **API 上传→ConsumerPlugin.apply_overrides** | ❌ 无验证 | ❌ | 创建值为 None 的实例 |
 | **工作流 apply_assignment_to_document** | ❌ 无验证 | ❌ | 不更新已有实例（静默跳过） |
 | **工作流 apply_removal_to_document** | N/A（删除） | ❌ | hard_delete |
 | **document_importer 导入** | ❌ 无验证，信任导出数据 | ❌ | 按导出值原样写入 |
@@ -877,7 +948,7 @@ document_updated.connect(send_websocket_document_updated)
 | **工作流（DOCUMENT_ADDED）** | 首次消费路径，由 `document_consumption_finished` → `add_to_index` 覆盖 |
 | **工作流（DOCUMENT_UPDATED）** | `document_updated` 信号 → 不连接 add_to_index；工作流 mutation 直接 save CustomFieldInstance，**无索引更新** |
 | **工作流（CONSUMPTION）** | 最终由 ConsumerPlugin 触发 `document_consumption_finished` 覆盖 |
-| **document_importer 导入** | ⚠️ **禁用所有信号**，导入后需手动调用 `document_index` 命令重建索引 |
+| **document_importer 导入** | 导入过程中禁用信号，但 **导入结束后自动调用 `document_index reindex`** 重建索引（在信号禁用上下文之外执行） |
 | **SELECT 定义变更→process_cf_select_update** | `.update(value_select=None)` 是批量 SQL，不触发任何信号；**完全无索引更新**。for 循环只调用文件名更新函数，不更新搜索索引 |
 
 搜索后端遍历 `document.custom_fields.all()`，使用 `value_for_search` 属性将值转为字符串后写入 Tantivy 索引（见 5.1 节）。
@@ -981,6 +1052,56 @@ document_updated.connect(send_websocket_document_updated)
 2. `document_updated` 信号只触发工作流（DOCUMENT_UPDATED）和 Websocket 通知，不触发索引
 3. Websocket payload 不含 custom_fields 数据，仅通知前端重新拉取
 4. `process_cf_select_update` 的 `.update()` 批量操作不触发任何信号
+
+### 9.5 API 上传校验、落库行为与导入索引重建的关系总结
+
+#### 关系一：API 上传校验与最终落库的"一次校验"原则
+
+API 上传的 custom_fields 值在 **PostDocumentSerializer.validate_custom_fields()** 阶段就完成了完整校验（dict 格式），之后的链路：
+
+```
+PostDocumentSerializer.validate()  ✅ 完整校验（仅一次）
+  ↓ 值封装进 DocumentMetadataOverrides
+  ↓ Celery 异步任务 consume_file()
+  ↓ WorkflowTriggerPlugin 可能追加工作流值  ⚠️ 不校验
+  ↓ ConsumerPlugin.apply_overrides()  ❌ 不再校验，直接 create()
+  ↓ Document.save()
+  ↓ document_consumption_finished → add_to_index ✅ 写入搜索索引
+```
+
+**设计意图**：校验只在 API 入口做一次，后续各环节（Celery、插件链、落库）信任上游数据，追求性能。
+**风险点**：WorkflowTriggerPlugin 注入的工作流值完全不校验，如果管理员在工作流中配置了非法值，会直接导致数据库异常或脏数据。
+
+#### 关系二：落库与搜索索引的时序
+
+CustomFieldInstance 的写入发生在 `document.save()` **之前**（`apply_overrides` → CustomFieldInstance.create() → document.save()）。
+
+搜索索引的写入发生在 `document_consumption_finished` 信号触发时，此时：
+- Document 和 CustomFieldInstance 都已写入数据库
+- 事务已提交
+- 搜索后端遍历 `document.custom_fields.all()`，此时能读到刚写入的实例
+
+因此正常流程下不存在"索引写入时实例还没创建"的竞态问题。
+
+#### 关系三：document_importer 信号禁用与索引重建的配合
+
+document_importer 禁用信号的目的是避免导入大量数据时反复触发文件名重算、SELECT 清理等副作用，造成巨大性能开销。
+
+导入结束后立即调用 `document_index reindex` 重建索引，弥补了信号禁用导致的索引缺失。这是一个"先批量写数据库，最后统一建索引"的高效模式：
+
+```
+with disable_signal(...):           # 禁用 4 个 post_save/m2m_changed + auditlog
+    load_data_to_database()         # 批量 upsert，无任何信号触发
+    _import_files_from_manifest()   # 复制文件
+
+# 上下文退出，信号恢复
+call_command("document_index", "reindex")  # 统一重建搜索索引
+```
+
+**与 Custom Fields 的关系**：
+- 导入过程中 CustomFieldInstance 的批量写入不会触发 `update_filename_and_move_files`
+- 导入结束后 `document_index reindex` 会遍历所有文档，将 custom_fields 写入 Tantivy 索引
+- 如果文件名模板使用了 custom_fields，导入后的文件名可能与模板不一致（因为信号被禁用，文件名重算未执行），需手动触发
 
 ---
 
