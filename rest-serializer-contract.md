@@ -1,6 +1,6 @@
 # REST API Serializer 契约传递脉络梳理
 
-本文档从代码实现角度梳理 Paperless-ngx 中 REST API Serializer 契约在前后端之间的传递链路，覆盖**字段来源**、**权限裁剪**、**通用表单消费**和**SavedView 专项分析**四个部分，所有引用均附带实际代码片段便于直接复核。
+本文档从代码实现角度梳理 Paperless-ngx 中 REST API Serializer 契约在前后端之间的传递链路，覆盖**字段来源**、**权限裁剪**、**通用表单消费**和**SavedView 专项分析**四个部分，所有引用均附带实际代码片段和仓库相对路径位置，便于直接复核。
 
 ---
 
@@ -83,7 +83,7 @@ serializers.ModelSerializer
 
 #### DynamicFieldsModelSerializer —— 字段动态裁剪基类
 
-[serialisers.py#L103-L121](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L103-L121)
+位置：`src/documents/serialisers.py#L103-L121`
 
 ```python
 class DynamicFieldsModelSerializer(serializers.ModelSerializer[Any]):
@@ -101,7 +101,7 @@ class DynamicFieldsModelSerializer(serializers.ModelSerializer[Any]):
 
 #### SerializerWithPerms —— 权限参数载体
 
-[serialisers.py#L217-L222](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L217-L222)
+位置：`src/documents/serialisers.py#L217-L222`
 
 ```python
 class SerializerWithPerms(serializers.Serializer[dict[str, Any]]):
@@ -116,7 +116,7 @@ class SerializerWithPerms(serializers.Serializer[dict[str, Any]]):
 
 #### 来源一：Meta.fields 声明的 Model 自动映射
 
-[serialisers.py#L1226-L1258](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L1226-L1258)
+位置：`src/documents/serialisers.py#L1226-L1258`
 
 ```python
 class DocumentSerializer(...):
@@ -142,11 +142,11 @@ class DocumentSerializer(...):
         list_serializer_class = OwnedObjectListSerializer
 ```
 
-对应的 Model 字段定义在 [models.py#L157-L306](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/models.py#L157-L306)。
+对应的 Model 字段定义在：`src/documents/models.py#L157-L306`
 
 #### 来源二：Serializer 内显式声明的自定义字段
 
-[serialisers.py#L994-L1028](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L994-L1028)
+位置：`src/documents/serialisers.py#L994-L1028`
 
 ```python
 class DocumentSerializer(...):
@@ -174,7 +174,7 @@ class DocumentSerializer(...):
 
 其中典型方法实现：
 
-[serialisers.py#L1081-L1088](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L1081-L1088) —— 文件名计算字段
+位置：`src/documents/serialisers.py#L1081-L1088` —— 文件名计算字段
 
 ```python
 def get_original_file_name(self, obj) -> str | None:
@@ -187,7 +187,7 @@ def get_archived_file_name(self, obj) -> str | None:
         return None
 ```
 
-[serialisers.py#L1033-L1041](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L1033-L1041) —— 仅在 retrieve 时返回重复文档
+位置：`src/documents/serialisers.py#L1033-L1041` —— 仅在 retrieve 时返回重复文档
 
 ```python
 @extend_schema_field(DuplicateDocumentSummarySerializer(many=True))
@@ -203,9 +203,9 @@ def get_duplicate_documents(self, obj):
 
 #### 来源三：OwnedObjectSerializer 注入的权限字段
 
-[serialisers.py#L262-L470](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L262-L470)
+位置：`src/documents/serialisers.py#L262-L470`
 
-字段声明在 [serialisers.py#L405-L414](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L405-L414)：
+字段声明在：`src/documents/serialisers.py#L405-L414`
 
 ```python
 permissions = SerializerMethodField(read_only=True, required=False)
@@ -222,7 +222,7 @@ set_permissions = SetPermissionsSerializer(
 
 核心方法实现：
 
-[serialisers.py#L342-L363](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L342-L363)
+位置：`src/documents/serialisers.py#L342-L363`
 
 ```python
 @extend_schema_field(field={...})  # OpenAPI 类型定义
@@ -252,7 +252,7 @@ def get_user_can_change(self, obj) -> bool:
 
 `_get_perms` 优先从 ViewSet 批量预取的 context 读取，回退到 django-guardian 单查：
 
-[serialisers.py#L280-L307](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L280-L307)
+位置：`src/documents/serialisers.py#L280-L307`
 
 ```python
 def _get_perms(self, obj, codename: str, target: Literal["users", "groups"]):
@@ -275,7 +275,7 @@ def _get_perms(self, obj, codename: str, target: Literal["users", "groups"]):
 
 #### 来源四：MatchingModelSerializer 注入的匹配字段
 
-[serialisers.py#L124-L167](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L124-L167)
+位置：`src/documents/serialisers.py#L124-L167`
 
 ```python
 class MatchingModelSerializer(serializers.ModelSerializer[Any]):
@@ -292,7 +292,7 @@ class MatchingModelSerializer(serializers.ModelSerializer[Any]):
 
 ### 3.1 PassUserMixin：从 HTTP 请求注入 user / full_perms
 
-[views.py#L360-L382](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/views.py#L360-L382)
+位置：`src/documents/views.py#L360-L382`
 
 ```python
 class PassUserMixin(GenericAPIView[Any]):
@@ -314,7 +314,7 @@ class PassUserMixin(GenericAPIView[Any]):
 
 ### 3.2 OwnedObjectSerializer.__init__：根据 full_perms / all_fields 裁剪字段
 
-[serialisers.py#L267-L278](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L267-L278)
+位置：`src/documents/serialisers.py#L267-L278`
 
 ```python
 def __init__(self, *args, **kwargs) -> None:
@@ -334,7 +334,7 @@ def __init__(self, *args, **kwargs) -> None:
 
 ### 3.3 DocumentSerializer：PATCH/PUT 自动触发 full_perms=true
 
-[serialisers.py#L1213-L1224](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L1213-L1224)
+位置：`src/documents/serialisers.py#L1213-L1224`
 
 ```python
 def __init__(self, *args, **kwargs) -> None:
@@ -359,7 +359,7 @@ def __init__(self, *args, **kwargs) -> None:
 
 ### 3.5 BulkPermissionMixin：列表批量预取权限（防 N+1）
 
-[views.py#L385-L479](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/views.py#L385-L479)
+位置：`src/documents/views.py#L385-L479`
 
 ```python
 class BulkPermissionMixin:
@@ -389,7 +389,7 @@ class BulkPermissionMixin:
 
 ### 3.6 对象级权限：ViewSet 层 + Serializer 层双重校验
 
-**ViewSet permission_classes** [permissions.py#L28-L52](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/permissions.py#L28-L52)：
+**ViewSet permission_classes** 位置：`src/documents/permissions.py#L28-L52`
 
 ```python
 class PaperlessObjectPermissions(DjangoObjectPermissions):
@@ -410,7 +410,7 @@ class PaperlessObjectPermissions(DjangoObjectPermissions):
             return True  # 无 owner 视为公开
 ```
 
-**Serializer.update() 二次校验 owner/权限变更** [serialisers.py#L452-L469](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L452-L469)：
+**Serializer.update() 二次校验 owner/权限变更** 位置：`src/documents/serialisers.py#L452-L469`
 
 ```python
 def update(self, instance, validated_data):
@@ -426,7 +426,7 @@ def update(self, instance, validated_data):
 
 ### 3.7 document_count 权限感知
 
-[permissions.py#L207-L220](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/permissions.py#L207-L220)
+位置：`src/documents/permissions.py#L207-L220`
 
 ```python
 def get_document_count_filter_for_user(user):
@@ -442,7 +442,7 @@ def get_document_count_filter_for_user(user):
 
 ### 4.1 TypeScript 接口层 —— 静态契约镜像
 
-[data/object-with-permissions.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/data/object-with-permissions.ts)
+位置：`src-ui/src/app/data/object-with-permissions.ts`
 
 ```typescript
 export interface PermissionsObject {
@@ -458,7 +458,7 @@ export interface ObjectWithPermissions extends ObjectWithId {
 }
 ```
 
-[data/document.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/data/document.ts#L115-L170)
+位置：`src-ui/src/app/data/document.ts#L115-L170`
 
 ```typescript
 export interface Document extends ObjectWithPermissions {
@@ -477,7 +477,8 @@ export interface Document extends ObjectWithPermissions {
 ### 4.2 REST Service 层 —— full_perms 参数控制
 
 **DocumentService.get() 默认带 full_perms=true**
-[services/rest/document.service.ts#L196-L213](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/rest/document.service.ts#L196-L213)
+
+位置：`src-ui/src/app/services/rest/document.service.ts#L196-L213`
 
 ```typescript
 get(id: number, versionID: number = null, fields: string = null): Observable<Document> {
@@ -487,7 +488,8 @@ get(id: number, versionID: number = null, fields: string = null): Observable<Doc
 ```
 
 **PATCH 写入时附带 write_only 的 remove_inbox_tags**
-[services/rest/document.service.ts#L305-L313](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/rest/document.service.ts#L305-L313)
+
+位置：`src-ui/src/app/services/rest/document.service.ts#L305-L313`
 
 ```typescript
 patch(o: Document, versionID: number = null): Observable<Document> {
@@ -503,7 +505,7 @@ patch(o: Document, versionID: number = null): Observable<Document> {
 
 ### 4.3 PermissionsService —— 权限字段的判定消费
 
-[services/permissions.service.ts#L75-L97](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/permissions.service.ts#L75-L97)
+位置：`src-ui/src/app/services/permissions.service.ts#L75-L97`
 
 ```typescript
 currentUserHasObjectPermissions(action: string, object: ObjectWithPermissions): boolean {
@@ -531,7 +533,8 @@ currentUserHasObjectPermissions(action: string, object: ObjectWithPermissions): 
 ### 4.4 EditDialogComponent —— 通用编辑对话框的 permissions_form 桥接
 
 **初始化：GET 响应 → permissions_form**
-[components/common/edit-dialog/edit-dialog.component.ts#L72-L116](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/common/edit-dialog/edit-dialog.component.ts#L72-L116)
+
+位置：`src-ui/src/app/components/common/edit-dialog/edit-dialog.component.ts#L72-L116`
 
 ```typescript
 ngOnInit(): void {
@@ -558,7 +561,8 @@ ngOnInit(): void {
 ```
 
 **提交：permissions_form → 请求体的 owner / set_permissions**
-[components/common/edit-dialog/edit-dialog.component.ts#L159-L196](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/common/edit-dialog/edit-dialog.component.ts#L159-L196)
+
+位置：`src-ui/src/app/components/common/edit-dialog/edit-dialog.component.ts#L159-L196`
 
 ```typescript
 save() {
@@ -590,7 +594,7 @@ save() {
 
 ### 4.5 PermissionsFormComponent —— 权限编辑表单 UI
 
-[components/common/input/permissions/permissions-form/permissions-form.component.ts#L17-L97](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/common/input/permissions/permissions-form/permissions-form.component.ts#L17-L97)
+位置：`src-ui/src/app/components/common/input/permissions/permissions-form/permissions-form.component.ts#L17-L97`
 
 ```typescript
 export interface PermissionsFormObject {
@@ -618,7 +622,9 @@ export class PermissionsFormComponent ... {
 }
 ```
 
-对应模板 HTML 结构见 [permissions-form.component.html](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/common/input/permissions/permissions-form/permissions-form.component.html)，层级为：
+对应模板 HTML 结构位置：`src-ui/src/app/components/common/input/permissions/permissions-form/permissions-form.component.html`
+
+层级为：
 - `owner` → Select 用户选择器
 - `set_permissions.view.users` / `set_permissions.view.groups`
 - `set_permissions.change.users` / `set_permissions.change.groups`
@@ -627,7 +633,7 @@ export class PermissionsFormComponent ... {
 
 用于 SavedView 管理页、Tag 批量编辑等"单独改权限"场景，比 EditDialog 多一个 `merge` 开关。
 
-[components/common/permissions-dialog/permissions-dialog.component.ts#L26-L104](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts#L26-L104)
+位置：`src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts#L26-L104`
 
 ```typescript
 export class PermissionsDialogComponent {
@@ -667,7 +673,7 @@ export class PermissionsDialogComponent {
 }
 ```
 
-后端 `merge` 参数的消费在 [permissions.py#L93-L163](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/permissions.py#L93-L163) 的 `set_permissions_for_object(permissions, object, *, merge=False)`：
+后端 `merge` 参数的消费位置：`src/documents/permissions.py#L93-L163` 中的 `set_permissions_for_object(permissions, object, *, merge=False)`：
 
 ```python
 def set_permissions_for_object(permissions, object, *, merge: bool = False) -> None:
@@ -684,7 +690,7 @@ def set_permissions_for_object(permissions, object, *, merge: bool = False) -> N
 
 ### 4.7 OpenAPI Schema (drf-spectacular)
 
-[schema.py#L29-L43](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/schema.py#L29-L43)
+位置：`src/documents/schema.py#L29-L43`
 
 ```python
 def generate_object_with_permissions_schema(serializer_class):
@@ -702,7 +708,7 @@ def generate_object_with_permissions_schema(serializer_class):
     }
 ```
 
-应用于 ViewSet，例如 [views.py#L523](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/views.py#L523)：
+应用于 ViewSet，例如位置：`src/documents/views.py#L523`
 
 ```python
 @extend_schema_view(**generate_object_with_permissions_schema(CorrespondentSerializer))
@@ -719,7 +725,7 @@ SavedView 与 Tag/Correspondent 的区别在于它有**三种不同的权限表�
 
 ### 5.1 后端 SavedViewSerializer 完整实现
 
-[serialisers.py#L1318-L1533](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L1318-L1533)
+位置：`src/documents/serialisers.py#L1318-L1533`
 
 **字段声明与 Meta：**
 
@@ -750,7 +756,9 @@ class SavedViewSerializer(OwnedObjectSerializer):
         ]
 ```
 
-**filter_rules 嵌套写入：** `update()` 中先删后重建 [serialisers.py#L1480-L1512](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L1480-L1512)
+**filter_rules 嵌套写入：** `update()` 中先删后重建
+
+位置：`src/documents/serialisers.py#L1480-L1512`
 
 ```python
 def update(self, instance, validated_data):
@@ -766,7 +774,9 @@ def update(self, instance, validated_data):
     return instance
 ```
 
-**display_fields 校验：** [serialisers.py#L1462-L1478](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L1462-L1478)
+**display_fields 校验：**
+
+位置：`src/documents/serialisers.py#L1462-L1478`
 
 ```python
 def validate(self, attrs):
@@ -784,7 +794,7 @@ def validate(self, attrs):
 
 **Legacy 兼容性（API v9 → v10）：** `show_on_dashboard` / `show_in_sidebar` 字段不再存在于 Model，而是迁移到 UiSettings.settings JSON 中。Serializer 在 `to_representation`（旧版本响应）和 `to_internal_value`（旧版本请求）做了桥接：
 
-[serialisers.py#L1409-L1460](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L1409-L1460)
+位置：`src/documents/serialisers.py#L1409-L1460`
 
 ```python
 def to_representation(self, instance):
@@ -805,7 +815,7 @@ def to_internal_value(self, data):
 
 ### 5.2 后端 SavedViewViewSet
 
-[views.py#L2547-L2562](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/views.py#L2547-L2562)
+位置：`src/documents/views.py#L2547-L2562`
 
 ```python
 @extend_schema_view(**generate_object_with_permissions_schema(SavedViewSerializer))
@@ -821,7 +831,7 @@ class SavedViewViewSet(BulkPermissionMixin, PassUserMixin, ModelViewSet[SavedVie
 
 ### 5.3 前端 SavedView TypeScript 接口
 
-[data/saved-view.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/data/saved-view.ts)
+位置：`src-ui/src/app/data/saved-view.ts`
 
 ```typescript
 export interface SavedView extends ObjectWithPermissions {
@@ -839,7 +849,7 @@ export interface SavedView extends ObjectWithPermissions {
 
 ### 5.4 前端 SavedViewService
 
-[services/rest/saved-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/rest/saved-view.service.ts)
+位置：`src-ui/src/app/services/rest/saved-view.service.ts`
 
 关键点：**Service 的 `list()` 本身不传 full_perms，由调用方决定**；返回时还会从 UiSettings 合并 `show_on_dashboard` / `show_in_sidebar`。
 
@@ -885,7 +895,7 @@ export class SavedViewService extends AbstractPaperlessService<SavedView> {
 
 #### 路径 A：SavedViewsComponent 管理页 —— 独立 PermissionsDialog
 
-[components/manage/saved-views/saved-views.component.ts#L81-L89](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L81-L89)
+位置：`src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L81-L89`
 
 **加载列表时显式传 full_perms=true：**
 
@@ -903,7 +913,7 @@ private reloadViews(): void {
 
 **权限编辑按钮触发 PermissionsDialog：**
 
-[components/manage/saved-views/saved-views.component.ts#L251-L280](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L251-L280)
+位置：`src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L251-L280`
 
 ```typescript
 public editPermissions(savedView: SavedView): void {
@@ -930,7 +940,7 @@ public editPermissions(savedView: SavedView): void {
 
 **权限可见性控制：**
 
-[components/manage/saved-views/saved-views.component.ts#L240-L249](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L240-L249)
+位置：`src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L240-L249`
 
 ```typescript
 public canEditSavedView(view: SavedView): boolean {
@@ -946,7 +956,7 @@ public canDeleteSavedView(view: SavedView): boolean {
 
 `initialize()` 里根据 `canEditSavedView()` 动态禁用 FormControl：
 
-[components/manage/saved-views/saved-views.component.ts#L96-L142](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L96-L142)
+位置：`src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L96-L142`
 
 ```typescript
 for (let view of this.savedViews) {
@@ -965,7 +975,7 @@ for (let view of this.savedViews) {
 
 #### 路径 B：SaveViewConfigDialogComponent —— 新建保存视图对话框
 
-[components/document-list/save-view-config-dialog/save-view-config-dialog.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.ts)
+位置：`src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.ts`
 
 **FormGroup 结构（含 permissions_form）：**
 
@@ -980,7 +990,7 @@ saveViewConfigForm = new FormGroup({
 
 模板中直接嵌入权限编辑组件，使用 `accordion=true` 折叠模式：
 
-[save-view-config-dialog.component.html#L11](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.html#L11)
+位置：`src-ui/src/app/components/document-list/save-view-config-dialog/save-view-config-dialog.component.html#L11`
 
 ```html
 <pngx-permissions-form accordion="true" formControlName="permissions_form"></pngx-permissions-form>
@@ -988,7 +998,7 @@ saveViewConfigForm = new FormGroup({
 
 **提交时的字段转换**（由 DocumentListComponent.saveViewConfigAs() 处理）：
 
-[components/document-list/document-list.component.ts#L448-L510](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts#L448-L510)
+位置：`src-ui/src/app/components/document-list/document-list.component.ts#L448-L510`
 
 ```typescript
 saveViewConfigAs() {
@@ -1017,7 +1027,7 @@ saveViewConfigAs() {
 
 #### 路径 C：DocumentListComponent.saveViewConfig() —— 覆盖保存（不含权限）
 
-[components/document-list/document-list.component.ts#L398-L428](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts#L398-L428)
+位置：`src-ui/src/app/components/document-list/document-list.component.ts#L398-L428`
 
 这是最简单的路径：用户点击"保存当前视图"按钮，只更新 filter_rules / sort_field 等字段，**完全不涉及权限**。
 
@@ -1057,7 +1067,8 @@ this.activeSavedViewCanChange = this.permissionsService.currentUserHasObjectPerm
 SavedView 目前未纳入批量编辑（`object_type` 只支持 tags/correspondents/document_types/storage_paths），但 PermissionsDialogComponent 中的 `merge` 参数正是为此设计。
 
 **后端 BulkEditObjectsSerializer：**
-[serialisers.py#L2783-L2896](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py#L2783-L2896)
+
+位置：`src/documents/serialisers.py#L2783-L2896`
 
 ```python
 class BulkEditObjectsSerializer(SerializerWithPerms, SetPermissionsMixin):
@@ -1073,7 +1084,8 @@ class BulkEditObjectsSerializer(SerializerWithPerms, SetPermissionsMixin):
 ```
 
 **后端 BulkEditObjectsView：**
-[views.py#L4543-L4639](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/views.py#L4543-L4639)
+
+位置：`src/documents/views.py#L4543-L4639`
 
 ```python
 class BulkEditObjectsView(PassUserMixin):
@@ -1092,7 +1104,8 @@ class BulkEditObjectsView(PassUserMixin):
 ```
 
 **前端 AbstractNameFilterService.bulk_edit_objects：**
-[services/rest/abstract-name-filter-service.ts#L36-L62](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/rest/abstract-name-filter-service.ts#L36-L62)
+
+位置：`src-ui/src/app/services/rest/abstract-name-filter-service.ts#L36-L62`
 
 ```typescript
 bulk_edit_objects(objects, operation, permissions = null, merge = null, all = false, filters = null) {
@@ -1193,28 +1206,29 @@ Content-Type: application/json
 
 ### 后端
 
-| 文件 | 职责 |
+| 路径（仓库根目录相对位置） | 职责 |
 |------|------|
-| [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/serialisers.py) | 所有 Serializer：字段声明、权限裁剪、权限读写、SavedView filter_rules 重建 |
-| [permissions.py](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/permissions.py) | `PaperlessObjectPermissions`、`set_permissions_for_object()`（含 merge）、权限感知 document_count |
-| [views.py](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/views.py) | `PassUserMixin`（传 user/full_perms）、`BulkPermissionMixin`（批量预取）、`SavedViewViewSet`、`BulkEditObjectsView` |
-| [schema.py](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/schema.py) | `generate_object_with_permissions_schema()` —— drf-spectacular full_perms 参数 schema |
-| [models.py](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src/documents/models.py) | Django Model 定义，Serializer 字段来源根基 |
+| `src/documents/serialisers.py` | 所有 Serializer：字段声明、权限裁剪、权限读写、SavedView filter_rules 重建、BulkEditObjectsSerializer |
+| `src/documents/permissions.py` | `PaperlessObjectPermissions`、`set_permissions_for_object()`（含 merge）、权限感知 document_count |
+| `src/documents/views.py` | `PassUserMixin`（传 user/full_perms）、`BulkPermissionMixin`（批量预取）、`SavedViewViewSet`、`BulkEditObjectsView` |
+| `src/documents/schema.py` | `generate_object_with_permissions_schema()` —— drf-spectacular full_perms 参数 schema |
+| `src/documents/models.py` | Django Model 定义，Serializer 字段来源根基 |
 
 ### 前端
 
-| 文件 | 职责 |
+| 路径（仓库根目录相对位置） | 职责 |
 |------|------|
-| [data/object-with-permissions.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/data/object-with-permissions.ts) | `PermissionsObject` / `ObjectWithPermissions` TS 接口 |
-| [data/saved-view.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/data/saved-view.ts) | `SavedView` TS 接口 |
-| [services/rest/abstract-paperless-service.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/rest/abstract-paperless-service.ts) | 通用 REST CRUD 基类 |
-| [services/rest/abstract-name-filter-service.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/rest/abstract-name-filter-service.ts) | 支持 `fullPerms` 和 `bulk_edit_objects` 的基类 |
-| [services/rest/document.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/rest/document.service.ts) | `DocumentService`：GET 默认 full_perms=true、PATCH 附 remove_inbox_tags |
-| [services/rest/saved-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/rest/saved-view.service.ts) | `SavedViewService`：列表合并 show_on_dashboard、patchMany |
-| [services/permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/services/permissions.service.ts) | `currentUserHasObjectPermissions()` —— user_can_change / permissions 矩阵判定 |
-| [components/common/edit-dialog/edit-dialog.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/common/edit-dialog/edit-dialog.component.ts) | 通用编辑对话框，permissions ↔ permissions_form 桥接 |
-| [components/common/permissions-dialog/permissions-dialog.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts) | 独立权限对话框（含 merge 开关），SavedView 管理页使用 |
-| [components/common/input/permissions/permissions-form/\*](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/common/input/permissions/permissions-form/) | 权限编辑表单 UI 组件（owner + view/change users + groups） |
-| [components/manage/saved-views/saved-views.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts) | SavedView 管理页：full_perms=true 加载列表、PermissionsDialog 改权限 |
-| [components/document-list/save-view-config-dialog/\*](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/document-list/save-view-config-dialog/) | 新建 SavedView 对话框：内嵌折叠的权限表单 |
-| [components/document-list/document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/67-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts) | saveViewConfigAs() 新建（含权限）、saveViewConfig() 覆盖保存（不含权限） |
+| `src-ui/src/app/data/object-with-permissions.ts` | `PermissionsObject` / `ObjectWithPermissions` TS 接口 |
+| `src-ui/src/app/data/document.ts` | `Document` TS 接口 |
+| `src-ui/src/app/data/saved-view.ts` | `SavedView` TS 接口 |
+| `src-ui/src/app/services/rest/abstract-paperless-service.ts` | 通用 REST CRUD 基类 |
+| `src-ui/src/app/services/rest/abstract-name-filter-service.ts` | 支持 `fullPerms` 和 `bulk_edit_objects` 的基类 |
+| `src-ui/src/app/services/rest/document.service.ts` | `DocumentService`：GET 默认 full_perms=true、PATCH 附 remove_inbox_tags |
+| `src-ui/src/app/services/rest/saved-view.service.ts` | `SavedViewService`：列表合并 show_on_dashboard、patchMany |
+| `src-ui/src/app/services/permissions.service.ts` | `currentUserHasObjectPermissions()` —— user_can_change / permissions 矩阵判定 |
+| `src-ui/src/app/components/common/edit-dialog/edit-dialog.component.ts` | 通用编辑对话框，permissions ↔ permissions_form 桥接 |
+| `src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts` | 独立权限对话框（含 merge 开关），SavedView 管理页使用 |
+| `src-ui/src/app/components/common/input/permissions/permissions-form/` | 权限编辑表单 UI 组件（owner + view/change users + groups） |
+| `src-ui/src/app/components/manage/saved-views/saved-views.component.ts` | SavedView 管理页：full_perms=true 加载列表、PermissionsDialog 改权限 |
+| `src-ui/src/app/components/document-list/save-view-config-dialog/` | 新建 SavedView 对话框：内嵌折叠的权限表单 |
+| `src-ui/src/app/components/document-list/document-list.component.ts` | saveViewConfigAs() 新建（含权限）、saveViewConfig() 覆盖保存（不含权限） |
