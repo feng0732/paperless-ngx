@@ -242,7 +242,7 @@ def pre_check_duplicate(self) -> None:
 | 是否避免重复入库 | ✅ **是** — 防止同一内容创建多条 Document 记录 |
 | 生效前提 | 之前相同内容的文件已经被**成功消费并入库**（Document 记录已写入 DB） |
 | 失效场景 | 如果之前的任务只是 PENDING/STARTED，Document 尚未写入数据库，则 SHA256 查重检测不到。此时多个重复任务会同时通过查重，并行执行解析。最终只有第一条成功写入的任务会留下 Document，其余在写入时可能因后续流程发现冲突或报错 |
-| 与 CONSUMER_DELETE_DUPLICATES 的关系 | 设为 True 时，查重不通过会主动删除源文件（从而减少后续重启再次触发的概率）；设为 False 时，仅记录警告，文件仍在 consume 目录中，重启后会再次触发重复入队 |
+| 与 CONSUMER_DELETE_DUPLICATES 的关系 | **仅当已有相同 Document 记录存在时**，设为 True 才会在查重命中时主动删除源文件（从而减少后续重启再次触发的概率）。对于 PENDING/STARTED 窗口，Document 尚未入库，SHA256 查重检测不到重复，CONSUMER_DELETE_DUPLICATES 完全不起作用。设为 False 时，仅记录警告，文件仍在 consume 目录中 |
 
 ---
 
@@ -268,7 +268,7 @@ if Path(shadow_file).is_file():
 | 是否避免重复入队 | ❌ 否（此时入队早已发生） |
 | 是否减少后续再次触发 | ✅ **是** — 文件被删除后，后续扫描/监控不会再发现它，从而减少未来重启或扫描时的重复触发 |
 | 时间窗口 | 任务被提交（PENDING）→ Worker 执行完成（SUCCESS） 之间，源文件仍然存在。此时若监控进程重启，启动扫描会重复入队 |
-| 与 CONSUMER_DELETE_DUPLICATES 的区别 | 本阶段是"成功消费后的正常清理"；CONSUMER_DELETE_DUPLICATES 是"查重发现重复时立即删除，避免后续再次触发" |
+| 与 CONSUMER_DELETE_DUPLICATES 的区别 | 本阶段是"成功消费后的正常清理"，必定执行；CONSUMER_DELETE_DUPLICATES 是"查重发现重复时立即删除"，**仅当已存在相同 Document 记录时才会执行**，PENDING/STARTED 窗口内 Document 未入库时不会触发 |
 
 ---
 
@@ -276,15 +276,15 @@ if Path(shadow_file).is_file():
 
 以下是各种场景下是否会发生重复入队的精确分析：
 
-| 场景 | 是否重复入队 | 原因 |
-|------|-------------|------|
-| watch 模式下同一文件写入过程中触发多次 added/modified 事件 | ❌ 不会 | FileStabilityTracker 以 Path 为键合并事件，稳定后 pop 移除 |
-| watch 模式下文件稳定入队后，用户再次修改该文件（源文件尚未被消费删除） | ✅ **会** | 稳定文件已从 `_tracked` 中 pop，新的 modified 事件会重新跟踪并在稳定后再次入队。SHA256 查重会在消费阶段拦截（若 CONSUMER_DELETE_DUPLICATES=True 则删除源文件） |
-| 单次启动，oneshot 模式 | ❌ 不会 | glob 扫描时逐个处理，单次遍历不重复 |
-| 消费任务还在 PENDING，监控进程重启 | ✅ **会！** | 启动扫描重新发现源文件（尚未被成功消费删除），再次调用 `_consume_file`。SHA256 查重此时还未入库，检测不到。会有多个相同任务并行执行 |
-| 消费任务已 SUCCESS，但源文件未被删除（极端异常） | ✅ **会！** | 启动扫描再次发现文件。但此时 Document 已存在，SHA256 查重能拦截（若 CONSUMER_DELETE_DUPLICATES=True 会删除文件，避免下次再重复） |
-| 消费者进程崩溃，文件停留在 consume 目录 | ✅ **会！** | 每次重启都会重新发现。SHA256 查重能否拦截取决于上次崩溃前 Document 是否已写入 DB |
-| 用户手动将同一文件复制两次到 consume 目录（不同文件名） | ✅ **会** | 两个不同路径（即使内容相同）是不同的 TrackedFile。SHA256 查重会在消费阶段拦截第二次 |
+| 场景 | 是否重复入队 | 原因及 CONSUMER_DELETE_DUPLICATES 的作用 |
+|------|-------------|------------------------------------------|
+| watch 模式下同一文件写入过程中触发多次 added/modified 事件 | ❌ 不会 | FileStabilityTracker 以 Path 为键合并事件，稳定后 pop 移除。与 CONSUMER_DELETE_DUPLICATES 无关 |
+| watch 模式下文件稳定入队后，用户再次修改该文件（源文件尚未被消费删除） | ✅ **会** | 稳定文件已从 `_tracked` 中 pop，新的 modified 事件会重新跟踪并在稳定后再次入队。**CONSUMER_DELETE_DUPLICATES 能否生效取决于第一次任务是否已成功入库**：若 Document 已写入 DB，第二次消费时 SHA256 查重命中，设为 True 会删除源文件；若第一次任务仍为 PENDING/STARTED，则查重检测不到，CONSUMER_DELETE_DUPLICATES 无效 |
+| 单次启动，oneshot 模式 | ❌ 不会 | glob 扫描时逐个处理，单次遍历不重复。与 CONSUMER_DELETE_DUPLICATES 无关 |
+| 消费任务还在 PENDING/STARTED，监控进程重启 | ✅ **会！** | 启动扫描重新发现源文件（尚未被成功消费删除），再次调用 `_consume_file`。Document 尚未入库，SHA256 查重检测不到。**CONSUMER_DELETE_DUPLICATES 在此场景完全无效**。多个相同任务会并行执行解析 |
+| 消费任务已 SUCCESS，但源文件未被删除（极端异常） | ✅ **会！** | 启动扫描再次发现文件。此时 Document 已存在，SHA256 查重能拦截重复入库。**CONSUMER_DELETE_DUPLICATES=True 会删除源文件，避免后续再次触发；设为 False 则文件仍在，每次重启都会重复入队** |
+| 消费者进程崩溃，文件停留在 consume 目录 | ✅ **会！** | 每次重启都会重新发现。**CONSUMER_DELETE_DUPLICATES 的效果取决于崩溃时机**：若崩溃前 Document 已写入 DB，则后续消费时查重命中，设为 True 会删除文件；若崩溃时 Document 尚未写入 DB，则与 PENDING 重启场景相同，CONSUMER_DELETE_DUPLICATES 无效 |
+| 用户手动将同一文件复制两次到 consume 目录（不同文件名） | ✅ **会** | 两个不同路径（即使内容相同）是不同的 TrackedFile。**第二次消费时，若第一次已成功入库，CONSUMER_DELETE_DUPLICATES=True 会删除第二个文件；若第一次仍在 PENDING，则无效** |
 
 ---
 
@@ -578,7 +578,9 @@ _watch_directory() 进入无限循环
 
 **实际作用**：即使因进程重启等原因导致同一内容被多次入队，也不会在数据库中产生重复的 Document 记录。
 
-**增强效果**：若开启 `CONSUMER_DELETE_DUPLICATES=True`，查重命中时会主动删除源文件，从而减少后续重启或扫描时的再次触发。
+**关于 CONSUMER_DELETE_DUPLICATES 的边界**：
+- ✅ 仅当已有相同 Document 记录存在于数据库时，设为 True 才会在查重命中时主动删除源文件，从而减少后续重启或扫描时的再次触发
+- ❌ 对于 PENDING/STARTED 窗口（Document 尚未入库），SHA256 查重检测不到重复，`CONSUMER_DELETE_DUPLICATES` 完全不起作用，无法删除源文件，也无法阻止后续重复入队
 
 ---
 
@@ -615,7 +617,12 @@ _watch_directory() 进入无限循环
   同进程、未重新修改            已成功入库                 PENDING 期间有窗口
 ```
 
-**最危险的重复入队窗口**：监控进程崩溃重启，且上次提交的任务仍为 PENDING（源文件未删、Document 未入库）。此时三类机制全部失效，会发生真正的重复入队和并行解析。缓解方式是开启 `CONSUMER_DELETE_DUPLICATES=True`，使第二轮任务在消费阶段至少能删除源文件，防止无限循环。
+**最危险的重复入队窗口**：监控进程崩溃重启，且上次提交的任务仍为 PENDING/STARTED（源文件未删、Document 未入库）。此时三类机制全部失效：
+1. FileStabilityTracker：进程重启后内存清空，无法去重
+2. SHA256 查重：Document 尚未入库，检测不到重复
+3. `CONSUMER_DELETE_DUPLICATES`：**在此场景完全无效**，因为它依赖于 SHA256 查重先命中
+
+最终结果是多个相同任务会并行执行解析。只有当第一轮任务率先完成并写入 Document 后，后续轮次的任务在消费阶段才能被 SHA256 查重拦截（此时 CONSUMER_DELETE_DUPLICATES=True 才能删除源文件，防止更多轮次的重复入队）。
 
 ---
 
@@ -650,8 +657,8 @@ ConsumerFilter 过滤
 │  ConsumerPreflightPlugin.pre_check_file_exists()           │
 │  ConsumerPreflightPlugin.pre_check_duplicate()             │
 │    [SHA256 查重：防重复入库 ✅，不防重复入队 ❌]             │
-│    [若 CONSUMER_DELETE_DUPLICATES=True 则删除源文件，       │
-│     减少后续再次触发]                                       │
+│    [CONSUMER_DELETE_DUPLICATES=True 时，仅当已存在相同      │
+│     Document 时才会删除源文件；PENDING/STARTED 窗口无效]    │
 └────────────────────────────────────────────────────────────┘
     ↓
 ConsumerPlugin.run() 解析、分类、存储 Document
