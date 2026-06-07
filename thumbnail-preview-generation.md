@@ -1,41 +1,54 @@
-# Paperless-ngx 缩略图（Thumbnail）与预览（Preview）生成机制详解
+# Paperless-ngx 缩略图与预览生成：代码证据与链路详解
 
-本文档从代码层面全面解读 Paperless-ngx 中缩略图与预览图的生成、缓存读取、失败处理以及状态展示的完整链路。
-
----
-
-## 一、核心文件速览
-
-| 模块 | 文件 | 作用 |
-|------|------|------|
-| 后端消费流程 | [consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py) | 文档消费核心，调用解析器生成缩略图 |
-| 后端视图层 | [views.py](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py) | 提供 `/thumb/` 和 `/preview/` API 端点 |
-| 后端缓存层 | [caching.py](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py) | 缩略图修改时间缓存 key 管理 |
-| 后端条件判断 | [conditionals.py](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/conditionals.py) | HTTP 缓存的 ETag / Last-Modified 计算 |
-| 后端模型 | [models.py](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py) | `Document.thumbnail_path` 等属性定义 |
-| 后端任务 | [tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/tasks.py) | `update_document_content_maybe_archive_file` 等异步任务中的缩略图重生成 |
-| 后端管理命令 | [document_thumbnails.py](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/management/commands/document_thumbnails.py) | `document_thumbnails` 命令：批量重建缩略图 |
-| 后端进度管理 | [helpers.py](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/plugins/helpers.py) | WebSocket 进度推送（ProgressManager） |
-| 前端服务 | [document.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/rest/document.service.ts) | `getPreviewUrl()` / `getThumbUrl()` 构造 URL |
-| 前端 WebSocket | [websocket-status.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts) | 状态消息接收与翻译 |
-| 前端预览弹窗 | [preview-popup.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.ts) | 列表页鼠标悬停预览弹窗 |
-| 前端详情页 | [document-detail.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts) | 文档详情页的预览加载 |
+> 所有代码引用标注方式：`仓库相对路径`（稳定位置标识）+ 可点击绝对链接。
+> 稳定位置优先使用函数/类名（防行号漂移），必要时补充行号范围。
 
 ---
 
-## 二、缩略图（Thumbnail）生成流程
+## 一、核心文件索引（仓库相对路径）
 
-### 2.1 文档消费时生成（主路径）
+| 层级 | 仓库相对路径 | 角色 |
+|------|-------------|------|
+| 后端消费核心 | `src/documents/consumer.py` | 调用解析器生成缩略图、失败处理、WebSocket 进度推送 |
+| 后端 API 视图 | `src/documents/views.py` | `/preview/` 与 `/thumb/` 端点、HTTP 缓存装饰器、`serve_file()` |
+| 后端缓存层 | `src/documents/caching.py` | 缩略图修改时间缓存 key、TTL 常量、缓存失效入口 |
+| 后端缓存条件 | `src/documents/conditionals.py` | HTTP 协商缓存的 ETag / Last-Modified 计算函数 |
+| 后端模型 | `src/documents/models.py` | `Document.thumbnail_path`、`PaperlessTask` 状态记录 |
+| 后端异步任务 | `src/documents/tasks.py` | `update_document_content_maybe_archive_file`（重处理时重生成缩略图） |
+| 后端批量编辑 | `src/documents/bulk_edit.py` | `reprocess()` 函数，驱动前端"Reprocess"按钮 |
+| 后端管理命令 | `src/documents/management/commands/document_thumbnails.py` | `document_thumbnails` CLI：批量重建缩略图 |
+| 后端命令基类 | `src/documents/management/commands/base.py` | `PaperlessCommand`：多进程 + 进度条基础设施 |
+| 后端进度推送 | `src/documents/plugins/helpers.py` | `ProgressManager`、`ProgressStatusOptions`、`BaseStatusManager._fail()` |
+| 前端 REST 服务 | `src-ui/src/app/services/rest/document.service.ts` | `getThumbUrl()`、`getPreviewUrl()`、`reprocessDocuments()` |
+| 前端 WebSocket 状态 | `src-ui/src/app/services/websocket-status.service.ts` | `FileStatus`、`FILE_STATUS_MESSAGES`、进度换算 |
+| 前端预览弹窗 | `src-ui/src/app/components/common/preview-popup/preview-popup.component.ts` | 列表页悬停预览 + `onError()` 处理 |
+| 前端预览弹窗模板 | `src-ui/src/app/components/common/preview-popup/preview-popup.component.html` | 错误态、密码锁、PDF Viewer 渲染 |
+| 前端文档详情 | `src-ui/src/app/components/document-detail/document-detail.component.ts` | `reprocess()`、`onError()`、`pdfPreviewLoaded()`、`tiffError`、`previewText` |
+| 前端文档详情模板 | `src-ui/src/app/components/document-detail/document-detail.component.html` | `#previewContent` 模板、TIFF 错误、密码输入、缩略图覆盖层 |
+| 前端文档卡片 | `src-ui/src/app/components/document-list/document-card-small/document-card-small.component.html` | 列表缩略图 `<img>` 渲染 |
+| 前端文档卡片 | `src-ui/src/app/components/document-list/document-card-large/document-card-large.component.html` | 列表缩略图 `<img>` 渲染 |
+| 前端任务类型 | `src-ui/src/app/data/paperless-task.ts` | `PaperlessTaskType.ReprocessDocument` 等枚举 |
 
-缩略图的生成发生在文档消费（consume）流程中，由 `ConsumerPlugin.run()` 驱动。关键代码位于 [consumer.py:L526-L536](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L526-L536)：
+---
+
+## 二、缩略图生成链路（带代码证据位置）
+
+### 2.1 主路径：消费流程中生成
+
+**调用入口** `ConsumerPlugin.run()` 方法内
+
+- 仓库相对路径：`src/documents/consumer.py`
+- 稳定位置：`ConsumerPlugin.run()` → `document_parser.get_thumbnail()` 调用点
+- 代码链接：[consumer.py#L526-L536](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L526-L536)
 
 ```python
+# ConsumerPlugin.run() 内部
 self.log.debug(f"Generating thumbnail for {self.filename}...")
 self._send_progress(
     70,
     100,
     ProgressStatusOptions.WORKING,
-    ConsumerStatusShortMessage.GENERATING_THUMBNAIL,  # "generating_thumbnail"
+    ConsumerStatusShortMessage.GENERATING_THUMBNAIL,  # 值 = "generating_thumbnail"
 )
 thumbnail = document_parser.get_thumbnail(
     self.working_copy,
@@ -43,16 +56,17 @@ thumbnail = document_parser.get_thumbnail(
 )
 ```
 
-进度说明：
-- `20/100` → 开始解析文档（`PARSING_DOCUMENT`）
-- `70/100` → 开始生成缩略图（`GENERATING_THUMBNAIL`）
-- `90/100` → 解析日期（`PARSE_DATE`）
-- `95/100` → 保存文档（`SAVE_DOCUMENT`）
-- `100/100` → 完成（`FINISHED`）
+**状态枚举定义**
 
-### 2.2 缩略图的存储路径
+- 仓库相对路径：`src/documents/consumer.py`
+- 稳定位置：`ConsumerStatusShortMessage.GENERATING_THUMBNAIL`
+- 代码链接：[consumer.py#L113-L122](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L113-L122)
 
-定义在 [models.py:L479-L484](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L479-L484)：
+### 2.2 存储路径计算
+
+- 仓库相对路径：`src/documents/models.py`
+- 稳定位置：`Document.thumbnail_path` 属性
+- 代码链接：[models.py#L479-L484](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L479-L484)
 
 ```python
 @property
@@ -62,45 +76,26 @@ def thumbnail_path(self) -> Path:
     return webp_file_path.resolve()
 ```
 
-规则：
-- 格式固定为 **WebP**
-- 文件名 = 文档 ID 的 7 位零填充，如文档 ID `123` → `0000123.webp`
-- 存储目录由 `settings.THUMBNAIL_DIR` 决定
+规则：固定 WebP 格式，7 位零填充 ID，如文档 123 → `0000123.webp`。
 
-### 2.3 缩略图写入磁盘
+### 2.3 写入磁盘
 
-在消费流程的文件写入阶段，通过 `_write()` 方法将临时生成的缩略图移动到最终位置 [consumer.py:L693-L696](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L693-L696)：
+- 仓库相对路径：`src/documents/consumer.py`
+- 稳定位置：`ConsumerPlugin._write()` 调用点，`FileLock(settings.MEDIA_LOCK)` 块内
+- 代码链接：[consumer.py#L689-L700](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L689-L700)
 
 ```python
 with FileLock(settings.MEDIA_LOCK):
     # ... 原始文件写入 ...
-    self._write(
-        thumbnail,
-        document.thumbnail_path,
-    )
+    self._write(thumbnail, document.thumbnail_path)
     # ... 归档文件写入 ...
 ```
 
-注意：使用 `FileLock(settings.MEDIA_LOCK)` 做文件级互斥锁，避免多进程并发写入冲突。
+### 2.4 重处理任务中重生成
 
-### 2.4 通过管理命令批量重建
-
-`document_thumbnails` 管理命令提供了手动重建能力，见 [document_thumbnails.py:L11-L30](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/management/commands/document_thumbnails.py#L11-L30)：
-
-```python
-def _process_document(doc_id: int) -> None:
-    document: Document = Document.objects.get(id=doc_id)
-    parser_class = get_parser_registry().get_parser_for_file(...)
-    with parser_class() as parser:
-        thumb = parser.get_thumbnail(document.source_path, document.mime_type)
-        shutil.move(thumb, document.thumbnail_path)
-```
-
-支持 `--document <id>` 指定单文档，或全量重建；支持多进程并行处理。
-
-### 2.5 异步任务中的重生成
-
-当文档内容需要重新解析时（例如 OCR 重新处理），`update_document_content_maybe_archive_file` 任务会重新生成缩略图，见 [tasks.py:L316-L376](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/tasks.py#L316-L376)：
+- 仓库相对路径：`src/documents/tasks.py`
+- 稳定位置：`update_document_content_maybe_archive_file()` 函数
+- 代码链接：[tasks.py#L316-L376](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/tasks.py#L316-L376)
 
 ```python
 thumbnail = parser.get_thumbnail(document.source_path, mime_type)
@@ -111,157 +106,15 @@ with FileLock(settings.MEDIA_LOCK):
 
 ---
 
-## 三、预览（Preview）生成机制
+## 三、缩略图生成失败后的用户可见状态（完整链路）
 
-**关键点：预览并没有单独的"生成"步骤，而是直接返回原始文件或归档 PDF 文件。**
+### 3.1 后端：`_fail()` 触发失败
 
-### 3.1 API 端点
+缩略图生成异常被 `run()` 的最外层 `try/except` 捕获，调用 `_fail()` 方法。
 
-两个端点都定义在 `DocumentViewSet` 中：
-
-**预览端点** [views.py:L1544-L1563](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1544-L1563)：
-- 路径：`/api/documents/<id>/preview/`
-- 参数：`?original=true`（强制使用原始文件）、`?version=<id>`（指定版本）
-
-```python
-def preview(self, request, pk=None):
-    # ... 权限检查、版本解析 ...
-    return serve_file(
-        doc=file_doc,
-        use_archive=not self.original_requested(request) and file_doc.has_archive_version,
-        disposition="inline",  # 浏览器内联展示
-    )
-```
-
-**缩略图端点** [views.py:L1568-L1583](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1568-L1583)：
-- 路径：`/api/documents/<id>/thumb/`
-- 返回 WebP 图片流
-
-```python
-def thumb(self, request, pk=None):
-    # ... 权限检查、版本解析 ...
-    handle = file_doc.thumbnail_file
-    return FileResponse(handle, content_type="image/webp")
-```
-
-### 3.2 serve_file() 核心逻辑
-
-[views.py:L4473-L4522](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L4473-L4522) 的 `serve_file()` 是预览的核心分发函数：
-
-```python
-def serve_file(*, doc, use_archive, disposition, follow_formatting=False):
-    if use_archive:
-        file_handle = doc.archive_file        # 归档 PDF
-        mime_type = "application/pdf"
-    else:
-        file_handle = doc.source_file         # 原始文件
-        mime_type = doc.mime_type
-        # CSV 预览特判：转为 text/plain 方便浏览器内联展示
-        if mime_type in {"application/csv", "text/csv"} and disposition == "inline":
-            mime_type = "text/plain"
-    # ... 构造带 Unicode 安全文件名的 Content-Disposition 头 ...
-    return FileResponse(file_handle, content_type=mime_type)
-```
-
-选择策略（`use_archive`）：
-1. 用户未显式传 `?original=true`
-2. 文档存在归档版本（`has_archive_version`）
-3. 满足以上两条 → 使用归档 PDF；否则使用原始文件
-
-### 3.3 前端 URL 构造
-
-[document.service.ts:L215-L237](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/rest/document.service.ts#L215-L237)：
-
-```typescript
-getPreviewUrl(id, original = false, versionID = null): string {
-  let url = new URL(this.getResourceUrl(id, 'preview'))
-  if (this._searchQuery) url.hash = `#search="${this.searchQuery}"`
-  if (original)   url.searchParams.append('original', 'true')
-  if (versionID)  url.searchParams.append('version', versionID.toString())
-  return url.toString()
-}
-
-getThumbUrl(id, versionID = null): string {
-  let url = new URL(this.getResourceUrl(id, 'thumb'))
-  if (versionID) url.searchParams.append('version', versionID.toString())
-  return url.toString()
-}
-```
-
----
-
-## 四、缓存读取机制
-
-Paperless-ngx 使用 **两层缓存**：Django 缓存（内存/Redis）+ HTTP 浏览器缓存。
-
-### 4.1 Django 缓存层
-
-**缩略图修改时间缓存**，定义在 [caching.py:L329-L346](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L329-L346)：
-
-```python
-def get_thumbnail_modified_key(document_id: int) -> str:
-    return f"doc_{document_id}_thumbnail_modified"
-```
-
-实际使用在 [conditionals.py:L120-L146](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/conditionals.py#L120-L146) 的 `thumbnail_last_modified()`：
-
-```python
-def thumbnail_last_modified(request, pk: int) -> datetime | None:
-    doc_key = get_thumbnail_modified_key(doc.id)
-    cache_hit = cache.get(doc_key)
-    if cache_hit is not None:
-        cache.touch(doc_key, CACHE_50_MINUTES)  # 命中则刷新 TTL
-        return cache_hit
-
-    # 未命中：读文件系统 mtime
-    last_modified = datetime.fromtimestamp(doc.thumbnail_path.stat().st_mtime, tz=UTC)
-    cache.set(doc_key, last_modified, CACHE_50_MINUTES)
-    return last_modified
-```
-
-TTL 常量在 [caching.py:L46-L48](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L46-L48)：
-- `CACHE_1_MINUTE = 60`
-- `CACHE_5_MINUTES = 5 * 60`
-- `CACHE_50_MINUTES = 50 * 60`
-
-**缓存失效**：文档更新时统一清理，见 [caching.py:L336-L345](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L336-L345)：
-
-```python
-def clear_document_caches(document_id: int) -> None:
-    cache.delete_many([
-        get_suggestion_cache_key(document_id),
-        get_metadata_cache_key(document_id),
-        get_thumbnail_modified_key(document_id),  # ← 缩略图时间戳缓存
-    ])
-```
-
-### 4.2 HTTP 缓存层（浏览器）
-
-通过 Django 的 `@condition` / `@last_modified` 装饰器实现 HTTP 协商缓存。
-
-| 端点 | 装饰器 | ETag 来源 | Last-Modified 来源 |
-|------|--------|-----------|-------------------|
-| `/preview/` | `@condition(etag_func=preview_etag, last_modified_func=preview_last_modified)` | 文档 checksum（original）或 archive_checksum | `doc.modified` |
-| `/thumb/` | `@last_modified(thumbnail_last_modified)` | （无） | 缩略图文件 mtime（优先从 Django 缓存读） |
-| `/metadata/` | `@condition(etag_func=metadata_etag, ...)` | `doc.checksum` | `doc.modified` |
-
-`preview_etag` 实现 [conditionals.py:L94-L106](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/conditionals.py#L94-L106)：
-
-```python
-def preview_etag(request, pk: int) -> str | None:
-    use_original = request.query_params.get("original") == "true"
-    return doc.checksum if use_original else doc.archive_checksum
-```
-
-此外所有端点都加了 `@cache_control(no_cache=True)`，表示浏览器每次都做协商验证（304），但不直接使用过期缓存。
-
----
-
-## 五、失败处理与重试
-
-### 5.1 缩略图生成失败
-
-在消费流程中，缩略图生成被包裹在 `try/except` 中，任何异常都会导致整个消费任务失败，见 [consumer.py:L555-L568](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L555-L568)：
+- 仓库相对路径：`src/documents/consumer.py`
+- 稳定位置：`ConsumerPlugin.run()` 的 `except ParseError` / `except Exception` 分支
+- 代码链接：[consumer.py#L555-L568](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L555-L568)
 
 ```python
 except ParseError as e:
@@ -270,28 +123,354 @@ except Exception as e:
     self._fail(str(e), "...", exc_info=True, exception=e)
 ```
 
-`_fail()` 方法会：
-1. 发送进度 `100/100 FAILED`，附带错误消息
-2. 记录错误日志
-3. 抛出 `ConsumerError` 终止消费流程
+### 3.2 `_fail()` 做了什么
 
-**结论：缩略图生成没有独立的重试机制，它和文档消费是同一个原子事务，失败则整个消费失败。**
+- 仓库相对路径：`src/documents/plugins/helpers.py`
+- 稳定位置：`BaseStatusManager._fail()` 方法
+- 代码链接：[helpers.py#L82-L105](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/plugins/helpers.py#L82-L105)
 
-### 5.2 前端预览加载失败
+`_fail()` 产生三个副作用：
+1. **WebSocket 推送**：`100/100 FAILED` + 错误消息 → 用户 UI 立刻可见
+2. **错误日志**：`logger.exception(...)` 写入日志文件
+3. **抛出 ConsumerError**：终止 Celery 任务，任务最终落库 `PaperlessTask.status = FAILURE`
 
-**预览弹窗组件** [preview-popup.component.ts:L109-L115](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.ts#L109-L115)：
+### 3.3 前端 WebSocket 实时接收失败态
+
+- 仓库相对路径：`src-ui/src/app/services/websocket-status.service.ts`
+- 稳定位置：`FileStatus.updateFromStatus()` → 当 `status === "FAILED"` 时的分支
+- 代码链接：[websocket-status.service.ts#L99-L107](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts#L99-L107)
+
+进度换算：
+- 仓库相对路径：`src-ui/src/app/services/websocket-status.service.ts`
+- 稳定位置：`FileStatus.getProgress()` 中 `case FileStatusPhase.FAILED: return 1.0`
+- 代码链接：[websocket-status.service.ts#L61-L78](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts#L61-L78)
+
+**用户可见表现**：上传进度条直接走到 100%，红色失败提示显示错误消息文本。
+
+### 3.4 持久化失败记录：PaperlessTask 表
+
+- 仓库相对路径：`src/documents/models.py`
+- 稳定位置：`PaperlessTask.Status.FAILURE` 枚举 + 字段
+- 代码链接：[models.py#L670-L679](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L670-L679)
+
+```python
+class Status(models.TextChoices):
+    PENDING = "pending"
+    STARTED = "started"
+    SUCCESS = "success"
+    FAILURE = "failure"
+    REVOKED = "revoked"
+```
+
+- 仓库相对路径：`src/documents/models.py`
+- 稳定位置：`PaperlessTask.result_data`、`PaperlessTask.date_done`、`PaperlessTask.duration_seconds`
+- 代码链接：[models.py#L786-L791](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L786-L791)
+
+**用户可见表现**：失败后文档**不会入库**（因为消费事务整体回滚）。用户只能在：
+- 上传 Toast 通知中看到错误摘要
+- `/api/tasks/` 任务列表（系统状态对话框）中看到历史失败记录，包含 `task_type=consume_file`、`status=failure`、错误消息
+
+### 3.5 已入库文档的缩略图缺失
+
+如果缩略图文件因磁盘损坏/迁移丢失（文档已入库），用户可见表现：
+
+**列表页卡片缩略图**：
+- 仓库相对路径：`src-ui/src/app/components/document-list/document-card-small/document-card-small.component.html`
+- 稳定位置：`<img class="card-img doc-img" [src]="getThumbUrl()">`
+- 代码链接：[document-card-small.component.html#L5](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-list/document-card-small/document-card-small.component.html#L5)
+
+- 仓库相对路径：`src-ui/src/app/components/document-list/document-card-large/document-card-large.component.html`
+- 稳定位置：`<img [src]="getThumbUrl()" class="card-img doc-img">`
+- 代码链接：[document-card-large.component.html#L5](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-list/document-card-large/document-card-large.component.html#L5)
+
+**表现**：浏览器 `<img>` 加载 `/api/documents/<id>/thumb/` 返回 404，图片位置显示为空白破图图标（浏览器默认行为）。前端未绑定 `(error)` 事件做额外兜底。
+
+**详情页缩略图覆盖层**：
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.html`
+- 稳定位置：`<img [src]="thumbUrl" ... alt="Document loading...">`
+- 代码链接：[document-detail.component.html#L458-L467](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L458-L467)
+
+**表现**：同样是浏览器默认破图标，覆盖层在 `previewLoaded` 为 true 前持续显示。
+
+---
+
+## 四、缩略图重建入口（两条路径）
+
+### 4.1 路径一：CLI 管理命令 `document_thumbnails`
+
+**命令实现**
+- 仓库相对路径：`src/documents/management/commands/document_thumbnails.py`
+- 稳定位置：`Command` 类、`_process_document()` 函数
+- 代码链接：[document_thumbnails.py#L1-L70](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/management/commands/document_thumbnails.py#L1-L70)
+
+```python
+def _process_document(doc_id: int) -> None:
+    document: Document = Document.objects.get(id=doc_id)
+    parser_class = get_parser_registry().get_parser_for_file(
+        document.mime_type, document.original_filename or "", document.source_path,
+    )
+    if parser_class is None:
+        logger.warning("%s: No parser for mime type %s", document, document.mime_type)
+        return
+    with parser_class() as parser:
+        thumb = parser.get_thumbnail(document.source_path, document.mime_type)
+        shutil.move(thumb, document.thumbnail_path)
+
+class Command(PaperlessCommand):
+    supports_progress_bar = True
+    supports_multiprocessing = True
+
+    def add_arguments(self, parser) -> None:
+        super().add_arguments(parser)
+        parser.add_argument("-d", "--document", type=int, default=None, ...)
+
+    def handle(self, *args, **options):
+        if options["document"]:
+            documents = Document.objects.filter(pk=options["document"])
+        else:
+            documents = Document.objects.all()
+        ids = list(documents.values_list("id", flat=True))
+        for result in self.process_parallel(
+            _process_document, ids, description="Regenerating thumbnails...",
+        ):
+            if result.error:
+                self.console.print(f"[red]Failed document {result.item}: {result.error}[/red]")
+```
+
+**使用方式**
+```bash
+# 全部重建
+python manage.py document_thumbnails
+
+# 指定单文档
+python manage.py document_thumbnails --document 42
+
+# 多进程（默认 = cpu_count//4）
+python manage.py document_thumbnails --processes 4
+
+# 关闭进度条
+python manage.py document_thumbnails --no-progress-bar
+```
+
+**命令基类提供的能力**
+- 仓库相对路径：`src/documents/management/commands/base.py`
+- 稳定位置：`PaperlessCommand.process_parallel()`、`PaperlessCommand.track()`
+- 代码链接：[base.py#L464-L550](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/management/commands/base.py#L464-L550)
+
+`process_parallel()` 行为：
+- `--processes 1` 时主进程顺序执行（方便测试和调试）
+- `--processes > 1` 时 fork 子进程，fork 前调用 `db.connections.close_all()`（PostgreSQL 兼容性要求）
+- 每个文档的结果包装为 `ProcessResult(item, result, error)`，失败不中断整体流程
+
+### 4.2 路径二：Web UI "Reprocess" 按钮
+
+**前端入口（详情页）**
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
+- 稳定位置：`DocumentDetailComponent.reprocess()` 方法
+- 代码链接：[document-detail.component.ts#L1373-L1406](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L1373-L1406)
 
 ```typescript
-onError(event: any) {
+reprocess() {
+  let modal = this.modalService.open(ConfirmDialogComponent, { backdrop: 'static' })
+  modal.componentInstance.title = $localize`Reprocess confirm`
+  modal.componentInstance.messageBold = $localize`This operation will permanently recreate the archive file for this document.`
+  modal.componentInstance.message = $localize`The archive file will be re-generated with the current settings.`
+  modal.componentInstance.btnClass = 'btn-danger'
+  modal.componentInstance.btnCaption = $localize`Proceed`
+  modal.componentInstance.confirmClicked.subscribe(() => {
+    this.documentsService.reprocessDocuments({ documents: [this.document.id] })
+      .subscribe({ next: () => { toast.info("...will begin in the background."); modal.close() },
+                   error: (err) => { toast.showError("Error executing operation", err) } })
+  })
+}
+```
+
+**前端入口（列表页批量）**
+- 仓库相对路径：`src-ui/src/app/components/document-list/bulk-editor/bulk-editor.component.ts`
+- 稳定位置：`BulkEditorComponent.reprocessSelected()` 方法
+- 代码链接：[bulk-editor.component.ts#L891-L906](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-list/bulk-editor/bulk-editor.component.ts#L891-L906)
+
+**HTTP 请求**
+- 仓库相对路径：`src-ui/src/app/services/rest/document.service.ts`
+- 稳定位置：`DocumentService.reprocessDocuments()`
+- 代码链接：[document.service.ts#L352-L356](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/rest/document.service.ts#L352-L356)
+
+```typescript
+reprocessDocuments(selection: DocumentSelectionQuery) {
+  return this.http.post(this.getResourceUrl(null, 'reprocess'), { ...selection })
+}
+```
+
+请求路径：`POST /api/documents/reprocess/`
+
+**后端 API 路由**
+- 仓库相对路径：`src/documents/views.py`
+- 稳定位置：`DocumentViewSet` 中 `reprocess` action 注册
+- 代码链接：[views.py#L3002-L3023](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L3002-L3023)
+
+**后端执行**
+- 仓库相对路径：`src/documents/bulk_edit.py`
+- 稳定位置：`reprocess()` 函数
+- 代码链接：[bulk_edit.py#L395-L402](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/bulk_edit.py#L395-L402)
+
+```python
+def reprocess(doc_ids: list[int]) -> Literal["OK"]:
+    for document_id in doc_ids:
+        update_document_content_maybe_archive_file.apply_async(
+            kwargs={"document_id": document_id},
+            headers={"trigger_source": PaperlessTask.TriggerSource.MANUAL},
+        )
+    return "OK"
+```
+
+**任务类型**
+- 仓库相对路径：`src/documents/models.py`
+- 稳定位置：`PaperlessTask.TaskType.REPROCESS_DOCUMENT = "reprocess_document"`
+- 代码链接：[models.py#L691](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L691)
+
+- 仓库相对路径：`src-ui/src/app/data/paperless-task.ts`
+- 稳定位置：`PaperlessTaskType.ReprocessDocument = 'reprocess_document'`
+- 代码链接：[paperless-task.ts#L12](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/data/paperless-task.ts#L12)
+
+**用户可见表现**：点击 Reprocess → 弹出确认框 → 确认后 Toast 提示 "will begin in the background" → 任务列表中出现 `task_type=reprocess_document` 的新任务 → 执行过程中缩略图会被重新生成。
+
+---
+
+## 五、预览加载失败的前端展示（四种场景）
+
+### 5.1 场景一：PDF 需要密码
+
+**详情页处理逻辑**
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
+- 稳定位置：`DocumentDetailComponent.onError()` 方法
+- 代码链接：[document-detail.component.ts#L1502-L1507](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L1502-L1507)
+
+```typescript
+onError(event) {
   if (event.name == 'PasswordException') {
-    this.requiresPassword = true   // PDF 需要密码的特殊标记
-  } else {
-    this.error = true              // 通用错误标记
+    this.requiresPassword = true
+    this.previewLoaded = true
   }
 }
 ```
 
-**文档详情页** [document-detail.component.ts:L509-L514](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L509-L514)：
+**详情页模板渲染**
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.html`
+- 稳定位置：`@if (requiresPassword)` 块 + `<div class="password-prompt">`
+- 代码链接：[document-detail.component.html#L509-L515](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L509-L515)
+
+```html
+@if (requiresPassword) {
+  <div class="password-prompt">
+    <form>
+      <input autocomplete="" autofocus="true" class="form-control"
+             placeholder="Enter Password" type="password" (keyup)="onPasswordKeyUp($event)" />
+    </form>
+  </div>
+}
+```
+
+**预览弹窗处理逻辑**
+- 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.ts`
+- 稳定位置：`PreviewPopupComponent.onError()` 方法
+- 代码链接：[preview-popup.component.ts#L109-L115](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.ts#L109-L115)
+
+**预览弹窗模板**
+- 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.html`
+- 稳定位置：`@if (requiresPassword)` → `file-earmark-lock` 图标
+- 代码链接：[preview-popup.component.html#L20-L24](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.html#L20-L24)
+
+```html
+@if (requiresPassword) {
+  <div class="w-100 h-100 position-relative">
+    <i-bs width="2em" height="2em" class="position-absolute top-50 start-50 translate-middle" name="file-earmark-lock"></i-bs>
+  </div>
+}
+```
+
+**用户可见表现**：详情页显示密码输入框；列表悬停弹窗显示居中的锁图标。
+
+### 5.2 场景二：PDF Viewer 通用加载错误（非密码）
+
+**预览弹窗处理逻辑**
+- 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.ts`
+- 稳定位置：`PreviewPopupComponent.onError()` 的 else 分支 → `this.error = true`
+- 代码链接：[preview-popup.component.ts#L109-L115](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.ts#L109-L115)
+
+```typescript
+onError(event: any) {
+  if (event.name == 'PasswordException') {
+    this.requiresPassword = true
+  } else {
+    this.error = true
+  }
+}
+```
+
+**预览弹窗模板渲染**
+- 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.html`
+- 稳定位置：`@if (error)` → "Error loading preview" 斜体文本
+- 代码链接：[preview-popup.component.html#L8-L11](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.html#L8-L11)
+
+```html
+@if (error) {
+  <div class="w-100 h-100 position-relative">
+    <p class="fst-italic position-absolute top-50 start-50 translate-middle">Error loading preview</p>
+  </div>
+}
+```
+
+**用户可见表现**：悬停弹窗中央显示斜体灰色文字 "Error loading preview"。
+
+### 5.3 场景三：TIFF 渲染失败
+
+**详情页 TIFF 渲染逻辑**
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
+- 稳定位置：`DocumentDetailComponent.tryRenderTiff()` 方法中的两个错误处理分支
+- 代码链接：[document-detail.component.ts#L1940-L1984](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L1940-L1984)
+
+```typescript
+// HTTP 请求失败分支
+error: (err) => {
+  this.tiffError = $localize`An error occurred loading tiff: ${err.toString()}`
+}
+
+// UTIF.js 解码异常分支
+catch (err) {
+  this.tiffError = $localize`An error occurred loading tiff: ${err.toString()}`
+}
+```
+
+**详情页模板渲染**
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.html`
+- 稳定位置：`@case (ContentRenderType.TIFF)` 中的 `@if (!tiffError) / @else`
+- 代码链接：[document-detail.component.html#L496-L503](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L496-L503)
+
+```html
+@case (ContentRenderType.TIFF) {
+  @if (!tiffError) {
+    <div class="preview-sticky">
+      <img [src]="tiffURL" width="100%" height="100%" alt="{{title}}" />
+    </div>
+  } @else {
+    <div class="preview-sticky bg-light p-3 overflow-auto whitespace-preserve" width="100%">{{tiffError}}</div>
+  }
+}
+```
+
+**元数据加载时重置**
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
+- 稳定位置：`loadMetadataForSelectedVersion()` 中 `this.tiffError = null`
+- 代码链接：[document-detail.component.ts#L384-L416](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L384-L416)
+
+**用户可见表现**：预览区域显示浅灰背景、带滚动条的错误文本，包含具体异常信息（如 "An error occurred loading tiff: TypeError: ..."）。
+
+### 5.4 场景四：文本类文档内容获取失败
+
+**详情页预览文本加载逻辑**
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
+- 稳定位置：加载 `content` 字段时的 `.subscribe({ error: ... })` 回调
+- 代码链接：[document-detail.component.ts#L509-L514](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L509-L514)
 
 ```typescript
 .subscribe({
@@ -301,186 +480,229 @@ onError(event: any) {
 })
 ```
 
-文本类文档预览失败时直接在页面显示错误信息，不中断用户操作。
+**详情页模板渲染**
+- 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.html`
+- 稳定位置：`@case (ContentRenderType.Text)` → `<div>{{previewText}}</div>`
+- 代码链接：[document-detail.component.html#L488-L489](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L488-L489)
 
-### 5.3 后端 API 端点异常
-
-两个端点都捕获 `FileNotFoundError` 并转为 `Http404`：
-- `/thumb/` → 缩略图文件不存在
-- `/preview/` → 原始文件或归档文件不存在
-
-### 5.4 手动修复：重建缩略图
-
-由于消费失败时文档并未入库，用户能看到的"缩略图缺失"通常是文件系统损坏或迁移导致。此时使用管理命令修复：
-
-```bash
-document_thumbnails                # 重建所有
-document_thumbnails --document 42  # 只重建 ID=42
+```html
+@case (ContentRenderType.Text) {
+  <div class="preview-sticky bg-light p-3 overflow-auto whitespace-preserve" width="100%">{{previewText}}</div>
+}
 ```
 
-这是事实上的"重试"方式。
+**预览弹窗模板渲染**
+- 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.html`
+- 稳定位置：`@if (previewText)` → 同样式文本容器
+- 代码链接：[preview-popup.component.html#L14-L15](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.html#L14-L15)
+
+**用户可见表现**：预览区域直接显示 "An error occurred loading content: ..." 错误信息，不打断其他操作。
 
 ---
 
-## 六、状态展示链路（WebSocket 实时进度）
+## 六、缓存读取机制（双层）
 
-整个状态推送是 **后端 ProgressManager → Django Channels (WebSocket) → 前端 WebsocketStatusService** 的三层架构。
+### 6.1 Django 应用缓存层：缩略图修改时间
 
-### 6.1 后端：ProgressManager 发送消息
-
-[helpers.py:L119-L150](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/plugins/helpers.py#L119-L150)：
-
-```python
-class ProgressManager(BaseStatusManager):
-    def send_progress(self, status, message, current_progress, max_progress, *, document_id=None, ...):
-        data: ProgressUpdateData = {
-            "filename": self.filename,
-            "task_id": self.task_id,
-            "current_progress": current_progress,   # e.g. 70
-            "max_progress": max_progress,           # e.g. 100
-            "status": status,                       # "WORKING"
-            "message": message,                     # "generating_thumbnail"
-            "document_id": document_id,
-            # ... 权限字段 ...
-        }
-        payload = {"type": "status_update", "data": data}
-        self.send(payload)   # 通过 channel layer 发到 "status_updates" group
-```
-
-状态值枚举 [helpers.py:L15-L19](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/plugins/helpers.py#L15-L19)：
-- `STARTED` / `WORKING` / `SUCCESS` / `FAILED`
-
-### 6.2 消费流程中的状态节点
-
-[consumer.py:L117](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L117) 定义了生成缩略图时的短消息：
+**缓存 Key 构造**
+- 仓库相对路径：`src/documents/caching.py`
+- 稳定位置：`get_thumbnail_modified_key()` 函数
+- 代码链接：[caching.py#L329-L331](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L329-L331)
 
 ```python
-class ConsumerStatusShortMessage(StrEnum):
-    GENERATING_THUMBNAIL = "generating_thumbnail"
-    # ... 其他状态 ...
+def get_thumbnail_modified_key(document_id: int) -> str:
+    return f"doc_{document_id}_thumbnail_modified"
 ```
 
-完整状态流转：
+**TTL 常量**
+- 仓库相对路径：`src/documents/caching.py`
+- 稳定位置：`CACHE_50_MINUTES = 50 * 60`
+- 代码链接：[caching.py#L46-L48](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L46-L48)
 
-| 阶段 | current/max | status | message |
-|------|------------|--------|---------|
-| 开始解析 | 20/100 | WORKING | `parsing_document` |
-| 生成缩略图 | 70/100 | WORKING | `generating_thumbnail` |
-| 解析日期 | 90/100 | WORKING | `parse_date` |
-| 保存文档 | 95/100 | WORKING | `save_document` |
-| 成功 | 100/100 | SUCCESS | `finished` |
-| 失败 | 100/100 | FAILED | 具体错误信息 |
+**读缓存逻辑**
+- 仓库相对路径：`src/documents/conditionals.py`
+- 稳定位置：`thumbnail_last_modified()` 函数
+- 代码链接：[conditionals.py#L120-L146](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/conditionals.py#L120-L146)
 
-### 6.3 前端：状态接收与翻译
+```python
+def thumbnail_last_modified(request, pk: int) -> datetime | None:
+    doc_key = get_thumbnail_modified_key(doc.id)
+    cache_hit = cache.get(doc_key)
+    if cache_hit is not None:
+        cache.touch(doc_key, CACHE_50_MINUTES)  # 命中刷新 TTL
+        return cache_hit
+    # 未命中 → 读文件 mtime → 回填缓存
+    last_modified = datetime.fromtimestamp(doc.thumbnail_path.stat().st_mtime, tz=UTC)
+    cache.set(doc_key, last_modified, CACHE_50_MINUTES)
+    return last_modified
+```
 
-[websocket-status.service.ts:L25-L42](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts#L25-L42) 维护了消息字典：
+**缓存失效**
+- 仓库相对路径：`src/documents/caching.py`
+- 稳定位置：`clear_document_caches()` 函数
+- 代码链接：[caching.py#L336-L345](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L336-L345)
+
+```python
+def clear_document_caches(document_id: int) -> None:
+    cache.delete_many([
+        get_suggestion_cache_key(document_id),
+        get_metadata_cache_key(document_id),
+        get_thumbnail_modified_key(document_id),
+    ])
+```
+
+### 6.2 HTTP 浏览器缓存层：协商缓存
+
+**装饰器挂载**
+- 仓库相对路径：`src/documents/views.py`
+- 稳定位置：`DocumentViewSet.thumb()` 的 `@last_modified` 装饰器
+- 代码链接：[views.py#L1565-L1583](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1565-L1583)
+
+- 仓库相对路径：`src/documents/views.py`
+- 稳定位置：`DocumentViewSet.preview()` 的 `@condition(etag_func=..., last_modified_func=...)` 装饰器
+- 代码链接：[views.py#L1538-L1563](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1538-L1563)
+
+**preview ETag 计算**
+- 仓库相对路径：`src/documents/conditionals.py`
+- 稳定位置：`preview_etag()` 函数
+- 代码链接：[conditionals.py#L94-L106](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/conditionals.py#L94-L106)
+
+```python
+def preview_etag(request, pk: int) -> str | None:
+    use_original = request.query_params.get("original") == "true"
+    return doc.checksum if use_original else doc.archive_checksum
+```
+
+所有端点同时有 `@cache_control(no_cache=True)`，表示浏览器每次协商验证（304 Not Modified）而不直接使用过期缓存。
+
+---
+
+## 七、预览生成链路（serve_file 分发）
+
+预览没有独立的"生成"过程，直接返回原始文件或归档文件。
+
+### 7.1 API 端点
+
+**预览端点**
+- 仓库相对路径：`src/documents/views.py`
+- 稳定位置：`DocumentViewSet.preview()` 方法
+- 代码链接：[views.py#L1544-L1563](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1544-L1563)
+
+路由：`GET /api/documents/<id>/preview/?original=true&version=<id>`
+
+**缩略图端点**
+- 仓库相对路径：`src/documents/views.py`
+- 稳定位置：`DocumentViewSet.thumb()` 方法
+- 代码链接：[views.py#L1568-L1583](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1568-L1583)
+
+路由：`GET /api/documents/<id>/thumb/?version=<id>`
+
+### 7.2 serve_file() 分发逻辑
+
+- 仓库相对路径：`src/documents/views.py`
+- 稳定位置：`serve_file()` 函数
+- 代码链接：[views.py#L4473-L4522](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L4473-L4522)
+
+```python
+def serve_file(*, doc, use_archive, disposition, follow_formatting=False):
+    if use_archive:
+        file_handle = doc.archive_file
+        mime_type = "application/pdf"
+    else:
+        file_handle = doc.source_file
+        mime_type = doc.mime_type
+        if mime_type in {"application/csv", "text/csv"} and disposition == "inline":
+            mime_type = "text/plain"   # CSV 转纯文本，便于浏览器内联显示
+    # ... 构造 Content-Disposition 头（Unicode 安全文件名） ...
+    return FileResponse(file_handle, content_type=mime_type)
+```
+
+`use_archive` 决策：用户未传 `?original=true` **且**文档有归档版本 → True（返回 PDF），否则 False（返回原始文件）。
+
+### 7.3 前端 URL 构造
+
+- 仓库相对路径：`src-ui/src/app/services/rest/document.service.ts`
+- 稳定位置：`DocumentService.getThumbUrl()` / `getPreviewUrl()`
+- 代码链接：[document.service.ts#L215-L237](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/rest/document.service.ts#L215-L237)
+
+---
+
+## 八、状态展示链路（WebSocket 实时进度）
+
+### 8.1 后端推送
+
+- 仓库相对路径：`src/documents/plugins/helpers.py`
+- 稳定位置：`ProgressManager.send_progress()` 方法
+- 代码链接：[helpers.py#L119-L150](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/plugins/helpers.py#L119-L150)
+
+推送数据结构包含：`filename`、`task_id`、`current_progress`、`max_progress`、`status`（STARTED/WORKING/SUCCESS/FAILED）、`message`（如 `"generating_thumbnail"`）、`document_id`。
+
+### 8.2 前端接收与翻译
+
+- 仓库相对路径：`src-ui/src/app/services/websocket-status.service.ts`
+- 稳定位置：`FILE_STATUS_MESSAGES` 常量
+- 代码链接：[websocket-status.service.ts#L25-L42](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts#L25-L42)
 
 ```typescript
 export const FILE_STATUS_MESSAGES = {
-  parsing_document:    $localize`Processing document...`,
+  parsing_document:     $localize`Processing document...`,
   generating_thumbnail: $localize`Generating thumbnail...`,
-  parse_date:          $localize`Retrieving date from document...`,
-  save_document:       $localize`Saving document...`,
-  finished:            $localize`Finished.`,
+  parse_date:           $localize`Retrieving date from document...`,
+  save_document:        $localize`Saving document...`,
+  finished:             $localize`Finished.`,
   // ...
 }
 ```
 
-前端进度换算 [websocket-status.service.ts:L61-L74](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts#L61-L74)：
-
-```typescript
-getProgress(): number {
-  switch (this.phase) {
-    case FileStatusPhase.STARTED:   return 0.0
-    case FileStatusPhase.UPLOADING: return (current / max) * 0.2          // 上传占 20%
-    case FileStatusPhase.WORKING:   return (current / max) * 0.8 + 0.2    // 服务端处理占 80%
-    case FileStatusPhase.SUCCESS:
-    case FileStatusPhase.FAILED:    return 1.0
-  }
-}
-```
-
-因此当后端发送 `generating_thumbnail`（70/100 WORKING）时，前端显示的总进度是：
-`0.2 + (70/100) * 0.8 = 0.76` → **76%**
-
-### 6.4 PaperlessTask 数据库记录
-
-除了实时 WebSocket 推送，每个消费任务还会持久化到 `PaperlessTask` 表中，定义在 [models.py:L664-L741](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L664-L741)：
-
-```python
-class PaperlessTask(ModelWithOwner):
-    class Status(models.TextChoices):
-        PENDING = "pending"
-        STARTED = "started"
-        SUCCESS = "success"
-        FAILURE = "failure"
-        REVOKED = "revoked"
-
-    task_id        # Celery task ID
-    task_type      # "consume_file" 等
-    trigger_source # web_ui / api_upload / folder_consume / email_consume / system / manual
-    status         # 当前状态
-    # ... 时间戳、错误信息快照 ...
-```
-
-用户可以通过 `/api/tasks/` 接口查询历史任务（包括缩略图生成阶段的失败）。
+进度换算：上传阶段占 20%，后端处理阶段占 80%。`generating_thumbnail`（70/100 WORKING）→ `0.2 + 0.7 * 0.8 = 76%`。
 
 ---
 
-## 七、整体架构时序图
+## 九、缩略图/预览链路总览
 
 ```
-用户上传文档
-    │
-    ▼
-┌──────────────────────────────────────────────────────────┐
-│                    后端 consume_file 任务                 │
-│                                                          │
-│  1. PARSING_DOCUMENT (进度 20/100)                       │
-│     └─ parser.parse() 提取文本/OCR                        │
-│                                                          │
-│  2. GENERATING_THUMBNAIL (进度 70/100)  ◄───────┐        │
-│     └─ parser.get_thumbnail() → WebP 临时文件   │        │
-│         WebSocket 推送 "generating_thumbnail" ──┘        │
-│                                                          │
-│  3. PARSE_DATE (进度 90/100)                             │
-│  4. SAVE_DOCUMENT (进度 95/100)                          │
-│     └─ transaction + FileLock 写入:                      │
-│        • 原始文件 → source_path                          │
-│        • 缩略图   → thumbnail_path (0000123.webp)        │
-│        • 归档 PDF → archive_path (可选)                  │
-│                                                          │
-│  5. FINISHED (进度 100/100)  SUCCESS                     │
-│     或 FAILED (整个事务回滚)                              │
-└──────────────────────────────────────────────────────────┘
-    │
-    ▼
-用户访问 /api/documents/<id>/thumb/
-    │
-    ├─ @last_modified(thumbnail_last_modified)
-    │     └─ Django cache → doc_{id}_thumbnail_modified
-    │        (命中: 刷新 TTL 50min; 未命中: 读 st_mtime 回填)
-    │
-    └─ FileResponse(doc.thumbnail_file, "image/webp")
+文档入库阶段（一次性）
+│
+├─ consume_file (Celery Task)
+│   ├─ 20%  parser.parse() → 文本/OCR
+│   ├─ 70%  parser.get_thumbnail() → 临时 WebP  [generating_thumbnail]
+│   ├─ 90%  日期匹配
+│   └─ 95%  FileLock → 写入 source_path / thumbnail_path / archive_path
+│
+└─ 失败 → _fail() → WebSocket FAILED + PaperlessTask(status=FAILURE)
 
 
-用户访问 /api/documents/<id>/preview/
-    │
-    ├─ @condition(etag_func=preview_etag, ...)
-    │     └─ ETag = archive_checksum or checksum
-    │
-    └─ serve_file(use_archive=has_archive_version && !?original=true)
-           ├─ True  → doc.archive_file   (application/pdf)
-           └─ False → doc.source_file    (原始 mime_type)
+用户访问阶段（反复发生）
+│
+├─ GET /api/documents/<id>/thumb/
+│   └─ @last_modified(thumbnail_last_modified)
+│        ├─ Django cache: doc_{id}_thumbnail_modified (TTL 50min, 命中刷新)
+│        └─ FileResponse(thumbnail_file, "image/webp")
+│
+├─ GET /api/documents/<id>/preview/
+│   └─ @condition(etag=archive_checksum|checksum)
+│        └─ serve_file(use_archive=has_archive && !?original)
+│             ├─ True  → archive_file  (application/pdf)
+│             └─ False → source_file   (原始 MIME，CSV→text/plain)
+│
+└─ 前端
+    ├─ 列表卡片 <img [src]="getThumbUrl()">  → 失败=浏览器默认破图
+    ├─ 悬停弹窗 pngx-preview-popup            → 失败=Error loading preview / 锁图标
+    └─ 详情页 #previewContent
+         ├─ PDF  → PasswordException → 密码输入框
+         ├─ TIFF → tiffError → 浅灰底错误文本
+         ├─ Text → previewText → 浅灰底错误文本
+         └─ Img  → <img src> → 浏览器默认破图
+
+
+事后修复（手动触发）
+│
+├─ CLI:  document_thumbnails [--document N] [--processes N] [--no-progress-bar]
+│   └─ PaperlessCommand.process_parallel() → _process_document()
+│        └─ parser.get_thumbnail() → shutil.move()
+│
+└─ Web:  Reprocess 按钮
+    └─ POST /api/documents/reprocess/ → bulk_edit.reprocess()
+         └─ update_document_content_maybe_archive_file.apply_async()
+              └─ 同 consume_file 的缩略图生成逻辑
 ```
-
----
-
-## 八、设计要点总结
-
-1. **缩略图格式统一为 WebP**：文件名仅由文档 ID 决定，便于反向查找。
-2. **预览 = 文件直出**：没有额外的渲染服务，依赖浏览器对 PDF/图片/文本的原生支持，架构简洁。
-3. **HTTP 协商缓存 + Django 应用缓存双层设计**：既降低浏览器重复请求，又避免频繁读取文件系统 mtime。
-4. **缩略图生成与消费事务绑定**：失败则整体失败，通过 `document_thumbnails` 命令做事后补偿。
-5. **WebSocket + 数据库双通道状态**：实时进度走 Channels，持久化查询走 `PaperlessTask` 表。
-6. **文件写入用 FileLock 保护**：`settings.MEDIA_LOCK` 防止多 worker 并发写同一文件。
