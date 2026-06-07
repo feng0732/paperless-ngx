@@ -394,7 +394,267 @@ if not request.user.has_perm("auditlog.view_logentry") or (
 
 ---
 
-## 六、完整调用链总览
+## 六、tags 与 custom_fields 历史记录的三条分流路径
+
+tags 和 custom_fields 由于涉及多对多关联和独立实例模型，其历史记录来源不止一条，数据形态差异显著。本节对照代码逐一拆解。
+
+### 6.1 总览：三条分流的触发场景
+
+| 分流路径 | 触发场景 | 记录对象 | LogEntry.content_type |
+|------|------|------|------|
+| **A. django-auditlog 自动 M2M 审计** | 普通 API 保存（触发 `m2m_changed` signal） | Document | documents.Document |
+| **B. 批量编辑手动日志** | `POST /api/documents/bulk_edit/`（modify_tags / modify_custom_fields） | Document | documents.Document |
+| **C. 字段实例自动审计** | 任意修改 CustomFieldInstance 的操作 | CustomFieldInstance | documents.CustomFieldInstance |
+
+history API 会从 **A + B** 中查询 Document 的 LogEntry，再单独从 **C** 中查询该文档所有 CustomFieldInstance 的 LogEntry，最后按 timestamp 合并排序返回。
+
+### 6.2 分流 A：django-auditlog 自动 M2M 审计（仅 tags）
+
+#### 6.2.1 触发机制
+
+在 [models.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/models.py#L1229-L1240) 中注册：
+
+```python
+auditlog.register(Document, m2m_fields={"tags"}, exclude_fields=["content_length", "modified"])
+```
+
+django-auditlog 通过 `m2m_changed` signal 监听，内部调用 `LogEntryManager.log_m2m_changes()` 方法。
+
+#### 6.2.2 changes 数据形态
+
+根据 django-auditlog 3.4.1 源码（`auditlog.models.LogEntryManager.log_m2m_changes`）：
+
+```python
+objects = [smart_str(instance) for instance in changed_queryset]
+kwargs["changes"] = {
+    field_name: {
+        "type": "m2m",
+        "operation": operation,   # "add" 或 "delete"
+        "objects": objects,       # Tag.__str__() 的结果列表
+    }
+}
+```
+
+实际示例：
+
+```python
+{
+    "tags": {
+        "type": "m2m",
+        "operation": "add",
+        "objects": ["Invoice", "Important"]   # Tag 的 name，不是 ID
+    }
+}
+```
+
+#### 6.2.3 ID 含义
+
+- `objects` 中的每一项是 `Tag.__str__()` 的结果。Tag 继承自 [MatchingModel](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/models.py#L46-L93)，其 `__str__` 返回 `self.name`。
+- **注意**：`objects` 存储的是 tag 名称字符串，**不是 tag 的 ID**。这意味着如果 tag 后续被重命名，历史记录中显示的仍是变更当时的名称。
+
+#### 6.2.4 前端显示结果
+
+走 `change.value["type"] === 'm2m'` 分支，在 [document-history.component.html](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src-ui/src/app/components/document-detail/document-history/document-history.component.html#L32-L37) 中渲染：
+
+```html
+<li>
+    <span class="fst-italic">{{ change.value["operation"] | titlecase }}</span>&nbsp;
+    <span>{{ change.key | titlecase }}</span>:&nbsp;
+    <code class="text-primary">{{ change.value["objects"].join(', ') }}</code>
+</li>
+```
+
+显示效果：`Add Tags: Invoice, Important` 或 `Delete Tags: Old`
+
+---
+
+### 6.3 分流 B：批量编辑手动日志（tags 和 custom_fields）
+
+#### 6.3.1 触发机制
+
+在 [BulkEditView.post()](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/views.py#L2864-L2909) 中，批量编辑不调用 `document.save()`，而是直接执行 SQL UPDATE 或 M2M Manager 操作（绕过 django-auditlog 的 signal），因此手动构造 LogEntry。
+
+#### 6.3.2 changes 数据形态
+
+```python
+changes={modified_field: [old_value, new_value]}
+```
+
+##### tags 的实际 changes 示例：
+
+```python
+{
+    "tags": [9, [3, 7, 9, 11]]
+    #        ↑    └───────────┘
+    #   old_value         new_value
+    #   (单个 int)     (int 列表)
+}
+```
+
+##### custom_fields 的实际 changes 示例：
+
+```python
+{
+    "custom_fields": [12, [12, 15, 18]]
+    #                  ↑    └────────┘
+    #             old_value      new_value
+    #             (单个 int)   (int 列表)
+}
+```
+
+#### 6.3.3 ID 含义
+
+- **old_value**：来自 `.values()` + 字典推导式覆盖后的结果，是**最后一个**关联对象的 pk（Tag pk 或 CustomFieldInstance pk），**并非完整列表**。详见 4.2.1 节关于 Django `.values()` 对 M2M/反向关联的展开行为分析。
+- **new_value**：来自 `Manager.values_list("pk", flat=True)`，是完整的 pk 列表。
+- 两者**均为数据库主键 ID**，不是名称。
+
+#### 6.3.4 前端显示结果
+
+由于 `change.value` 是一个二元数组（不是带 `"type": "m2m"` 的对象），走**普通字段分支**：
+
+```html
+<code class="text-primary">{{ getPrettyName(change.key, change.value[1]) | async }}</code>
+```
+
+即调用 `getPrettyName("tags", "[3, 7, 9, 11]")` 或 `getPrettyName("custom_fields", "[12, 15, 18]")`。
+
+在 [getPrettyName()](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src-ui/src/app/components/document-detail/document-history/document-history.component.ts#L66-L113) 中：
+
+```typescript
+const idInt = parseInt(id, 10)  // parseInt("[3, 7, 9, 11]") → NaN
+if (!Number.isFinite(idInt)) {
+    result$ = fallback$         // of(id) → 直接返回原始字符串
+}
+switch (type) {
+    // "tags" 和 "custom_fields" 不在 switch 分支中
+    default:
+        result$ = fallback$
+}
+```
+
+显示效果：
+- `Tags: 3,7,9,11`（数组的 toString() 结果，或 JSON 字符串形式）
+- `Custom Fields: 12,15,18`
+
+**关键问题**：显示的是 pk ID 列表而非名称，用户无法直接识别。
+
+---
+
+### 6.4 分流 C：CustomFieldInstance 自动审计日志（仅 custom_fields）
+
+#### 6.4.1 触发机制
+
+CustomFieldInstance 模型在 [models.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/models.py#L1240) 中通过 `auditlog.register(CustomFieldInstance)` 注册。任何对 CustomFieldInstance 的增删改（包括通过普通 API、批量编辑、工作流等）都会自动生成独立的 LogEntry，其 `content_type` 指向 `documents.CustomFieldInstance`。
+
+#### 6.4.2 原始 changes 形态
+
+CustomFieldInstance 自身的字段变更被 django-auditlog 自动记录，例如：
+
+```python
+# 新增 CustomFieldInstance 时（action=create）
+changes = {
+    "document": ["None", 42],
+    "field": ["None", 7],
+    "value_text": ["None", "invoice-2024-001"],
+}
+
+# 修改值时（action=update）
+changes = {
+    "value_text": ["old-value", "new-value"],
+}
+```
+
+各字段的 ID 含义：
+- `document`：Document 的 pk
+- `field`：CustomField 的 pk
+- `value_*` 系列：实际存储的字段值
+
+#### 6.4.3 history API 的二次转换
+
+history API **不会原样返回** CustomFieldInstance 的 changes。在 [views.py history action](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/views.py#L1778-L1800) 中，这些日志被重新格式化：
+
+```python
+for entry in LogEntry.objects.get_for_objects(doc.custom_fields.all()):
+    entries.append({
+        "changes": {
+            "custom_fields": {
+                "type": "custom_field",
+                "field": str(entry.object_repr).split(":")[0].strip(),
+                "value": str(entry.object_repr).split(":")[1].strip(),
+            },
+        },
+        "id": entry.id,
+        "timestamp": entry.timestamp,
+        "action": entry.get_action_display(),
+        "actor": ...,
+    })
+```
+
+**关键转换逻辑**：使用 `entry.object_repr`（即 CustomFieldInstance 的 `__str__()` 结果）按冒号拆分为 field 和 value。
+
+CustomFieldInstance 的 `__str__()` 定义在 [models.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/models.py#L1190-L1191)：
+
+```python
+def __str__(self) -> str:
+    return str(self.field.name) + f" : {self.value_for_search}"
+```
+
+`value_for_search` 属性在 [models.py](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src/documents/models.py#L1210-L1226) 中定义，对 SELECT 类型会解析出 label，其余类型直接 `str(self.value)`。
+
+转换后的 changes 形态：
+
+```python
+{
+    "custom_fields": {
+        "type": "custom_field",
+        "field": "Invoice Number",   # CustomField.name
+        "value": "INV-2024-001",      # value_for_search 的结果
+    }
+}
+```
+
+#### 6.4.4 ID 含义
+
+- `field`：已被转换为 CustomField 的**名称**（不是 ID）
+- `value`：已被转换为展示值（对于 SELECT 是 label，不是 select_options 中的 ID）
+- 原始 LogEntry 中的 `changes`（包含各字段 ID 的 [old, new] 二元组）在转换过程中被**完全丢弃**，无法从 API 获取
+
+#### 6.4.5 前端显示结果
+
+走 `change.value["type"] === 'custom_field'` 分支，在 [document-history.component.html](file:///d:/fz/0601/solo-dogfeeding/code/70-paperless-ngx/src-ui/src/app/components/document-detail/document-history/document-history.component.html#L39-L43) 中渲染：
+
+```html
+<li>
+    <span>{{ change.value["field"] }}</span>:&nbsp;
+    <code class="text-primary">{{ change.value["value"] }}</code>
+</li>
+```
+
+显示效果：`Invoice Number: INV-2024-001`
+
+**注意**：该分支同样**不显示旧值**，只显示变更发生时 CustomFieldInstance 的 `object_repr` 快照。如果是删除操作，显示的是被删除前的 field:value；如果是修改操作，显示的是修改后的新值（因为 `object_repr` 取自 `smart_str(instance)`，为变更后的当前状态）。
+
+---
+
+### 6.5 三端分流对比总表
+
+| 维度 | A. 自动 M2M 审计（tags） | B. 批量手动日志 | C. 字段实例审计（custom_fields） |
+|------|------|------|------|
+| **触发方式** | `m2m_changed` signal | `log_create()` 手动调用 | `post_save`/`pre_delete` signal |
+| **changes 顶层 key** | `tags` | `tags` 或 `custom_fields` | `custom_fields`（转换后） |
+| **changes 结构** | `{type: "m2m", operation, objects}` | `[old_value, new_value]` 二元组 | `{type: "custom_field", field, value}` |
+| **ID/值形态** | objects = Tag 名称列表 | old = 单个 pk int；new = pk 列表 | field = 名称；value = 展示值 |
+| **能否显示旧值** | 通过 operation 语义表达 add/delete | 存储了但前端不显示 | 不存储（转换时丢弃原始 changes） |
+| **前端显示分支** | `type === 'm2m'` | 普通字段分支 | `type === 'custom_field'` |
+| **前端显示效果** | `Add Tags: Invoice, Important` | `Tags: 3,7,9,11`（pk 列表） | `Invoice Number: INV-2024-001` |
+| **是否区分增/删** | 是（operation 字段） | 否（只显示最终状态） | 否（只显示最终值） |
+| **仅 tags 有** | ✅ | ✅（modify_tags） | ❌ |
+| **仅 custom_fields 有** | ❌ | ✅（modify_custom_fields） | ✅ |
+| **两者共有** | ❌ | ✅ | ❌ |
+
+---
+
+## 七、完整调用链总览
 
 ```
 用户操作
