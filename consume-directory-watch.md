@@ -4,14 +4,14 @@
 
 Consume Directory 监控功能由以下核心组件协同工作：
 
-| 组件 | 文件 | 职责 |
-|------|------|------|
-| 命令入口 | [document_consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py) | Django Management Command，协调监控流程 |
-| 文件系统监听 | watchfiles 库 | 底层文件变更事件检测（支持原生通知 + 轮询） |
-| 稳定性跟踪器 | [FileStabilityTracker](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L75-L179) | 检测文件写入完成状态，并在监控侧做事件级去重 |
-| 文件过滤器 | [ConsumerFilter](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L182-L284) | 过滤无效文件类型和系统文件 |
-| 消费任务 | [consume_file](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/tasks.py#L123-L220) | Celery 异步任务，执行实际文档处理 |
-| 预检插件 | [ConsumerPreflightPlugin](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/consumer.py#L954-L1054) | 任务执行前的文件存在性和 SHA256 内容校验 |
+| 组件 | 源文件 | 职责 |
+|------|--------|------|
+| 命令入口 | `src/documents/management/commands/document_consumer.py` | Django Management Command，协调监控流程 |
+| 文件系统监听 | watchfiles 第三方库 | 底层文件变更事件检测（支持原生通知 + 轮询） |
+| 稳定性跟踪器 | `FileStabilityTracker`（document_consumer.py） | 检测文件写入完成状态，并在监控侧做事件级去重 |
+| 文件过滤器 | `ConsumerFilter`（document_consumer.py） | 过滤无效文件类型和系统文件 |
+| 消费任务 | `consume_file`（src/documents/tasks.py） | Celery 异步任务，执行实际文档处理 |
+| 预检插件 | `ConsumerPreflightPlugin`（src/documents/consumer.py） | 任务执行前的文件存在性和 SHA256 内容校验 |
 
 ---
 
@@ -22,37 +22,32 @@ Consume Directory 监控功能由以下核心组件协同工作：
 ```
 ┌───────────────────────────────────────────────────────────────────┐
 │ 阶段 1: 启动扫描 (_process_existing_files)                        │
-│   位置: document_consumer.py L452-L477                            │
 │   行为: glob 扫描已有文件，直接调用 _consume_file                  │
 │   ★ 无去重  ★ 无稳定性等待                                         │
 └────────────────────────────┬──────────────────────────────────────┘
                              ↓
 ┌───────────────────────────────────────────────────────────────────┐
 │ 阶段 2: 监控侧事件去重 (FileStabilityTracker)                      │
-│   位置: document_consumer.py L75-L179                             │
 │   行为: 内存 dict[Path, TrackedFile] 合并同一文件的多次事件        │
-│   ★ 真正的"避免重复入队"机制（仅在 watch 模式、同一进程内有效）    │
+│   ★ 在同一进程内、文件未被重新修改前，避免重复入队                  │
 └────────────────────────────┬──────────────────────────────────────┘
                              ↓
 ┌───────────────────────────────────────────────────────────────────┐
 │ 阶段 3: 任务入队 (_consume_file)                                   │
-│   位置: document_consumer.py L308-L353                            │
 │   行为: 调用 consume_file.apply_async 提交 Celery 任务             │
 │   ★ 仅检查文件存在性，不检查是否已有相同文件的任务在队列中          │
 └────────────────────────────┬──────────────────────────────────────┘
                              ↓
 ┌───────────────────────────────────────────────────────────────────┐
 │ 阶段 4: 消费阶段 SHA256 查重 (ConsumerPreflightPlugin)             │
-│   位置: consumer.py L979-L1030                                     │
 │   行为: 计算 SHA256，查询 Document.global_objects                  │
 │   ★ 不是"避免重复入队"，是"避免重复入库"（任务已入队，已在执行）    │
 └────────────────────────────┬──────────────────────────────────────┘
                              ↓
 ┌───────────────────────────────────────────────────────────────────┐
 │ 阶段 5: 消费成功后删除源文件                                       │
-│   位置: consumer.py L737-L758                                      │
-│   行为: self.input_doc.original_file.unlink()                      │
-│   ★ 间接去重：文件消失，后续扫描/监控不会再发现它                   │
+│   行为: original_file.unlink()                                     │
+│   ★ 成功后减少再次触发：文件消失，后续扫描/监控不会再发现它         │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,7 +57,7 @@ Consume Directory 监控功能由以下核心组件协同工作：
 
 ### 阶段 1：启动扫描（_process_existing_files）
 
-**代码位置**：[document_consumer.py L452-L477](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L452-L477)
+**源文件**：`src/documents/management/commands/document_consumer.py`
 
 ```python
 def _process_existing_files(self, ...) -> None:
@@ -72,7 +67,7 @@ def _process_existing_files(self, ...) -> None:
             continue
         if not consumer_filter(Change.added, str(filepath)):
             continue
-        _consume_file(...)  # 直接入队，无任何去重
+        _consume_file(...)  # 直接入队，无任何去重，无稳定性等待
 ```
 
 **性质分析**：
@@ -88,9 +83,9 @@ def _process_existing_files(self, ...) -> None:
 
 ### 阶段 2：监控侧事件去重（FileStabilityTracker）
 
-**代码位置**：[document_consumer.py L75-L179](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L75-L179)
+**源文件**：`src/documents/management/commands/document_consumer.py`
 
-这是 **整个链路中唯一真正"避免重复入队"的机制**，但仅在 watch 模式下生效。
+这是 **整个链路中唯一在入队前拦截重复提交的机制**，但其有效边界非常有限。
 
 #### 数据结构
 
@@ -108,11 +103,9 @@ class FileStabilityTracker:
 
 #### 去重逻辑：track() 方法
 
-[document_consumer.py L102-L129](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L102-L129)
-
 ```python
 def track(self, path: Path, change: Change) -> None:
-    path = path.resolve()  # 关键：路径规范化，确保同一文件映射到同一键
+    path = path.resolve()  # 路径规范化，确保同一文件映射到同一键
 
     match change:
         case Change.deleted:
@@ -137,12 +130,10 @@ def track(self, path: Path, change: Change) -> None:
 
 #### 去重逻辑：get_stable_files() 方法
 
-[document_consumer.py L131-L170](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L131-L170)
-
 ```python
 def get_stable_files(self) -> Iterator[Path]:
     for path, tracked in self._tracked.items():
-        # ... 稳定性检查 ...
+        # ... 稳定性检查（时间 + stat 未变化） ...
 
     # 关键：稳定文件 yield 之前先从 _tracked 中 pop 移除
     for path in to_yield:
@@ -150,29 +141,32 @@ def get_stable_files(self) -> Iterator[Path]:
         yield path
 ```
 
-**关键设计**：文件一旦被判定为稳定并返回，立即从跟踪字典中移除。即使后续还有该文件的事件（极端情况下），也会被视为新文件重新跟踪（但此时源文件通常已被消费流程删除）。
+**关键设计**：文件一旦被判定为稳定并返回，立即从跟踪字典中移除。
 
-#### 本阶段去重能力评估
+#### 本阶段去重能力评估 —— 精确边界
 
 | 维度 | 说明 |
 |------|------|
-| 是否真正避免重复入队 | ✅ **是** — 在 watch 模式的同一进程生命周期内，同一文件只会被提交一次到 Celery |
-| 作用范围 | 仅同一进程、同一 FileStabilityTracker 实例 |
-| 失效场景 | 进程重启后 `_tracked` 字典清空，之前跟踪的文件全部丢失 |
-| 失效场景 | 启动扫描阶段不走 FileStabilityTracker，不经过此处 |
+| 是否避免重复入队 | ✅ **有条件地是** — 仅在以下全部条件满足时生效 |
+| 条件 1 | 处于 **watch 模式**（启动扫描阶段不走 FileStabilityTracker） |
+| 条件 2 | **同一进程生命周期内**（进程重启后 `_tracked` 字典清空，之前的跟踪状态全部丢失） |
+| 条件 3 | **文件未被重新修改**（文件稳定后立即从 `_tracked` 中 pop，若之后再次被修改会产生新事件并重新跟踪，视为新的入队） |
+| 典型失效场景 | 监控进程崩溃重启 → 上次 PENDING 任务对应的源文件尚未删除 → 启动扫描再次发现并重复入队 |
+| 典型失效场景 | 文件稳定入队后，用户再次修改该文件（此时源文件尚未被消费流程删除）→ 产生新的 modified 事件 → 再次入队 |
+
+> **精确表述**：FileStabilityTracker 的作用是 —— 在同一监控进程内，将同一个文件因写入过程中产生的多次 added/modified 事件合并为一次入队。它不保证跨进程、跨重启的去重，也不保证文件被用户重新修改后不会再次入队。
 
 ---
 
 ### 阶段 3：任务入队（_consume_file）
 
-**代码位置**：[document_consumer.py L308-L353](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L308-L353)
+**源文件**：`src/documents/management/commands/document_consumer.py`
 
 ```python
 def _consume_file(filepath: Path, ...) -> None:
     # 检查 1: 文件是否仍然存在
     try:
         if not filepath.is_file():
-            logger.debug(f"Not consuming {filepath}: not a file or doesn't exist")
             return
     except OSError as e:
         logger.warning(f"Not consuming {filepath}: {e}")
@@ -186,7 +180,7 @@ def _consume_file(filepath: Path, ...) -> None:
         except Exception:
             logger.exception(...)
 
-    # 检查 3: 直接提交 Celery 任务，无任何去重检查
+    # 检查 3: 直接提交 Celery 任务 —— 无任何去重检查
     try:
         consume_file.apply_async(
             kwargs={
@@ -205,9 +199,9 @@ def _consume_file(filepath: Path, ...) -> None:
 | 维度 | 说明 |
 |------|------|
 | 是否避免重复入队 | ❌ **否** — 不查询 PaperlessTask 表，不检查是否已有相同文件的 PENDING/STARTED 任务 |
-| `is_file()` 检查的作用 | 仅防止以下竞态：文件在稳定性检查通过后、入队前被用户删除/移动。不是去重 |
+| `is_file()` 检查的作用 | 仅防止以下竞态：文件在稳定性检查通过后、入队前被用户删除/移动。这是存在性校验，不是去重 |
 | 标签生成异常处理 | 独立 try-except，标签失败不阻止文件入队，属于容错而非去重 |
-| 可能的重复入队 | 如果因进程重启导致同一文件两次到达 `_consume_file`，这里不会拦截 |
+| 可能的重复入队 | 如果因进程重启或文件被再次修改导致同一文件两次到达 `_consume_file`，这里不会拦截 |
 
 **重要事实**：`_consume_file` 不查询 `PaperlessTask` 表。虽然 PaperlessTask 记录中包含 `input_data.filename` 和 `trigger_source=FOLDER_CONSUME`，但入队前不做检查。
 
@@ -215,9 +209,9 @@ def _consume_file(filepath: Path, ...) -> None:
 
 ### 阶段 4：消费阶段 SHA256 查重（ConsumerPreflightPlugin）
 
-**代码位置**：[consumer.py L979-L1030](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/consumer.py#L979-L1030)
+**源文件**：`src/documents/consumer.py`
 
-**这不是"避免重复入队"的机制 — 任务已经入队并在 Celery Worker 中执行了。** 它避免的是"重复入库"（即同一内容在 Document 表中创建多条记录）。
+**这不是"避免重复入队"的机制 —— 任务已经入队并在 Celery Worker 中执行了。** 它避免的是"重复入库"（即同一内容在 Document 表中创建多条记录）。
 
 ```python
 def pre_check_duplicate(self) -> None:
@@ -244,17 +238,17 @@ def pre_check_duplicate(self) -> None:
 
 | 维度 | 说明 |
 |------|------|
-| 是否避免重复入队 | ❌ **否** — 任务已经在执行，浪费了一次 Worker 调度和 SHA256 计算 |
+| 是否避免重复入队 | ❌ **否** — 任务已经在执行，已经浪费了一次 Worker 调度和 SHA256 计算 |
 | 是否避免重复入库 | ✅ **是** — 防止同一内容创建多条 Document 记录 |
-| 生效前提 | 之前相同内容的文件已经被**成功消费并入库**（Document 记录存在） |
+| 生效前提 | 之前相同内容的文件已经被**成功消费并入库**（Document 记录已写入 DB） |
 | 失效场景 | 如果之前的任务只是 PENDING/STARTED，Document 尚未写入数据库，则 SHA256 查重检测不到。此时多个重复任务会同时通过查重，并行执行解析。最终只有第一条成功写入的任务会留下 Document，其余在写入时可能因后续流程发现冲突或报错 |
-| 与 CONSUMER_DELETE_DUPLICATES 的关系 | 设为 True 时，查重不通过会主动删除源文件（间接防止后续重启再次入队）；设为 False 时，仅记录警告，文件仍在 consume 目录中，重启后会再次触发重复入队 |
+| 与 CONSUMER_DELETE_DUPLICATES 的关系 | 设为 True 时，查重不通过会主动删除源文件（从而减少后续重启再次触发的概率）；设为 False 时，仅记录警告，文件仍在 consume 目录中，重启后会再次触发重复入队 |
 
 ---
 
 ### 阶段 5：消费成功后删除源文件
 
-**代码位置**：[consumer.py L737-L758](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/consumer.py#L737-L758)
+**源文件**：`src/documents/consumer.py`
 
 ```python
 # 仅在成功消费后删除
@@ -271,9 +265,10 @@ if Path(shadow_file).is_file():
 
 | 维度 | 说明 |
 |------|------|
-| 是否避免重复入队 | ⚠️ **间接防止** — 文件被删除后，后续扫描/监控不会再发现它 |
+| 是否避免重复入队 | ❌ 否（此时入队早已发生） |
+| 是否减少后续再次触发 | ✅ **是** — 文件被删除后，后续扫描/监控不会再发现它，从而减少未来重启或扫描时的重复触发 |
 | 时间窗口 | 任务被提交（PENDING）→ Worker 执行完成（SUCCESS） 之间，源文件仍然存在。此时若监控进程重启，启动扫描会重复入队 |
-| 与 CONSUMER_DELETE_DUPLICATES 的区别 | 前者是"成功消费后正常清理"；后者是"查重发现重复时立即删除，避免后续再次触发" |
+| 与 CONSUMER_DELETE_DUPLICATES 的区别 | 本阶段是"成功消费后的正常清理"；CONSUMER_DELETE_DUPLICATES 是"查重发现重复时立即删除，避免后续再次触发" |
 
 ---
 
@@ -283,13 +278,13 @@ if Path(shadow_file).is_file():
 
 | 场景 | 是否重复入队 | 原因 |
 |------|-------------|------|
-| watch 模式下同一文件触发多次 added/modified 事件 | ❌ 不会 | FileStabilityTracker 以 Path 为键合并事件，稳定后 pop 移除 |
-| watch 模式下文件稳定后，用户再次修改 | ⚠️ 会再次入队 | 稳定文件已从 _tracked 中 pop，新的 modified 事件会重新跟踪并在稳定后再次入队。但 SHA256 查重会在消费阶段拦截（若 CONSUMER_DELETE_DUPLICATES=True 则删除源文件） |
+| watch 模式下同一文件写入过程中触发多次 added/modified 事件 | ❌ 不会 | FileStabilityTracker 以 Path 为键合并事件，稳定后 pop 移除 |
+| watch 模式下文件稳定入队后，用户再次修改该文件（源文件尚未被消费删除） | ✅ **会** | 稳定文件已从 `_tracked` 中 pop，新的 modified 事件会重新跟踪并在稳定后再次入队。SHA256 查重会在消费阶段拦截（若 CONSUMER_DELETE_DUPLICATES=True 则删除源文件） |
 | 单次启动，oneshot 模式 | ❌ 不会 | glob 扫描时逐个处理，单次遍历不重复 |
-| 消费任务还在 PENDING，监控进程重启 | ✅ **会！** | 启动扫描重新发现源文件（尚未被成功消费删除），再次调用 _consume_file。SHA256 查重此时还未入库，检测不到。会有多个相同任务并行执行 |
+| 消费任务还在 PENDING，监控进程重启 | ✅ **会！** | 启动扫描重新发现源文件（尚未被成功消费删除），再次调用 `_consume_file`。SHA256 查重此时还未入库，检测不到。会有多个相同任务并行执行 |
 | 消费任务已 SUCCESS，但源文件未被删除（极端异常） | ✅ **会！** | 启动扫描再次发现文件。但此时 Document 已存在，SHA256 查重能拦截（若 CONSUMER_DELETE_DUPLICATES=True 会删除文件，避免下次再重复） |
 | 消费者进程崩溃，文件停留在 consume 目录 | ✅ **会！** | 每次重启都会重新发现。SHA256 查重能否拦截取决于上次崩溃前 Document 是否已写入 DB |
-| 用户手动将同一文件复制两次到 consume 目录 | ✅ **会** | 两个不同路径（即使内容相同）是不同的 TrackedFile。SHA256 查重会在消费阶段拦截第二次 |
+| 用户手动将同一文件复制两次到 consume 目录（不同文件名） | ✅ **会** | 两个不同路径（即使内容相同）是不同的 TrackedFile。SHA256 查重会在消费阶段拦截第二次 |
 
 ---
 
@@ -314,8 +309,6 @@ if Path(shadow_file).is_file():
 3. **存在条件**：文件仍存在且 stat 成功
 
 ### 稳定性检测流程
-
-[FileStabilityTracker.get_stable_files()](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L131-L170)
 
 ```
 遍历所有跟踪文件
@@ -349,8 +342,6 @@ if not tracked.is_unchanged():
 
 ### stat 容错处理
 
-[TrackedFile.update_stats()](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L51-L61) 和 [is_unchanged()](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L63-L72) 都捕获 OSError：
-
 ```python
 def update_stats(self) -> bool:
     try:
@@ -362,20 +353,20 @@ def update_stats(self) -> bool:
         return False
 ```
 
+所有 stat 操作都捕获 OSError，确保文件权限变更、临时不可访问等异常不会导致监控崩溃。
+
 ---
 
 ## 六、扫描并发与超时控制
 
 ### 双模式文件监听
 
-使用 [watchfiles](https://watchfiles.helpmanual.io/) 库：
+使用 watchfiles 第三方库：
 
 | 模式 | 触发条件 | 适用场景 |
 |------|----------|----------|
 | **原生通知** | `CONSUMER_POLLING_INTERVAL = 0`（默认） | 本地文件系统：inotify (Linux) / FSEvents (macOS) / ReadDirectoryChangesW (Windows) |
 | **轮询模式** | `CONSUMER_POLLING_INTERVAL > 0` | 网络文件系统（SMB/NFS），原生通知不可靠 |
-
-模式切换在 [_watch_directory()](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L479-L577)：
 
 ```python
 use_polling = polling_interval > 0
@@ -435,7 +426,7 @@ if is_testing and use_polling:
 
 ### 7.1 文件过滤器（ConsumerFilter）
 
-**位置**：[document_consumer.py L182-L284](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L182-L284)
+**源文件**：`src/documents/management/commands/document_consumer.py`
 
 ```
 watchfiles 事件流
@@ -459,7 +450,7 @@ DefaultFilter (父类):
 
 ### 7.2 入队阶段错误隔离
 
-[_consume_file()](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L308-L353) 每个环节独立异常处理：
+`_consume_file()` 每个环节独立异常处理：
 
 ```
 文件存在性检查 (OSError) → 记录警告，跳过该文件
@@ -473,7 +464,7 @@ DefaultFilter (父类):
 
 ### 7.3 监控循环整体容错
 
-外层 while 循环仅捕获 `KeyboardInterrupt`（[document_consumer.py L575-L577](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L575-L577)）：
+外层 while 循环仅捕获 `KeyboardInterrupt`：
 
 ```python
 while not self.stop_flag.is_set():
@@ -491,7 +482,7 @@ while not self.stop_flag.is_set():
 
 ### 7.4 子目录标签生成的数据库容错
 
-[_tags_from_path()](file:///d:/fz/0601/solo-dogfeeding/code/69-paperless-ngx/src/documents/management/commands/document_consumer.py#L287-L305) 执行前主动关闭旧连接：
+`_tags_from_path()` 执行前主动关闭旧连接：
 
 ```python
 def _tags_from_path(...) -> list[int]:
@@ -537,7 +528,7 @@ _watch_directory() 进入无限循环
 └────────────────────────────────────────────────┘
 ```
 
-**关键点**：启动时先处理已有文件（无稳定等待），再进入监控（有稳定性检测和事件去重）。
+**关键点**：启动时先处理已有文件（无稳定等待），再进入监控（有稳定性检测和事件级去重）。
 
 ---
 
@@ -556,14 +547,87 @@ _watch_directory() 进入无限循环
 
 ---
 
-## 十、完整流程图（标注去重性质）
+## 十、最终结论：三类机制的本质区别
+
+经过对 5 个阶段的精确边界分析，整条链路中并不存在一个"完美防重"机制，而是由三类性质完全不同的机制分层协作：
+
+### 第一类：防重复入队（在 consume_file.apply_async 之前拦截）
+
+**唯一机制**：FileStabilityTracker（阶段 2）
+
+**有效边界**：
+- ✅ 仅在 **watch 模式** 下生效（启动扫描阶段不走此处）
+- ✅ 仅在 **同一进程生命周期内** 生效（进程重启后 `_tracked` 内存清空）
+- ✅ 仅在 **文件未被重新修改** 的前提下生效（文件稳定后立即从 `_tracked` 中 pop，再次修改会被视为新文件重新入队）
+- ❌ 不跨进程、不跨重启
+
+**实际作用**：将同一个文件写入过程中产生的多次 added/modified 事件合并为一次入队提交。
+
+---
+
+### 第二类：防重复入库（任务已入队，在 Celery Worker 中拦截 Document 重复写入）
+
+**唯一机制**：ConsumerPreflightPlugin.pre_check_duplicate() 的 SHA256 查重（阶段 4）
+
+**有效边界**：
+- ✅ 跨进程、跨重启（基于数据库中的 Document 记录）
+- ✅ 不依赖文件路径，按文件内容哈希比对
+- ✅ 包括已软删除（回收站）的文档
+- ❌ 不防重复入队 — 任务已经执行到 Worker，浪费了调度和计算资源
+- ❌ 仅当之前相同内容的 Document 已成功写入 DB 后才生效；若之前的任务仍为 PENDING/STARTED，则检测不到，多个重复任务会并行执行
+
+**实际作用**：即使因进程重启等原因导致同一内容被多次入队，也不会在数据库中产生重复的 Document 记录。
+
+**增强效果**：若开启 `CONSUMER_DELETE_DUPLICATES=True`，查重命中时会主动删除源文件，从而减少后续重启或扫描时的再次触发。
+
+---
+
+### 第三类：成功后减少再次触发（文件物理消失，从源头消除重复可能）
+
+**机制**：消费成功后 `original_file.unlink()` 删除源文件（阶段 5）
+
+**有效边界**：
+- ✅ 最彻底的去重：文件不存在了，任何扫描/监控都不会再发现它
+- ❌ 有时间窗口：任务 PENDING → SUCCESS 之间源文件仍在，此时重启仍会重复入队
+- ❌ 仅在消费成功时执行；消费失败或进程崩溃时文件残留，后续重启会再次触发
+
+**实际作用**：正常消费完成后，从物理上移除源文件，从根本上杜绝未来的重复发现。
+
+---
+
+### 三类机制的协作关系
+
+```
+                        文件出现在 consume 目录
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         ▼                         ▼                         ▼
+  【防重复入队】              【防重复入库】            【成功后减少再次触发】
+  FileStabilityTracker      SHA256 查重              unlink() 删除源文件
+  (阶段 2)                  (阶段 4)                  (阶段 5)
+         │                         │                         │
+         ▼                         ▼                         ▼
+  合并同一进程内的          即使入队了也不写          消费成功后文件消失，
+  多次事件为一次入队       重复 Document             未来扫描不再发现
+         │                         │                         │
+         ▼                         ▼                         ▼
+  边界：watch模式、             边界：之前的任务           边界：必须消费成功，
+  同进程、未重新修改            已成功入库                 PENDING 期间有窗口
+```
+
+**最危险的重复入队窗口**：监控进程崩溃重启，且上次提交的任务仍为 PENDING（源文件未删、Document 未入库）。此时三类机制全部失效，会发生真正的重复入队和并行解析。缓解方式是开启 `CONSUMER_DELETE_DUPLICATES=True`，使第二轮任务在消费阶段至少能删除源文件，防止无限循环。
+
+---
+
+## 十一、完整流程图（标注去重性质）
 
 ```
 文件出现在 consume 目录
     ↓
 ┌─ 阶段 1/2 入口 ────────────────────────────────────────────┐
 │  启动扫描（glob）  或  watchfiles 事件                      │
-│  [无去重]          [FileStabilityTracker 事件级去重 ✅]     │
+│  [无去重]          [FileStabilityTracker 事件级去重：        │
+│                    同一进程、未重新修改前 ✅]                │
 └────────────────────────────────────────────────────────────┘
     ↓
 ConsumerFilter 过滤
@@ -585,13 +649,15 @@ ConsumerFilter 过滤
 ┌─ 阶段 4: Celery Worker 执行 ───────────────────────────────┐
 │  ConsumerPreflightPlugin.pre_check_file_exists()           │
 │  ConsumerPreflightPlugin.pre_check_duplicate()             │
-│    [SHA256 查重：防止重复入库 ✅，不防止重复入队 ❌]         │
+│    [SHA256 查重：防重复入库 ✅，不防重复入队 ❌]             │
+│    [若 CONSUMER_DELETE_DUPLICATES=True 则删除源文件，       │
+│     减少后续再次触发]                                       │
 └────────────────────────────────────────────────────────────┘
     ↓
 ConsumerPlugin.run() 解析、分类、存储 Document
     ↓
 ┌─ 阶段 5: 收尾 ─────────────────────────────────────────────┐
-│  成功 → unlink() 源文件 [间接防止后续重复入队 ⚠️]          │
+│  成功 → unlink() 源文件 [减少后续再次触发 ✅]               │
 │  失败 → 源文件保留，重启后会再次被发现                      │
 └────────────────────────────────────────────────────────────┘
 ```
