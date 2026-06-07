@@ -274,6 +274,215 @@ elif action == "empty":
 
 ---
 
+## 4.4 恢复文档后索引重新加入路径分析
+
+恢复（`doc.restore(strict=False)`）本身**完全不触发任何索引更新**。要让恢复后的文档重新出现在 Tantivy 搜索和 LLM 问答中，需要依赖以下 5 条间接路径。本节逐条分析它们对两种索引的真实影响。
+
+### 4.4.1 信号注册总览（证据基础）
+
+在分析具体路径之前，先明确两个自定义信号的全部处理函数——这是判断每条路径影响的基础。
+
+信号连接全部定义在 [src/documents/apps.py L24-L33](src/documents/apps.py#L24-L33)：
+
+```python
+document_consumption_finished.connect(add_inbox_tags)
+document_consumption_finished.connect(set_correspondent)
+document_consumption_finished.connect(set_document_type)
+document_consumption_finished.connect(set_tags)
+document_consumption_finished.connect(set_storage_path)
+document_consumption_finished.connect(add_to_index)              # ⭐ Tantivy 索引
+document_consumption_finished.connect(run_workflows_added)
+document_consumption_finished.connect(add_or_update_document_in_llm_index)  # ⭐ LLM 索引
+document_updated.connect(run_workflows_updated)                  # 仅工作流
+document_updated.connect(send_websocket_document_updated)         # 仅 WebSocket
+```
+
+**关键结论**：`document_updated` 信号的两个处理函数都与索引无关，只有 `document_consumption_finished` 同时连接了 Tantivy 和 LLM 索引的添加函数。
+
+### 4.4.2 五条路径逐条分析
+
+#### 路径一：`document_updated` 信号触发
+
+**触发位置**（共 5 处）：
+
+| 场景 | 代码位置 | 触发前是否已更新 Tantivy？ |
+|------|---------|--------------------------|
+| 单文档 REST API `PUT/PATCH` | [src/documents/views.py L1178](src/documents/views.py#L1178) | ✅ 是（L1176 已显式 `add_or_update`） |
+| 删除文档版本 | [src/documents/views.py L2046](src/documents/views.py#L2046) | ✅ 是（L2022 已显式 `add_or_update` 根文档） |
+| 更新版本标签 | [src/documents/views.py L2119](src/documents/views.py#L2119) | ❌ 否（此处无显式索引调用） |
+| `bulk_update_documents` 内循环 | [src/documents/tasks.py L260](src/documents/tasks.py#L260) | ⭕ 稍后批量处理（见路径二） |
+| 消费中生成新版本后 | [src/documents/consumer.py L732](src/documents/consumer.py#L732) | ❌ 否（消费流程走 `document_consumption_finished`） |
+
+**`document_updated` 的两个处理函数**：
+
+- [run_workflows_updated()](src/documents/signals/handlers.py L819-L829)：仅运行 `DOCUMENT_UPDATED` 类型的工作流
+- [send_websocket_document_updated()](src/documents/signals/handlers.py L832-L851)：仅通过 WebSocket 向前端推送文档变更通知
+
+**对索引的影响**：
+- **Tantivy 搜索索引**：❌ 不影响（信号处理函数中无索引操作。索引更新必须在 `send()` 之前显式调用）
+- **LLM 向量索引**：❌ 不影响（同理）
+
+这也印证了为什么恢复文档后必须走其他路径——因为 restore 不会发送 `document_updated`，即便发送也不会更新索引。
+
+---
+
+#### 路径二：`bulk_update_documents` 批量编辑异步任务
+
+**触发方式**：所有批量编辑（修改往来人、文档类型、存储路径、标签增删、自定义字段增删、权限变更等）在完成数据库 `update()` 后，都会异步调用此任务。入口见 [src/documents/bulk_edit.py L126-L354](src/documents/bulk_edit.py#L126-L354) 中各处 `bulk_update_documents.apply_async()`。
+
+**核心实现**：[src/documents/tasks.py L253-L275](src/documents/tasks.py#L253-L275)
+
+```python
+@shared_task
+def bulk_update_documents(document_ids) -> None:
+    from documents.search import get_backend
+
+    documents = Document.objects.filter(id__in=document_ids)
+
+    for doc in documents:
+        clear_document_caches(doc.pk)
+        document_updated.send(              # ① 发工作流 + WebSocket
+            sender=None,
+            document=doc,
+            logging_group=uuid.uuid4(),
+        )
+        post_save.send(Document, instance=doc, created=False)
+
+    with get_backend().batch_update() as batch:
+        for doc in documents:
+            batch.add_or_update(doc)          # ② ⭐ 批量更新 Tantivy 索引
+
+    ai_config = AIConfig()
+    if ai_config.llm_index_enabled:
+        update_llm_index(                    # ③ ⭐ 增量更新 LLM 索引
+            rebuild=False,
+        )
+```
+
+**对索引的影响**：
+- **Tantivy 搜索索引**：✅ **会重新加入**。通过 `batch.add_or_update(doc)` 批量写入。由于查询条件是 `Document.objects`（默认 Manager，自动过滤软删除文档），恢复后的文档（`deleted_at=NULL`）会被包含。
+- **LLM 向量索引**：✅ **会重新加入**（仅当 `llm_index_enabled=True`）。调用 `update_llm_index(rebuild=False)` 做增量重建。
+- 工作流：✅ 触发 `run_workflows_updated`
+- WebSocket：✅ 触发前端通知
+
+**⚠️ 注意**：`Document.objects` 会过滤已软删除文档，所以**如果文档仍在回收站中（`is_deleted=True`），它不会出现在 `documents` 查询集中，也就不会被重新加入索引**。只有恢复之后（`deleted_at` 被清空）再触发批量编辑，才会生效。
+
+---
+
+#### 路径三：`document_consumption_finished` 文档消费完成
+
+**触发位置**：[src/documents/consumer.py L658-L666](src/documents/consumer.py#L658-L666)
+
+仅在**新文档首次消费完成**时触发（以及测试代码中的手动触发）。恢复文档不会触发消费流程。
+
+**对索引的影响**：
+- **Tantivy 搜索索引**：✅ [add_to_index()](src/documents/signals/handlers.py L794-L800) → `get_backend().add_or_update(document, effective_content=...)`
+- **LLM 向量索引**：✅（仅当启用）[add_or_update_document_in_llm_index()](src/documents/signals/handlers.py L1331-L1339) → 异步 `update_document_in_llm_index`
+- 此外还会自动匹配往来人、文档类型、标签、存储路径，运行 `DOCUMENT_ADDED` 工作流
+
+---
+
+#### 路径四：后台管理（Django Admin）保存文档
+
+**实现**：[src/documents/admin.py L58-L120](src/documents/admin.py#L58-L120) 中的 `DocumentAdmin`
+
+```python
+# src/documents/admin.py L116-L120
+def save_model(self, request, obj, form, change):
+    from documents.search import get_backend
+    get_backend().add_or_update(obj)   # ⭐ 显式更新 Tantivy
+    super().save_model(request, obj, form, change)
+
+# src/documents/admin.py L110-L114
+def delete_model(self, request, obj):
+    from documents.search import get_backend
+    get_backend().remove(obj.pk)       # ⭐ 显式从 Tantivy 移除
+    super().delete_model(request, obj)
+```
+
+**对索引的影响**：
+- **Tantivy 搜索索引**：✅ **会重新加入**。`save_model()` 在保存前显式调用 `get_backend().add_or_update(obj)`。
+- **LLM 向量索引**：❌ **不会重新加入**。`DocumentAdmin` 中没有任何 LLM 索引相关调用，也不会发送 `document_consumption_finished` 信号。
+- 工作流：❌ 不触发 `document_updated`，不运行工作流
+- WebSocket：❌ 不推送通知
+
+**注意**：`DocumentAdmin.get_queryset()` 返回 `Document.global_objects.all()`（[src/documents/admin.py L96-L100](src/documents/admin.py#L96-L100)），即管理员在后台可以看到并编辑已软删除（回收站中）的文档。因此在后台直接保存一个回收站中的文档，Tantivy 索引中可能会出现一条 `is_deleted=True` 的记录——不过搜索前端使用 `Document.objects` 查询，通常不会返回这些文档。
+
+---
+
+#### 路径五：手动重建索引（Management Commands）
+
+这是最可靠的恢复方式，不依赖任何触发条件。
+
+##### Tantivy 搜索索引：`document_index reindex`
+
+[src/documents/management/commands/document_index.py L16-L70](src/documents/management/commands/document_index.py#L16-L70)
+
+```bash
+# 增量重建（保留现有索引，全量覆盖）
+python manage.py document_index reindex
+
+# 先清空再完全重建
+python manage.py document_index reindex --recreate
+
+# 仅在索引过期时重建（schema/语言变更时）
+python manage.py document_index reindex --if-needed
+```
+
+核心逻辑：
+```python
+documents = Document.objects.select_related(...).prefetch_related(...)  # 默认 Manager
+get_backend().rebuild(documents, ...)
+```
+
+- **Tantivy 搜索索引**：✅ 使用 `Document.objects`（非软删除）全量重建，所有恢复后的文档会被包含。
+
+##### LLM 向量索引：`document_llmindex rebuild | update`
+
+[src/documents/management/commands/document_llmindex.py L7-L24](src/documents/management/commands/document_llmindex.py#L7-L24)
+
+```bash
+# 完全重建 LLM 向量索引
+python manage.py document_llmindex rebuild
+
+# 增量更新 LLM 向量索引
+python manage.py document_llmindex update
+```
+
+最终调用 [llmindex_index()](src/documents/tasks.py L628-L643)，内部先检查 `ai_config.llm_index_enabled`，然后委托给 `paperless_ai.indexing.update_llm_index`。
+
+- **LLM 向量索引**：✅（仅当 `llm_index_enabled=True`）全量重建或增量更新，包含所有非软删除文档。
+
+### 4.4.3 影响矩阵汇总
+
+| 路径 | 触发场景 | Tantivy 搜索索引 | LLM 向量索引 | 工作流 | WebSocket | 对恢复文档是否有效 |
+|------|---------|----------------|------------|-------|----------|-----------------|
+| `doc.restore()` 本身 | 回收站恢复 | ❌ 不更新 | ❌ 不更新 | ❌ 不触发 | ❌ 不推送 | ❌ 无效 |
+| `document_updated` 信号 | 单文档编辑、版本变更等 | ❌ 不更新（仅信号处理） | ❌ 不更新 | ✅ 运行 | ✅ 推送 | ❌ 信号本身不更新索引 |
+| `bulk_update_documents` | 批量编辑往来人/标签/类型/字段等 | ✅ `batch.add_or_update` | ✅ `update_llm_index`（启用时） | ✅ 运行 | ✅ 推送 | ✅ 需在恢复后编辑 |
+| `document_consumption_finished` | 新文档首次消费 | ✅ `add_to_index` | ✅ `add_or_update_document_in_llm_index`（启用时） | ✅ 运行 | ❌ 不推送 | ❌ 恢复不会重新消费 |
+| Admin `DocumentAdmin.save_model` | 管理员后台编辑保存 | ✅ `add_or_update` | ❌ 不更新 | ❌ 不触发 | ❌ 不推送 | ✅ Tantivy 有效，LLM 无效 |
+| `document_index reindex` | 手动管理命令 | ✅ `get_backend().rebuild()` 全量 | — | ❌ | ❌ | ✅ 最可靠 |
+| `document_llmindex rebuild` | 手动管理命令 | — | ✅ 全量重建（启用时） | ❌ | ❌ | ✅ 最可靠 |
+| REST API 单文档 `PUT/PATCH` | 前端编辑保存 | ✅ 显式 `add_or_update`（信号前调用） | ❌ 不更新 | ✅ 运行 | ✅ 推送 | ✅ Tantivy 有效，LLM 无效 |
+| 备注增删 API | 新增/删除文档备注 | ✅ 显式 `add_or_update` | ❌ 不更新 | ❌ | ❌ | ✅ Tantivy 有效，LLM 无效 |
+
+### 4.4.4 恢复后让文档出现在搜索中的推荐做法
+
+根据上表，恢复文档后若需立即生效，有三种可靠方式：
+
+1. **最全面**：执行两个命令
+   ```bash
+   python manage.py document_index reindex
+   python manage.py document_llmindex rebuild   # 如启用 LLM
+   ```
+
+2. **前端操作 Tantivy 即可**：对恢复的文档执行任意一次编辑保存（修改任意字段后保存），REST API `PUT` 会触发 `get_backend().add_or_update()`（[src/documents/views.py L1176](src/documents/views.py#L1176)）
+
+3. **批量操作 Tantivy 即可**：对恢复的文档执行一次批量编辑（例如重新设置同一个标签），触发 `bulk_update_documents`，同时更新 Tantivy 和 LLM（启用时）索引。
+
+---
+
 ## 5. 永久删除（清空回收站）流程
 
 ### 5.1 三种触发方式
