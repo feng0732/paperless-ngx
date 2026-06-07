@@ -17,13 +17,15 @@ Paperless-ngx 的设置系统由四个层级构成，自底向上依次为：
 
 **最终优先级（从高到低）：L4 用户偏好 > L3 全局配置 > L2 环境变量 > L1 前端硬编码默认值**
 
+> **重要例外**：某些系统级字段（`app_title`、`ai_enabled`、`trash_delay` 等）由后端在 API 返回时**强制注入**，会覆盖用户 UiSettings（L4）中的同名键。见第三章。
+
 ---
 
 ## 二、各层级代码位置
 
 ### 2.1 L1：前端硬编码默认值
 
-文件：[ui-settings.ts](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src-ui/src/app/data/ui-settings.ts#L99-L349)
+文件：[src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts)
 
 每个设置项通过 `SETTINGS` 数组定义，包含 `key`、`type`、`default`：
 
@@ -45,7 +47,7 @@ export const SETTINGS: UiSetting[] = [
 
 ### 2.2 L2：Django 环境变量与代码默认值
 
-文件：[paperless/settings/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/paperless/settings/__init__.py)
+文件：[src/paperless/settings/__init__.py](src/paperless/settings/__init__.py)
 
 Django settings 从环境变量读取，带代码默认值：
 
@@ -61,11 +63,14 @@ OCR_LANGUAGE = os.getenv("PAPERLESS_OCR_LANGUAGE", "eng")
 OCR_OUTPUT_TYPE = os.getenv("PAPERLESS_OCR_OUTPUT_TYPE", "pdfa")
 OCR_DESKEW = get_bool_from_env("PAPERLESS_OCR_DESKEW", "true")
 EMPTY_TRASH_DELAY = max(get_int_from_env("PAPERLESS_EMPTY_TRASH_DELAY", 30), 1)
+AI_ENABLED = get_bool_from_env("PAPERLESS_AI_ENABLED", "NO")
 ```
+
+`get_bool_from_env` 的默认值为 `"NO"`（即 `False`），见 [src/paperless/settings/parsers.py](src/paperless/settings/parsers.py)。
 
 ### 2.3 L3：数据库全局配置（ApplicationConfiguration）
 
-文件：[paperless/models.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/paperless/models.py#L91-L350)
+文件：[src/paperless/models.py](src/paperless/models.py)
 
 这是一个**单例模型**（`AbstractSingletonModel`），始终只有一条记录（pk=1）。所有字段均为 `null=True`，允许为 NULL 表示"未设置，使用默认值"。
 
@@ -77,7 +82,7 @@ EMPTY_TRASH_DELAY = max(get_int_from_env("PAPERLESS_EMPTY_TRASH_DELAY", 30), 1)
 
 ### 2.4 L4：数据库用户偏好（UiSettings）
 
-文件：[documents/models.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/documents/models.py#L652-L661)
+文件：[src/documents/models.py](src/documents/models.py)
 
 ```python
 class UiSettings(models.Model):
@@ -105,84 +110,144 @@ class UiSettings(models.Model):
 
 ### 3.1 L3 与 L2 的合并：`paperless/config.py` 中的 Config 类
 
-文件：[paperless/config.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/paperless/config.py)
+文件：[src/paperless/config.py](src/paperless/config.py)
 
 后端定义了 5 个 dataclass（`OutputTypeConfig`、`OcrConfig`、`BarcodeConfig`、`GeneralConfig`、`AIConfig`），它们在 `__post_init__` 中执行 **L3 > L2** 的合并。
 
-核心模式：使用 `or` 运算符，当数据库值为 falsy（None / 空字符串 / 0 / False）时回退到 Django settings。
+#### 3.1.1 两种合并模式及陷阱
+
+合并使用两种模式，但其中一种对布尔值存在严重陷阱：
+
+| 模式 | 适用类型 | 写法 | 问题 |
+|------|---------|------|------|
+| **A: `or` 运算符** | 字符串/枚举/数字（理想情况） | `self.x = app_config.x or settings.X` | 对布尔值有 bug：`False or True = True` |
+| **B: `is not None` 判断** | 布尔值、0 值有效的数字 | `self.x = app_config.x if app_config.x is not None else settings.X` | 无问题，推荐 |
+
+#### 3.1.2 正确实现（仅 OcrConfig 中两个字段）
+
+`OcrConfig` 中的 `deskew` 和 `rotate_pages` 使用了正确的 `is not None` 判断：
 
 ```python
-@dataclasses.dataclass
-class OcrConfig(OutputTypeConfig):
-    language: str = dataclasses.field(init=False)
-    mode: ModeChoices = dataclasses.field(init=False)
-    deskew: bool = dataclasses.field(init=False)
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        app_config = self._get_config_instance()  # 获取 ApplicationConfiguration 单例
-
-        # 字符串/枚举/数字：用 or，空值回退
-        self.language = app_config.language or settings.OCR_LANGUAGE
-        self.mode = app_config.mode or ModeChoices(settings.OCR_MODE)
-
-        # 布尔值：注意 False or True = True，必须显式判断 is not None
-        self.deskew = (
-            app_config.deskew if app_config.deskew is not None else settings.OCR_DESKEW
-        )
+# OcrConfig.__post_init__
+self.deskew = (
+    app_config.deskew if app_config.deskew is not None else settings.OCR_DESKEW
+)
+self.rotate = (
+    app_config.rotate_pages
+    if app_config.rotate_pages is not None
+    else settings.OCR_ROTATE_PAGES
+)
 ```
 
-**关键差异**：
-- 字符串/数字字段：`app_config.xxx or settings.XXX`
-  - 若 DB 存了空字符串 `""`，会回退到环境变量（因为 `""` 是 falsy）
-- 布尔字段：`app_config.xxx if app_config.xxx is not None else settings.XXX`
-  - 必须显式判断 `is not None`，否则 DB 存 `False` 会被错误回退
+✅ 当 DB 存 `False` 时，`app_config.deskew is not None` 为 `True`，返回 DB 的 `False`，不会错误回退。
+
+#### 3.1.3 有 Bug 的实现：BarcodeConfig 中所有布尔字段
+
+`BarcodeConfig` 中的 **6 个布尔字段** 全部使用了 `or` 运算符，存在 bug：
+
+```python
+# BarcodeConfig.__post_init__（有 bug）
+self.barcodes_enabled = (
+    app_config.barcodes_enabled or settings.CONSUMER_ENABLE_BARCODES
+)
+self.barcode_enable_tiff_support = (
+    app_config.barcode_enable_tiff_support or settings.CONSUMER_BARCODE_TIFF_SUPPORT
+)
+self.barcode_retain_split_pages = (
+    app_config.barcode_retain_split_pages or settings.CONSUMER_BARCODE_RETAIN_SPLIT_PAGES
+)
+self.barcode_enable_asn = (
+    app_config.barcode_enable_asn or settings.CONSUMER_ENABLE_ASN_BARCODE
+)
+self.barcode_enable_tag = (
+    app_config.barcode_enable_tag or settings.CONSUMER_ENABLE_TAG_BARCODE
+)
+self.barcode_tag_split = (
+    app_config.barcode_tag_split or settings.CONSUMER_TAG_BARCODE_SPLIT
+)
+```
+
+❌ **Bug 复现场景**：
+- 环境变量 `PAPERLESS_CONSUMER_ENABLE_BARCODES=true`（L2 = True）
+- 管理员在 Config 页面**关闭**条码扫描（L3 DB 存 `False`）
+- 合并结果：`False or True = True` ❌
+- DB 中的 `False` 被环境变量的 `True` 覆盖了！管理员的设置不生效。
+
+#### 3.1.4 有 Bug 的实现：AIConfig.ai_enabled
+
+`AIConfig.ai_enabled` 同样使用了 `or` 运算符：
+
+```python
+# AIConfig.__post_init__（有 bug）
+self.ai_enabled = app_config.ai_enabled or settings.AI_ENABLED
+```
+
+❌ 同样的问题：当 L2 环境变量 `PAPERLESS_AI_ENABLED=YES`（True），管理员在 L3 DB 设为 `False`，合并结果是 `True`。
+
+> 额外注意：`ApplicationConfiguration.ai_enabled` 字段定义有 `default=False`（见 [src/paperless/models.py](src/paperless/models.py)），但字段同时是 `null=True`，所以实际存储时可以是 `None`、`True`、`False` 三种值。
+
+#### 3.1.5 字符串/枚举字段的 or 回退（可接受）
+
+对于字符串和枚举，`or` 模式通常是可接受的，因为 DB 存的空字符串也是 falsy：
+
+```python
+self.language = app_config.language or settings.OCR_LANGUAGE
+self.mode = app_config.mode or ModeChoices(settings.OCR_MODE)
+self.archive_file_generation = (
+    app_config.archive_file_generation
+    or ArchiveFileGenerationChoices(settings.ARCHIVE_FILE_GENERATION)
+)
+```
+
+但需注意：如果管理员在 Config 页面刻意输入空字符串，也会被回退到环境变量（通常符合预期）。
 
 ### 3.2 L4 与系统级信息的合并：`UiSettingsView.get()`
 
-文件：[documents/views.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/documents/views.py#L3857-L3927)
+文件：[src/documents/views.py](src/documents/views.py)
 
-前端调用 `/api/ui_settings/` GET 接口时，后端执行以下合并：
+前端调用 `/api/ui_settings/` GET 接口时，后端执行以下合并。**核心原则：后端注入的系统值优先级高于用户 UiSettings 中的同名键。**
 
-1. **读取用户 UiSettings（L4）** 作为基础
-2. **注入系统级只读信息**（这些值用户无法修改，仅由后端计算）
+#### 3.2.1 合并执行顺序
 
 ```python
 def get(self, request, format=None):
     user = User.objects.select_related("ui_settings").get(pk=request.user.id)
-    
-    # 步骤 1：读取用户偏好（可能为空 dict）
+
+    # 步骤 1：读取用户偏好（L4）作为基础
     ui_settings = {}
     if hasattr(user, "ui_settings"):
-        ui_settings = user.ui_settings.settings
+        ui_settings = user.ui_settings.settings  # ← 从 JSON 字段读取
 
-    # 步骤 2：注入 update_checking 后端配置
+    # 步骤 2：注入 update_checking（只读系统信息）
     if "update_checking" in ui_settings:
         ui_settings["update_checking"]["backend_setting"] = settings.ENABLE_UPDATE_CHECK
     else:
         ui_settings["update_checking"] = {"backend_setting": settings.ENABLE_UPDATE_CHECK}
 
-    # 步骤 3：注入 L2 值（这些是只读的，用户偏好不能覆盖）
+    # 步骤 3：直接注入 L2 环境变量值（覆盖用户同名键）
     ui_settings["trash_delay"] = settings.EMPTY_TRASH_DELAY
     ui_settings["version"] = version.__full_version_str__
     ui_settings["auditlog_enabled"] = settings.AUDIT_LOG_ENABLED
     ui_settings["email_enabled"] = settings.EMAIL_ENABLED
 
-    # 步骤 4：注入 L3 > L2 合并后的值（GeneralConfig、AIConfig）
+    # 步骤 4：注入 L3 > L2 合并后的 GeneralConfig 值
     general_config = GeneralConfig()
-    ui_settings["app_title"] = settings.APP_TITLE
+    ui_settings["app_title"] = settings.APP_TITLE  # 先写 L2
     if general_config.app_title is not None and len(general_config.app_title) > 0:
         ui_settings["app_title"] = general_config.app_title  # L3 覆盖 L2
     ui_settings["app_logo"] = settings.APP_LOGO
     if general_config.app_logo is not None and len(general_config.app_logo) > 0:
         ui_settings["app_logo"] = general_config.app_logo
 
+    # 步骤 5：注入 AI 开关（L3 > L2 合并，但合并本身有 bug）
     ai_config = AIConfig()
-    ui_settings["ai_enabled"] = ai_config.ai_enabled  # 已在 AIConfig 内部合并 L3>L2
+    ui_settings["ai_enabled"] = ai_config.ai_enabled
 
-    # 步骤 5：注入 OAuth URL（运行时生成）
+    # 步骤 6：注入 OAuth URL（运行时生成，可选）
     if settings.GMAIL_OAUTH_ENABLED:
         ui_settings["gmail_oauth_url"] = manager.get_gmail_authorization_url()
+    if settings.OUTLOOK_OAUTH_ENABLED:
+        ui_settings["outlook_oauth_url"] = manager.get_outlook_authorization_url()
 
     return Response({
         "user": user_resp,
@@ -191,11 +256,83 @@ def get(self, request, format=None):
     })
 ```
 
-**注意**：`app_title`、`app_logo`、`ai_enabled`、`trash_delay`、`auditlog_enabled`、`email_enabled` 等值是后端**强制注入**的，用户 UiSettings 中即使存了同名键也会被覆盖。
+#### 3.2.2 后端强制注入字段清单
+
+以下字段由后端直接赋值到 `ui_settings` dict 中，**用户 UiSettings JSON 中即使存了同名键也会被覆盖**：
+
+| 字段 | 注入顺序 | 值来源 | 用户能否通过 POST 修改 |
+|------|---------|--------|----------------------|
+| `update_checking.backend_setting` | 步骤 2 | L2 `settings.ENABLE_UPDATE_CHECK` | 不能（嵌套结构被部分覆盖） |
+| `trash_delay` | 步骤 3 | L2 `settings.EMPTY_TRASH_DELAY` | **不能，强制覆盖** |
+| `version` | 步骤 3 | 代码版本号常量 | 不能 |
+| `auditlog_enabled` | 步骤 3 | L2 `settings.AUDIT_LOG_ENABLED` | **不能，强制覆盖** |
+| `email_enabled` | 步骤 3 | L2 `settings.EMAIL_ENABLED` | **不能，强制覆盖** |
+| `app_title` | 步骤 4 | L3 `GeneralConfig.app_title` 或 L2 `settings.APP_TITLE` | **不能，强制覆盖** |
+| `app_logo` | 步骤 4 | L3 `GeneralConfig.app_logo` 或 L2 `settings.APP_LOGO` | **不能，强制覆盖** |
+| `ai_enabled` | 步骤 5 | `AIConfig.ai_enabled`（L3>L2 合并） | **不能，强制覆盖** |
+| `gmail_oauth_url` | 步骤 6 | 运行时生成（如启用） | 不能 |
+| `outlook_oauth_url` | 步骤 6 | 运行时生成（如启用） | 不能 |
+
+> **注意**：用户通过 POST `/api/ui_settings/` 可以把这些值存入 `UiSettings.settings` JSON，但下次 GET 请求时又会被后端覆盖，所以这些用户存储的值实际不生效。
+
+#### 3.2.3 三个关键字段的覆盖详解
+
+##### (1) `app_title` —— 应用标题
+
+覆盖逻辑：
+```
+用户 UiSettings["app_title"]
+    ↓ 被后端覆盖
+settings.APP_TITLE (L2)
+    ↓ 若 L3 有值则再次被覆盖
+GeneralConfig.app_title (L3)
+```
+
+`GeneralConfig` 内部合并：
+```python
+# GeneralConfig.__post_init__
+self.app_title = app_config.app_title or None
+```
+
+然后在 `UiSettingsView.get()` 中：
+```python
+ui_settings["app_title"] = settings.APP_TITLE
+if general_config.app_title is not None and len(general_config.app_title) > 0:
+    ui_settings["app_title"] = general_config.app_title
+```
+
+**最终优先级：L3 DB (非空) > L2 环境变量 > 用户 UiSettings**
+
+##### (2) `ai_enabled` —— AI 开关
+
+覆盖逻辑：
+```
+用户 UiSettings["ai_enabled"]
+    ↓ 被后端覆盖
+AIConfig.ai_enabled (L3 > L2 合并)
+```
+
+但 `AIConfig` 内部合并存在 `or` bug（见 3.1.4），所以实际：
+```
+AIConfig.ai_enabled = app_config.ai_enabled or settings.AI_ENABLED
+```
+
+**最终优先级：(L3 DB if True else L2 环境变量) > 用户 UiSettings**
+⚠️ 当 L3 DB 存 `False` 且 L2 为 `True` 时，错误地返回 L2 的 `True`。
+
+##### (3) `trash_delay` —— 回收站延迟天数
+
+覆盖逻辑最简单：
+```python
+ui_settings["trash_delay"] = settings.EMPTY_TRASH_DELAY
+```
+
+**最终优先级：L2 环境变量 > 用户 UiSettings**
+完全不使用 L3，也不看用户设置的值。
 
 ### 3.3 Django 模板 Context Processor 中的合并
 
-文件：[documents/context_processors.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/documents/context_processors.py)
+文件：[src/documents/context_processors.py](src/documents/context_processors.py)
 
 服务端渲染登录页等模板时也使用了 L3 > L2 的合并：
 
@@ -216,7 +353,7 @@ def settings(request):
 
 ### 4.1 设置加载流程
 
-文件：[settings.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src-ui/src/app/services/settings.service.ts)
+文件：[src-ui/src/app/services/settings.service.ts](src-ui/src/app/services/settings.service.ts)
 
 **Step 1：应用初始化时从后端拉取**
 
@@ -233,7 +370,7 @@ public initializeSettings(): Observable<UiSettings> {
 }
 ```
 
-**Step 2：读取时执行最终合并（L4+系统注入 > L1）**
+**Step 2：读取时执行最终合并（后端返回值 > L1）**
 
 ```typescript
 get(key: string): any {
@@ -241,7 +378,7 @@ get(key: string): any {
     let setting = SETTINGS.find((s) => s.key == key)
     if (!setting) return undefined
 
-    // 从后端返回的合并结果中取值（L4 + 系统注入）
+    // 从后端返回的合并结果中取值（已包含 L4 + 系统注入）
     let value = this.getSettingRawValue(key)
 
     // 特殊 case：DEFAULT_PERMS_OWNER 回退到当前用户 ID
@@ -267,7 +404,7 @@ get(key: string): any {
 
 ### 4.2 Settings 页面展示：settings.component.ts
 
-文件：[settings.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src-ui/src/app/components/admin/settings/settings.component.ts)
+文件：[src-ui/src/app/components/admin/settings/settings.component.ts](src-ui/src/app/components/admin/settings/settings.component.ts)
 
 Settings 页面通过 `SettingsService.get()` 读取每个字段的值填充表单，用户保存时调用 `storeSettings()` POST 回后端：
 
@@ -284,7 +421,7 @@ private getCurrentSettings() {
 
 ### 4.3 全局配置（Admin Config）页面：config.component.ts
 
-文件：[config.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src-ui/src/app/components/admin/config/config.component.ts)
+文件：[src-ui/src/app/components/admin/config/config.component.ts](src-ui/src/app/components/admin/config/config.component.ts)
 
 Config 页面管理 L3 `ApplicationConfiguration`，与用户偏好完全独立：
 
@@ -308,43 +445,40 @@ this.configService.saveConfig(...).subscribe(() => {
 前端读取设置 SettingsService.get(key)
         │
         ▼
-  ┌─────────────────────┐
-  │ 1. 后端 UiSettings   │ ← GET /api/ui_settings/
-  │    JSON 字段值       │
-  └─────────┬───────────┘
-            │ 有值？
-            ├─ 是 ──► 类型转换后返回
-            │
-            ▼ 否
-  ┌─────────────────────┐
-  │ 2. 后端注入的系统值  │ ← trash_delay, app_title, ai_enabled 等
-  │    （UiSettingsView  │   由后端强制注入，覆盖用户偏好同名键
-  │     .get() 中注入）  │
-  └─────────┬───────────┘
-            │ 有值？
-            ├─ 是 ──► 返回
-            │
-            ▼ 否
-  ┌─────────────────────┐
-  │ 3. 前端 SETTINGS[i]  │ ← ui-settings.ts 中的 default 字段
-  │    .default          │
-  └─────────┬───────────┘
-            │
-            ▼
-         返回默认值
+  ┌──────────────────────────────┐
+  │ 1. 后端 UiSettings JSON 字段  │ ← L4 用户偏好（每用户）
+  │    值（可能被后续注入覆盖）    │
+  └──────────────┬───────────────┘
+                 │
+                 ▼
+  ┌──────────────────────────────┐
+  │ 2. 后端强制注入的系统值        │ ← 在 UiSettingsView.get() 中赋值
+  │    （覆盖步骤 1 的同名键）      │   包括：trash_delay, app_title,
+  │                                │   ai_enabled, auditlog_enabled 等
+  └──────────────┬───────────────┘
+                 │ 有值？
+                 ├─ 是 ──► 类型转换后返回
+                 │
+                 ▼ 否
+  ┌──────────────────────────────┐
+  │ 3. 前端 SETTINGS[i].default   │ ← L1 前端硬编码默认值
+  └──────────────┬───────────────┘
+                 │
+                 ▼
+              返回默认值
 ```
 
-**后端注入值的内部优先级**（以 `ai_enabled` 为例）：
+**后端注入值的内部优先级（以 ai_enabled 为例）：**
 ```
 ai_enabled 最终值
     │
     ▼
-  AIConfig.ai_enabled
+  AIConfig.ai_enabled  ← 存在 or bug
     │
-    ├─ app_config.ai_enabled (L3 DB) 非 None? ──► 用它
+    ├─ app_config.ai_enabled (L3 DB) 为 True？ → 用它
     │
-    ▼ None
-  settings.AI_ENABLED (L2 环境变量)
+    └─ 否则 (False 或 None) → settings.AI_ENABLED (L2 环境变量)
+                          ⚠️ DB 存 False 时也会回退！
 ```
 
 ---
@@ -353,18 +487,19 @@ ai_enabled 最终值
 
 | 文件 | 作用 |
 |------|------|
-| [paperless/settings/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/paperless/settings/__init__.py) | L2 Django settings，从环境变量读取 |
-| [paperless/models.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/paperless/models.py) | L3 ApplicationConfiguration 单例模型 |
-| [paperless/config.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/paperless/config.py) | L3 > L2 合并逻辑（OcrConfig 等） |
-| [paperless/serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/paperless/serialisers.py#L212-L296) | L3 ApplicationConfigurationSerializer |
-| [documents/models.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/documents/models.py#L652-L661) | L4 UiSettings 用户偏好模型 |
-| [documents/views.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/documents/views.py#L3852-L3940) | L4 + 系统注入合并 API |
-| [documents/serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/documents/serialisers.py#L2414-L2424) | L4 UiSettingsViewSerializer |
-| [documents/context_processors.py](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src/documents/context_processors.py) | SSR 模板中的 L3>L2 合并 |
-| [src-ui/src/app/data/ui-settings.ts](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src-ui/src/app/data/ui-settings.ts) | L1 前端 SETTINGS 默认值定义 |
-| [src-ui/src/app/services/settings.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src-ui/src/app/services/settings.service.ts) | 前端设置加载、合并、持久化 |
-| [src-ui/src/app/services/config.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src-ui/src/app/services/config.service.ts) | L3 全局配置 CRUD |
-| [src-ui/src/app/data/paperless-config.ts](file:///d:/fz/0601/solo-dogfeeding/code/66-paperless-ngx/src-ui/src/app/data/paperless-config.ts) | L3 配置选项元数据（PaperlessConfigOptions） |
+| [src/paperless/settings/__init__.py](src/paperless/settings/__init__.py) | L2 Django settings，从环境变量读取 |
+| [src/paperless/settings/parsers.py](src/paperless/settings/parsers.py) | `get_bool_from_env` 等解析函数 |
+| [src/paperless/models.py](src/paperless/models.py) | L3 ApplicationConfiguration 单例模型 |
+| [src/paperless/config.py](src/paperless/config.py) | L3 > L2 合并逻辑（OcrConfig 等） |
+| [src/paperless/serialisers.py](src/paperless/serialisers.py) | L3 ApplicationConfigurationSerializer |
+| [src/documents/models.py](src/documents/models.py) | L4 UiSettings 用户偏好模型 |
+| [src/documents/views.py](src/documents/views.py) | L4 + 系统注入合并 API (`UiSettingsView`) |
+| [src/documents/serialisers.py](src/documents/serialisers.py) | L4 UiSettingsViewSerializer |
+| [src/documents/context_processors.py](src/documents/context_processors.py) | SSR 模板中的 L3>L2 合并 |
+| [src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts) | L1 前端 SETTINGS 默认值定义 |
+| [src-ui/src/app/services/settings.service.ts](src-ui/src/app/services/settings.service.ts) | 前端设置加载、合并、持久化 |
+| [src-ui/src/app/services/config.service.ts](src-ui/src/app/services/config.service.ts) | L3 全局配置 CRUD |
+| [src-ui/src/app/data/paperless-config.ts](src-ui/src/app/data/paperless-config.ts) | L3 配置选项元数据（PaperlessConfigOptions） |
 
 ---
 
@@ -377,23 +512,45 @@ ai_enabled 最终值
 | `documentListSize` | L1 前端默认 | 50 |
 | `darkModeUseSystem` | L1 前端默认 | true |
 | `ai_enabled` | L2 环境变量 `PAPERLESS_AI_ENABLED`（默认 NO） | false |
-| `app_title` | L2 `PAPERLESS_APP_TITLE`（默认 None）→ L1 前端默认 | `''` |
+| `app_title` | L2 `PAPERLESS_APP_TITLE`（默认 None） | `''` |
 | `trash_delay` | L2 `PAPERLESS_EMPTY_TRASH_DELAY`（默认 30） | 30 |
 
 ### 场景 2：管理员在 Config 页面设置了 `ai_enabled = true`
 
 | 字段 | 值来源 | 最终值 |
 |------|--------|--------|
-| `ai_enabled` | L3 DB `ApplicationConfiguration.ai_enabled = true` | true |
+| `ai_enabled` | L3 DB `ApplicationConfiguration.ai_enabled = true` | true ✅ |
 
-### 场景 3：用户在 Settings 页面设置了 `documentListSize = 20`
+### 场景 3：管理员在 Config 页面关闭条码扫描，但环境变量默认为 true
+
+| 字段 | 值来源 | 最终值 | 说明 |
+|------|--------|--------|------|
+| `barcodes_enabled` | L2 环境变量（因 `or` bug） | true ❌ | DB 的 `False` 被 `False or True = True` 覆盖 |
+
+### 场景 4：用户在 Settings 页面设置了 `documentListSize = 20`
 
 | 字段 | 值来源 | 最终值 |
 |------|--------|--------|
 | `documentListSize` | L4 DB `UiSettings.settings["general-settings"]["documentListSize"] = 20` | 20 |
 
-### 场景 4：用户 UiSettings 中误存了 `"trash_delay": 999`
+### 场景 5：用户 UiSettings JSON 中误存了 `"trash_delay": 999`
 
 | 字段 | 值来源 | 最终值 |
 |------|--------|--------|
 | `trash_delay` | 后端强制注入 L2 值，覆盖用户偏好 | 30（不会是 999） |
+
+### 场景 6：用户尝试 POST 保存 `"ai_enabled": false`
+
+| 阶段 | 值 |
+|------|-----|
+| POST 存入 DB | `UiSettings.settings["ai_enabled"] = false` ✅ 存进去了 |
+| 下次 GET 返回 | 后端注入 `ai_config.ai_enabled`，覆盖用户值 ❌ 用户设置不生效 |
+
+### 场景 7：OcrConfig.deskew 正确 vs BarcodeConfig.barcodes_enabled 错误
+
+| 配置项 | DB 值 | L2 环境变量 | 合并结果 | 是否符合预期 |
+|--------|-------|------------|---------|------------|
+| `deskew`（`is not None`） | `False` | `True` | `False` | ✅ DB 优先 |
+| `barcodes_enabled`（`or`） | `False` | `True` | `True` | ❌ 错误回退 |
+| `barcodes_enabled`（`or`） | `None` | `True` | `True` | ✅ 正常回退 |
+| `barcodes_enabled`（`or`） | `True` | `False` | `True` | ✅ DB 优先 |
