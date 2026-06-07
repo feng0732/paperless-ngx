@@ -483,17 +483,117 @@ move_original = (old_filename != instance.filename and not original_already_move
 
 ---
 
-#### 四种典型场景的精确对比
+**条件 3：MOVE_TO_TRASH（移入回收站）动作的特殊时序**
+
+这是最容易混淆的点——MOVE_TO_TRASH 在单个 Workflow 内并不是"遇到就立即删除"，而是有严格的执行顺序：
+
+[signals/handlers.py#L915-L993](src/documents/signals/handlers.py#L915-L993)：
+
+```python
+if matching.document_matches_workflow(document, workflow, trigger_type):
+    has_move_to_trash_action = False
+    for action in workflow.actions.order_by("order", "pk"):
+        if action.type == ASSIGNMENT:
+            apply_assignment_to_document(...)        # ① 修改内存对象
+        elif action.type == REMOVAL:
+            apply_removal_to_document(...)           # ② 修改内存对象
+        elif action.type == EMAIL:
+            execute_email_action(...)                # ③ 发邮件
+        elif action.type == WEBHOOK:
+            execute_webhook_action(...)              # ④ 发 HTTP 请求
+        elif action.type == PASSWORD_REMOVAL:
+            execute_password_removal_action(...)     # ⑤ 修改 PDF 文件
+        elif action.type == MOVE_TO_TRASH:
+            has_move_to_trash_action = True          # ⑥ ★ 只设标志位，不立即删除！
+
+    # ⑦ ★ 所有 action 执行完后，才 document.save()
+    document.save(update_fields=["title", "correspondent", "document_type",
+                                  "storage_path", "owner", "modified"])
+    #    └─ 触发 post_save → update_filename_and_move_files()  （此时文档还没被删！）
+
+    WorkflowRun.objects.create(...)                   # ⑧ 记录执行日志
+
+    if has_move_to_trash_action:
+        execute_move_to_trash_action(action, document, logging_group)  # ⑨ ★ 最后才软删除
+        #    └─ 调用 document.delete()（django-softdelete，只设置 deleted_at）
+```
+
+**执行顺序关键结论**：
+1. MOVE_TO_TRASH 和其他 action 在同一个 Workflow 内**共存**——先执行 ASSIGNMENT/REMOVAL 改元数据，再 `document.save()` 触发重命名，**最后**才软删除
+2. `document.save()`（步骤⑦）发生在软删除（步骤⑨）**之前**，所以只要这个 Workflow 匹配了文档，**不管有没有 MOVE_TO_TRASH，都会触发一次重命名调用**
+3. 软删除是 django-softdelete 的 `document.delete()`——**只设置 `deleted_at` 字段，不发送 post_save，也不删除磁盘文件**
+
+---
+
+**条件 4：软删除后是否继续执行后续 Workflow**
+
+软删除后，`for workflow in workflows:` 循环进入**下一个 Workflow** 时，在迭代开头会做两道检查 [handlers.py#L888-L913](src/documents/signals/handlers.py#L888-L913)：
+
+```python
+for workflow in workflows:
+    if not use_overrides:
+        try:
+            document.refresh_from_db()      # 重新从 DB 加载
+        except Document.DoesNotExist:       # 硬删除时抛异常
+            break
+        if document.is_deleted:             # 检查 deleted_at 是否非空
+            break                           # ★ 软删除后终止循环！
+```
+
+两道拦截：
+- **硬删除**（罕见）：`refresh_from_db()` 抛 `DoesNotExist` → `break`
+- **软删除**（MOVE_TO_TRASH 的默认行为）：`document.is_deleted` 为 `True` → `break`
+
+**结论**：含有 MOVE_TO_TRASH 的 Workflow 执行完毕后，**后续所有 Workflow（order 更大的）都被跳过**。这已由单元测试 [test_workflows.py#L4565-L4632](src/documents/tests/test_workflows.py#L4565-L4632) `test_multiple_workflows_trash_then_assignment` 验证：Workflow 1（order=0，MOVE_TO_TRASH）软删除后，Workflow 2（order=1，ASSIGNMENT）未执行。
+
+---
+
+**条件 5：软删除后 `bulk_update_documents` 末尾的 `post_save.send()`**
+
+即使软删除了后续 Workflow，`bulk_update_documents` 中 `document_updated.send()` 之后还有一行无条件执行的代码 [tasks.py#L265](src/documents/tasks.py#L265)：
+
+```python
+post_save.send(Document, instance=doc, created=False)
+```
+
+这会触发 `update_filename_and_move_files()`，但此时文档已被软删除。需要分析其行为：
+
+[handlers.py#L460-L582](src/documents/signals/handlers.py#L460-L582) 的早退条件中**没有检查 `is_deleted`**，所以会继续执行：
+
+```python
+with FileLock(settings.MEDIA_LOCK):
+    instance.refresh_from_db()         # ← 关键点
+    ...
+    candidate_filename = generate_filename(instance)
+    ...
+    if not move_original and not move_archive:
+        Document.objects.filter(pk=instance.pk).update(**updates)
+        return
+```
+
+这里 `refresh_from_db()` 的行为取决于 django-softdelete 的实现。由于软删除只标记 `deleted_at` 并未物理删除行，`refresh_from_db()` 通常能成功（通过 `global_objects` manager）。但即使成功：
+- 文件仍在磁盘原路径
+- 模板变量（storage_path、correspondent 等）在软删除前已经通过 MOVE_TO_TRASH 所在 Workflow 的 `document.save()` 持久化了
+- `generate_filename()` 算出的路径和 DB 中存储的**完全一致**
+- → `move_original=False, move_archive=False` → **早退**（只 update `modified` 字段，不移动文件）
+
+因此：软删除后的这次 `post_save.send()` 调用即使进入 `update_filename_and_move_files`，也会因为路径未变化而**早退空跑**。
+
+---
+
+#### 六种典型场景的精确对比（含 MOVE_TO_TRASH）
 
 | # | 场景 | `update_filename_and_move_files` 调用次数 | 真实 `shutil.move` 次数 | 触发来源 |
 |---|------|------------------------------------------|------------------------|---------|
-| A | **无任何 DOCUMENT_UPDATED Workflow 匹配** | **1 次** | 0 或 1 | 仅 `bulk_update_documents` 末尾的 `post_save.send()` |
-| B | **有 1 个 Workflow 匹配，但只含 EMAIL/WEBHOOK/MOVE_TO_TRASH（无 ASSIGNMENT/REMOVAL）** | **2 次**（1+1） | 0 或 1（两次算出来路径一样，通常第 1 次真实移动，第 2 次早退） | Workflow 内部 `save()` 1 次 + 末尾 `post_save.send()` 1 次 |
-| C | **有 1 个 Workflow 匹配，含 ASSIGNMENT，但设置的 storage_path 与批量编辑刚设的相同** | **2 次**（1+1） | 0 或 1（两次路径完全一样，批量编辑已触发变化时第 1 次移动，否则都是早退） | 同上 |
-| D | **有 1 个 Workflow 匹配，含 ASSIGNMENT 且设置了**不同的** storage_path** | **2 次**（1+1） | 0 或 1 或 2（通常第 1 次按 Workflow 新值移动，第 2 次早退） | 同上 |
-| E | **有 N 个 Workflow 同时匹配** | **N+1 次** | ≤N+1（通常只有第 1 次真实移动，后续 N 次均早退） | N 次 Workflow 内部 `save()` + 1 次末尾 `post_save.send()` |
+| A | **无任何 DOCUMENT_UPDATED Workflow 匹配** | **1 次** | 0 或 1 | 仅末尾 `post_save.send()` |
+| B | **有 1 个 Workflow 匹配，只含 EMAIL/WEBHOOK（无 MOVE_TO_TRASH/ASSIGNMENT/REMOVAL）** | **2 次**（1+1） | 0 或 1（两次路径一样，通常第 1 次真实移动，第 2 次早退） | Workflow 内部 `save()` 1 次 + 末尾 `post_save.send()` 1 次 |
+| C | **有 1 个 Workflow 匹配，只含 MOVE_TO_TRASH（无 ASSIGNMENT/REMOVAL）** | **2 次**（1+1） | 0 或 1（Workflow 的 save() 触发第 1 次，可能因批量编辑变了 storage_path 而真实移动；软删除后第 2 次早退） | Workflow 内部 `save()`（在 delete 之前）1 次 + 末尾 `post_save.send()` 1 次 |
+| D | **有 1 个 Workflow 匹配，含 ASSIGNMENT 且值不同 + MOVE_TO_TRASH** | **2 次**（1+1） | 0 或 1（ASSIGNMENT 改了 storage_path → save() 触发第 1 次真实移动；软删除后第 2 次早退） | Workflow 内部 `save()` 1 次 + 末尾 `post_save.send()` 1 次 |
+| E | **有 2 个 Workflow 匹配：Workflow 1（order=0）含 MOVE_TO_TRASH，Workflow 2（order=1）含 ASSIGNMENT** | **2 次**（1+1） | 0 或 1 | **Workflow 2 被 `is_deleted` 拦截不执行**，只有 Workflow 1 的 save() 1 次 + 末尾 `post_save.send()` 1 次 |
+| F | **有 N 个 Workflow 同时匹配且无 MOVE_TO_TRASH** | **N+1 次** | ≤N+1（通常只有第 1 次真实移动，后续 N 次均早退） | N 次 Workflow 内部 `save()` + 1 次末尾 `post_save.send()` |
 
-> 注："0 或 1"取决于批量编辑前的 storage_path 是否与当前实际路径一致——如果文档本来就已经在该 StoragePath 对应的路径下，则 `generate_filename()` 算出新旧路径相同，**即使调用了也不会真实移动文件**。
+> 注 1：场景 C/D/E 中 MOVE_TO_TRASH 触发软删除 **不发送 post_save**，所以不产生额外调用。
+> 注 2："0 或 1"取决于批量编辑前的 storage_path 是否与当前实际路径一致，以及 Workflow 的 ASSIGNMENT 是否设置了不同值——如果文档本来就已经在对应路径下，则 `generate_filename()` 算出新旧路径相同，**即使调用了也不会真实移动文件**。
 
 ---
 
@@ -555,18 +655,81 @@ bulk_update_documents → for each doc:
            └─ move_original = False → 早退
 ```
 
+**场景 C：1 个 Workflow 匹配，只含 MOVE_TO_TRASH（无 ASSIGNMENT）**
+
+```
+bulk_update_documents → for each doc:
+   document_updated.send(doc)
+      └─ run_workflows_updated
+           └─ for workflow in workflows:
+                if document_matches_workflow(...) → True  ← 命中 1 个
+                    for action in actions:
+                        if MOVE_TO_TRASH:
+                            has_move_to_trash_action = True    ← 只设标志，不立即删
+                    document.save(update_fields=[...])
+                        ↓ post_save 触发（此时文档还没被删！）
+                    post_save → update_filename_and_move_files() 调用 ×1  ★ 第 1 次
+                        ├─ 如批量编辑改了 storage_path → 路径变化 → 真实移动
+                        └─ 否则 → move_original = False → 早退
+                    WorkflowRun.objects.create(...)
+                    execute_move_to_trash_action(...)  ← document.delete() 软删除
+                                                                        ├─ 只设置 deleted_at
+                                                                        └─ 不发送 post_save！
+                ↓ 下一个 workflow 迭代开头
+                document.refresh_from_db()
+                if document.is_deleted: break          ← 终止循环，跳过后续 Workflow
+   post_save.send(Document, instance=doc)
+      └─ update_filename_and_move_files() 调用 ×1  ★ 第 2 次
+           ├─ refresh_from_db() → 成功（软删除行仍存在）
+           ├─ candidate_filename = generate_filename(doc)
+           │     ← 模板变量未变，路径与 DB 中存储的完全一致
+           └─ move_original = False → 早退空跑
+```
+
+**场景 E：2 个 Workflow 匹配，Workflow 1（order=0）含 MOVE_TO_TRASH，Workflow 2（order=1）含 ASSIGNMENT**
+
+```
+bulk_update_documents → for each doc:
+   document_updated.send(doc)
+      └─ run_workflows_updated
+           └─ for workflow in workflows:
+
+                ┌─ workflow = Workflow 1 (order=0, MOVE_TO_TRASH)
+                │   if document_matches_workflow(...) → True
+                │       has_move_to_trash_action = True
+                │       document.save(update_fields=[...])
+                │           └─ post_save → update_filename_and_move_files() 调用 ×1  ★ 第 1 次
+                │       WorkflowRun.objects.create(...)
+                │       execute_move_to_trash_action(...)  ← 软删除
+                │
+                └─ ↓ 下一个迭代（workflow = Workflow 2，order=1）
+                    document.refresh_from_db()
+                    if document.is_deleted → True
+                        break    ← ★ Workflow 2 完全被跳过！ASSIGNMENT 不执行
+
+   post_save.send(Document, instance=doc)
+      └─ update_filename_and_move_files() 调用 ×1  ★ 第 2 次（早退空跑）
+```
+
+> 单元测试 `test_multiple_workflows_trash_then_assignment` [test_workflows.py#L4565-L4632](src/documents/tests/test_workflows.py#L4565-L4632) 精确验证了此场景：Workflow 1 软删除后 Workflow 2 不执行，且软删除的 WorkflowRun 会被级联硬删除（因为 WorkflowRun 不继承 SoftDeleteModel）。
+
 ---
 
 #### 关键结论
 
 | 问题 | 精确结论 |
 |------|---------|
-| 重命名一定执行两次吗？ | **不一定**。若无 DOCUMENT_UPDATED Workflow 匹配，只执行 1 次；有 N 个 Workflow 匹配则执行 **N+1 次** |
+| 重命名一定执行两次吗？ | **不一定**。若无 DOCUMENT_UPDATED Workflow 匹配，只执行 1 次；有 N 个 Workflow 匹配且无 MOVE_TO_TRASH 则执行 **N+1 次** |
 | Workflow 只发邮件不改元数据，会不会触发 save？ | **会**——`document.save()` 放在 `if document_matches_workflow(...)` 分支末尾，**不依赖 action 类型**，即使只有 EMAIL 也会 save |
+| Workflow 含 MOVE_TO_TRASH，会不会触发 save？ | **会**——MOVE_TO_TRASH 只设标志位，`document.save()` 在所有 action 执行完之后、软删除之前执行 [handlers.py#L909-L984](src/documents/signals/handlers.py#L909-L984)，所以软删除前一定会触发一次重命名调用 |
+| MOVE_TO_TRASH 软删除会发送 post_save 吗？ | **不会**——django-softdelete 的 `document.delete()` 只设置 `deleted_at` 字段，**不触发任何 save 相关信号**，也不删除磁盘文件 |
+| 软删除后后续 Workflow 还会执行吗？ | **不会**——`for workflow in workflows` 每次迭代开头检查 `document.is_deleted`，软删除后立即 `break` 终止循环。order 更大的 Workflow（即使含 ASSIGNMENT）完全不执行 |
+| 软删除后末尾的 `post_save.send()` 还会重命名吗？ | **调用但早退**——`update_filename_and_move_files` 没有检查 `is_deleted`，但软删除后模板变量未变，`generate_filename()` 算出路径与 DB 一致 → `move_original=False` → 早退，只 update `modified` 字段 |
+| MOVE_TO_TRASH 和 ASSIGNMENT 在同一个 Workflow 中，谁先生效？ | **ASSIGNMENT 先改内存值 → save() 持久化（含重命名）→ 最后才软删除**——两个 action 在同一 Workflow 内完全共存，互不影响，软删除不回退已持久化的元数据 |
 | 调用次数 ≠ 真实移动次数？ | **是的**。只要 `generate_filename()` 算出的新路径与 DB 中旧路径相同，就会在 [handlers.py#L573-L582](src/documents/signals/handlers.py#L573-L582) 早退，只 update `modified` 字段，不执行 `shutil.move` |
 | 为什么不直接在 bulk_edit 里 `doc.save()`？ | 为了**先跑 Workflow**：让 DOCUMENT_UPDATED 触发器的 Workflow 有机会进一步修改元数据，再统一做重命名 |
 | `document_updated` 和 `post_save` 谁先执行？ | `document_updated` 先（含 Workflow + WebSocket），其内部 Workflow 的 save 可能触发若干次 post_save；全部完成后才执行 bulk_update_documents 末尾的 `post_save.send()` |
-| Workflow 能覆盖批量编辑的 StoragePath 吗？ | **可以**——如果 DOCUMENT_UPDATED Workflow 的 ASSIGNMENT 动作设置了 `assign_storage_path`，会覆盖批量编辑设置的值（多个 Workflow 匹配时 order 越靠后越晚生效） |
+| Workflow 能覆盖批量编辑的 StoragePath 吗？ | **可以**——如果 DOCUMENT_UPDATED Workflow 的 ASSIGNMENT 动作设置了 `assign_storage_path`，会覆盖批量编辑设置的值（多个 Workflow 匹配时 order 越靠后越晚生效，除非前面的 Workflow 含 MOVE_TO_TRASH 导致后续被跳过） |
 | 多次调用会不会冲突？ | 不会——每次 `update_filename_and_move_files` 都通过 `MEDIA_LOCK` 互斥，且开头 `refresh_from_db()` 从 DB 读取最新状态 |
 | 前端何时拿到通知？ | `document_updated` 的第 2 个接收者 `send_websocket_document_updated` 在 Workflow 执行完毕后发 WebSocket，**此时可能已发生第 1 次真实文件移动**，但末尾兜底的第 N+1 次调用可能还未执行（通常很快完成） |
 
