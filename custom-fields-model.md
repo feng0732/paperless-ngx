@@ -146,11 +146,27 @@ def value(self):
   - 如果以非数字开头 → 剥离前 3 字符（ISO 货币代码），剩余部分转为 Decimal
 - 用途：用于算术比较和排序（`gt`, `gte`, `lt`, `lte`, `exact`, `range`）
 
-### 3.5 序列化器保存流程
+### 3.5 序列化器保存流程（API 写入入口的真实行为）
 
-核心序列化器：[serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py#L819-L925)
+> **关键事实核对**：系统中**没有独立的 CustomFieldInstance API 端点**。
+> URL 路由 [paperless/urls.py L88](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/paperless/urls.py#L88) 仅注册了 `custom_fields`（CustomField 定义的 CRUD），不存在 `custom_field_instances` 路由。
+>
+> CustomFieldInstance 只能通过 **DocumentSerializer 的嵌套字段 `custom_fields`** 进行写入。
 
-**CustomFieldInstanceSerializer.create()** 的工作流程：
+#### 序列化器链路
+
+核心序列化器：[serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py#L989-L1258)
+
+```python
+class DocumentSerializer(OwnedObjectSerializer, NestedUpdateMixin, DynamicFieldsModelSerializer):
+    custom_fields = CustomFieldInstanceSerializer(many=True, allow_null=False, required=False)
+```
+
+`NestedUpdateMixin` 来自第三方库 `drf_writable_nested`，它会对嵌套的 `custom_fields` 数组中的每个元素自动调用 `CustomFieldInstanceSerializer.create()` 或 `.update()`。
+
+#### CustomFieldInstanceSerializer.create() 的工作流程
+
+[serialisers.py L819-L844](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py#L819-L844)
 
 ```
 1. 获取 document 和 custom_field 对象
@@ -163,6 +179,17 @@ def value(self):
        defaults={data_store_name: validated_data["value"]}
    )
 ```
+
+#### DocumentSerializer.update() 中的额外处理
+
+[serialisers.py L1130-L1210](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py#L1130-L1210)
+
+1. **DocumentLink 字段移除检测**：如果新传入的 custom_fields 中不再包含某个旧的 DOCUMENTLINK 字段，对该字段的每个目标文档调用 `bulk_edit.remove_doclink()` 清理反向链接。
+
+2. **硬删除已软删除的实例**：更新完成后执行
+   ```python
+   CustomFieldInstance.deleted_objects.filter(document=instance).delete()
+   ```
 
 ### 3.6 DocumentLink 的对称链接机制
 
@@ -753,17 +780,24 @@ def check_paths_and_prune_custom_fields(sender, instance, **kwargs):
 
 异步任务 `process_cf_select_update` 做两件事：
 
-1. **清理失效选项**：已移除的 option id 对应的实例值被置为 None
+1. **批量清理失效选项**：已移除的 option id 对应的实例值被置为 None
    ```python
    select_options = {opt["id"]: opt["label"] for opt in custom_field.extra_data.get("select_options", [])}
    custom_field.fields.exclude(value_select__in=select_options.keys()).update(value_select=None)
    ```
+   > **事实核对**：此处使用的是 Django ORM 的 `.update()` 方法，它直接执行 SQL `UPDATE`，**不触发 post_save 信号**。
+   > 这意味着：
+   > - 不会触发 `update_filename_and_move_files`（被清理为 None 的实例不会触发文件名更新）
+   > - **不会触发搜索索引更新**（搜索索引也依赖信号链）
 
-2. **触发文件名更新**：如果文件名模板使用了该自定义字段，重新生成文件名
+2. **逐个触发文件名更新**：遍历所有有该字段的文档，手动调用 `update_filename_and_move_files`
    ```python
    for cf_instance in custom_field.fields.select_related("document").iterator():
        update_filename_and_move_files(CustomFieldInstance, cf_instance)
    ```
+   > **事实核对**：这个 `for` 循环遍历**所有**有该字段的实例（包括值未被清理的），手动传入 `sender=CustomFieldInstance`。
+   > `update_filename_and_move_files` 内部会检查模板是否使用了 `custom_fields`，如未使用则直接 return。
+   > 这个循环**不会触发搜索索引更新**，因为它只处理文件名逻辑，不会发送 `document_updated` 信号。
 
 #### update_filename_and_move_files：文件名联动
 
@@ -791,18 +825,20 @@ def update_filename_and_move_files(sender, instance, **kwargs):
 
 | 保存路径 | 是否经过 CustomFieldInstanceSerializer 验证 | 是否处理 DocumentLink 对称链接 | 值为 None 时行为 |
 |----------|------------------------------------------|-----------------------------|------------------|
-| **API 单实例**（CustomFieldInstanceViewSet） | ✅ 完整验证（URL、整数范围、货币格式、SELECT id 合法性、DocumentLink 权限等） | ✅ `reflect_doclinks` / `remove_doclink` | 清空该字段值 |
-| **API 文档更新**（DocumentSerializer.custom_fields） | ✅ 内部调用 CustomFieldInstanceSerializer | ✅ | 清空该字段值 |
+| **API 文档更新**（DocumentSerializer.custom_fields 嵌套字段） | ✅ 内部调用 CustomFieldInstanceSerializer，完整验证 | ✅ `reflect_doclinks`（create 时） + `remove_doclink`（移除 DOCUMENTLINK 字段时） | 清空该字段值 |
 | **批量编辑**（bulk_edit.modify_custom_fields） | ❌ 无验证 | ✅ `reflect_doclinks`（仅 add） | 清值或创建空实例 |
-| **API 上传→ConsumerPlugin** | ❌ 无验证 | ❌ | 创建值为 None 的实例 |
+| **API 上传→ConsumerPlugin.apply_overrides** | ❌ 无验证 | ❌ | 创建值为 None 的实例 |
 | **工作流 apply_assignment_to_document** | ❌ 无验证 | ❌ | 不更新已有实例（静默跳过） |
 | **工作流 apply_removal_to_document** | N/A（删除） | ❌ | hard_delete |
 | **document_importer 导入** | ❌ 无验证，信任导出数据 | ❌ | 按导出值原样写入 |
 | **SELECT 定义变更→process_cf_select_update** | ❌ 只清理失效选项 id | N/A | 失效选项置为 None |
 
+> **事实核对**：不存在独立的 "CustomFieldInstanceViewSet"。API 路由 [paperless/urls.py L88](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/paperless/urls.py#L88) 仅注册 `custom_fields`（CustomField 定义 CRUD）。
+> CustomFieldInstance 只能通过 DocumentSerializer 的嵌套 `custom_fields` 字段写入，由第三方库 `drf_writable_nested.NestedUpdateMixin` 调度。
+
 #### 验证缺失的影响与风险
 
-1. **DocumentLink 不对称**：通过消费者/工作流写入的文档链接不会自动创建反向链接。只有 API 单实例/文档更新和批量编辑路径会调用 `reflect_doclinks()`。
+1. **DocumentLink 不对称**：通过消费者/工作流写入的文档链接不会自动创建反向链接。只有 API 文档更新和批量编辑路径会调用 `reflect_doclinks()`。
    - 修复方式：在这些路径手动调用，或接受「非 API 路径产生的链接是单向的」。
 
 2. **非法值可落库**：消费者和工作流路径没有类型检查。如果工作流配置了非法的日期字符串或超出 int4 范围的整数，会触发数据库层 IntegrityError 或静默产生脏数据。
@@ -812,30 +848,49 @@ def update_filename_and_move_files(sender, instance, **kwargs):
 
 ### 9.2 保存与搜索索引的关系
 
-搜索索引的更新依赖 Django 信号，不依赖具体保存路径。
+搜索索引的更新**不完全依赖信号**，部分路径通过手动调用后端 API 完成。
 
-#### add_to_index 信号
+#### 信号连接的真实情况
 
-[signals/handlers.py L794-L800](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/signals/handlers.py#L794-L800)
+[apps.py L10-L37](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/apps.py#L10-L37)
 
-`document_consumption_finished` 和 `document_updated` 信号触发 `add_to_index()`，调用搜索后端的 `add_or_update()`。
+```python
+document_consumption_finished.connect(add_to_index)       # ✅ 首次消费连接
+document_consumption_finished.connect(run_workflows_added)
+document_updated.connect(run_workflows_updated)
+document_updated.connect(send_websocket_document_updated)
+# ⚠️ 注意：document_updated 没有连接 add_to_index！
+```
 
-搜索后端遍历 `document.custom_fields.all()`，使用 `value_for_search` 属性将值转为字符串后写入 Tantivy 索引（见 5.1 节）。
+> **事实核对**：只有 `document_consumption_finished` 信号连接了 `add_to_index`。
+> `document_updated` 信号**不触发搜索索引更新**，它只触发工作流和 Websocket。
+> 非首次消费的场景必须**手动调用**搜索后端 API。
 
-#### 各路径的索引触发情况
+#### 各路径的索引触发真实情况
 
 | 保存路径 | 触发搜索重索引的方式 |
 |----------|-------------------|
-| API 单实例保存/删除 | Document.post_save → document_updated 信号 |
-| API 文档更新 | Document.post_save → document_updated 信号 |
-| 批量编辑 | bulk_update_documents 完成后手动发送 document_updated |
-| API 上传→ConsumerPlugin | `document_consumption_finished` 信号 |
-| 工作流（DOCUMENT_ADDED/UPDATED） | 触发 Document.save() → document_updated 信号 |
-| 工作流（CONSUMPTION） | 最终由 ConsumerPlugin 触发 document_consumption_finished |
-| document_importer 导入 | ⚠️ **禁用信号**，导入后需手动调用 `document_index` 命令重建索引 |
-| SELECT 定义变更 | 触发 CustomFieldInstance 的 post_save → update_filename_and_move_files，但**不会触发 Document 的 document_updated** |
+| **API 文档更新**（PUT/PATCH） | views.py DocumentViewSet.update() **手动调用** `get_backend().add_or_update(refreshed_doc)`（L1174-L1176） |
+| **批量编辑**（bulk_edit API） | tasks.py `bulk_update_documents` **手动批量调用** `batch.add_or_update(doc)`（L267-L269） |
+| **API 上传→首次消费** | `document_consumption_finished` 信号 → `add_to_index` |
+| **消费者添加新版本**（已有 root_document） | consumer.py L732 发送 `document_updated` 信号，但该信号不连接 add_to_index；**无手动调用**，可能导致新版本下 custom_fields 变更未反映到索引 |
+| **工作流（DOCUMENT_ADDED）** | 首次消费路径，由 `document_consumption_finished` → `add_to_index` 覆盖 |
+| **工作流（DOCUMENT_UPDATED）** | `document_updated` 信号 → 不连接 add_to_index；工作流 mutation 直接 save CustomFieldInstance，**无索引更新** |
+| **工作流（CONSUMPTION）** | 最终由 ConsumerPlugin 触发 `document_consumption_finished` 覆盖 |
+| **document_importer 导入** | ⚠️ **禁用所有信号**，导入后需手动调用 `document_index` 命令重建索引 |
+| **SELECT 定义变更→process_cf_select_update** | `.update(value_select=None)` 是批量 SQL，不触发任何信号；**完全无索引更新**。for 循环只调用文件名更新函数，不更新搜索索引 |
 
-**注意**：`process_cf_select_update` 虽然修改了 CustomFieldInstance 的值（`value_select=None`），但它触发的是 CustomFieldInstance 的 post_save，而搜索索引依赖 Document 级别的信号。因此 SELECT 字段 option 被删除后，已有文档的搜索索引可能还残留旧的 label 值，需要手动重建索引或等待下次文档更新。
+搜索后端遍历 `document.custom_fields.all()`，使用 `value_for_search` 属性将值转为字符串后写入 Tantivy 索引（见 5.1 节）。
+
+#### 索引与数据库不一致的场景
+
+以下场景可能导致搜索索引残留旧的 Custom Fields 值：
+
+1. **SELECT 字段 option 被删除**：`process_cf_select_update` 批量更新数据库，但不更新索引
+2. **工作流修改 Custom Fields（DOCUMENT_UPDATED 触发）**：实例被 save，但索引不更新
+3. **消费者添加新版本**：如果新版本路径改变了 custom_fields（理论上不会，因为版本是同一文档的不同文件），索引不会同步
+
+修复方式：调用 `document_index` 管理命令重建索引，或手动触发一次 API 文档更新。
 
 ### 9.3 保存与前端展示的关系
 
@@ -856,38 +911,76 @@ def update_filename_and_move_files(sender, instance, **kwargs):
    - document_importer 导入时禁用了该信号，导入后文件名可能与模板不匹配，需要手动 `renaming_suggestions` 或重新触发
 
 4. **Websocket 通知**：
-   - API 更新文档后，`send_websocket_document_updated` 会使用 `DocumentMetadataOverrides.from_document()` 提取当前 custom_fields 值，推送给前端
-   - 工作流修改 Document 后触发的 Document.save() 也会走同样路径
-   - 消费者路径在 `document_consumption_finished` 后同样会通知
 
-### 9.4 全景关系图
+   > **事实核对**：Websocket `document_updated` 消息的 payload **完全不包含 custom_fields 值**。
+   > 它只是一个轻量通知，告知前端"该文档有更新，请重新拉取"。
+
+   Websocket payload 定义：[plugins/helpers.py L163-L181](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/plugins/helpers.py#L163-L181)
+
+   ```python
+   payload = {
+       "type": "document_updated",
+       "data": {
+           "document_id": document_id,
+           "modified": modified,
+           "owner_id": owner_id,             # 权限相关
+           "users_can_view": [...],          # 权限相关
+           "groups_can_view": [...],         # 权限相关
+       },
+   }
+   ```
+
+   `DocumentMetadataOverrides.from_document(document)` 在 handler 中确实提取了 `custom_fields`，但该值**未被发送到 Websocket**，仅 `owner_id`、`view_users`、`view_groups` 被使用。
+
+   Websocket 通知的触发点：
+   - API 文档更新：views.py `DocumentViewSet.update()` 发送 `document_updated` 信号
+   - 批量编辑：tasks.py `bulk_update_documents` 对每个文档发送信号
+   - 消费者添加新版本：consumer.py L732 对 root_document 发送信号
+   - 删除版本 / 更新版本标签等：views.py 其他位置
+   - **注意**：首次消费完成（`document_consumption_finished`）不触发 `document_updated`，而是通过 `_send_progress(SUCCESS, document_id=...)` 通知前端
+
+### 9.4 全景关系图（经代码事实核对）
 
 ```
-                    ┌────────────────────────────────────────────┐
-                    │          保存入口（四条路径）                │
-                    └────────────────────────────────────────────┘
+                    ┌──────────────────────────────────────────────┐
+                    │           保存入口（四条路径）                  │
+                    └──────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┼────────────────┐
+                    ▼               ▼                ▼
+            ┌───────────┐   ┌──────────────┐   ┌────────────┐
+            │序列化器验证│   │  直接ORM     │   │ bulk导入   │
+            │(仅API文档) │   │(工作流/消费者)│   │ (无验证)   │
+            └─────┬─────┘   └──────┬───────┘   └─────┬──────┘
+                  │                │                  │
+                  └────────────────┼──────────────────┘
+                                   ▼
+                    ┌────────────────────────────────┐
+                    │     CustomFieldInstance 落库      │
+                    └────────────────┬───────────────┘
+                                     │
+                    ┌────────────────┼────────────────┐
+                    ▼                ▼                ▼
+           ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+           │CustomField   │  │ 搜索索引更新  │  │ 前端展示     │
+           │post_save信号 │  │ (手动调用/   │  │ (读时处理)    │
+           │→ 文件重命名   │  │  仅首次消费走 │  │ SELECT id    │
+           │              │  │   信号)      │  │  → label     │
+           └──────────────┘  └──────┬───────┘  └──────────────┘
                                     │
                     ┌───────────────┼───────────────┐
                     ▼               ▼               ▼
-            ┌───────────┐   ┌───────────┐   ┌───────────┐
-            │序列化器验证│   │  直接ORM  │   │ bulk导入  │
-            │ (仅API)   │   │(工作流/消费)│   │(无验证)   │
-            └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
-                  │               │               │
-                  └───────────────┼───────────────┘
-                                  ▼
-                    ┌──────────────────────────────┐
-                    │   CustomFieldInstance 落库     │
-                    └───────────────┬──────────────┘
-                                    │
-                    ┌───────────────┼───────────────┐
-                    ▼               ▼               ▼
-            ┌───────────┐   ┌───────────┐   ┌───────────┐
-            │post_save  │   │搜索索引   │   │前端展示   │
-            │信号触发   │──▶│add_to_index│  │(读时处理) │
-            │文件重命名 │   │(需信号)   │   │id→label   │
-            └───────────┘   └───────────┘   └───────────┘
+            document_        document_          API 更新时
+            consumption_      updated 信号       手动调用
+            finished信号     → 工作流 + Websocket  get_backend()
+            → add_to_index   (不触发索引更新)    .add_or_update()
 ```
+
+**关键事实**：
+1. 搜索索引更新与信号是松耦合的：只有首次消费走信号链，其余路径需手动调用后端 API
+2. `document_updated` 信号只触发工作流（DOCUMENT_UPDATED）和 Websocket 通知，不触发索引
+3. Websocket payload 不含 custom_fields 数据，仅通知前端重新拉取
+4. `process_cf_select_update` 的 `.update()` 批量操作不触发任何信号
 
 ---
 
@@ -901,11 +994,14 @@ def update_filename_and_move_files(sender, instance, **kwargs):
 | 过滤器 + 查询解析器 | [src/documents/filters.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/filters.py) |
 | 批量编辑 + DocLink 对称处理 | [src/documents/bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/bulk_edit.py) |
 | 消费者主流程（落库逻辑） | [src/documents/consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/consumer.py) |
-| Celery 任务调度（consume_file） | [src/documents/tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/tasks.py) |
+| Celery 任务调度（consume_file / bulk_update_documents） | [src/documents/tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/tasks.py) |
 | 工作流分配/移除 mutations | [src/documents/workflows/mutations.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/mutations.py) |
 | 工作流执行上下文/actions | [src/documents/workflows/actions.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/actions.py) |
 | 工作流工具（Prefetch/annotate） | [src/documents/workflows/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/utils.py) |
 | 信号处理（工作流、索引、文件名） | [src/documents/signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/signals/handlers.py) |
+| **信号连接配置**（apps.ready） | [src/documents/apps.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/apps.py) |
+| **Websocket StatusManager** | [src/documents/plugins/helpers.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/plugins/helpers.py) |
+| **API URL 路由注册** | [src/paperless/urls.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/paperless/urls.py) |
 | 文档导入命令 | [src/documents/management/commands/document_importer.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/management/commands/document_importer.py) |
 | 文档导出命令 | [src/documents/management/commands/document_exporter.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/management/commands/document_exporter.py) |
 | URL 验证器 | [src/documents/validators.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/validators.py) |
