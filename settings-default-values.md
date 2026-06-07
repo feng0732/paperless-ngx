@@ -6,12 +6,12 @@
 
 ## 一、四层设置体系概览
 
-Paperless-ngx 的设置系统由四个主层级 + 一个前端兜底层级构成，自底向上依次为：
+Paperless-ngx 的设置系统由四个主层级 + 一个前端兜底机制构成，自底向上依次为：
 
 | 层级 | 存储位置 | 作用域 | 典型字段 |
 |------|---------|--------|---------|
 | **L1** 前端 SETTINGS 硬编码默认值 | 前端 `ui-settings.ts` 的 `SETTINGS` 数组 | 所有用户 | `documentListSize` 默认 50、`darkModeUseSystem` 默认 true |
-| **L1b** 前端 environment 兜底值 | 前端 `environment.ts` | 所有用户 | `appTitle: 'Paperless-ngx'`（仅 app_title/app_logo 字段） |
+| **L1b** 前端组件级兜底（非 SETTINGS 默认值） | 各组件内联逻辑 / `environment.ts` | 所有用户 | `appTitle: 'Paperless-ngx'`（仅 app_title）；`app_logo` 显示内置 SVG |
 | **L2** Django 环境变量/配置文件 | 后端 `paperless/settings/__init__.py` | 全局系统级 | `PAPERLESS_OCR_LANGUAGE`、`PAPERLESS_EMPTY_TRASH_DELAY` |
 | **L3** 数据库全局配置 | `ApplicationConfiguration` 单例模型 | 管理员设置的全局值 | OCR 参数、Barcode 参数、AI 开关、App Logo/Title |
 | **L4** 数据库用户偏好 | `UiSettings` 模型（每用户一条） | 单个用户 | 语言、暗色模式、列表大小、通知偏好等 |
@@ -20,7 +20,9 @@ Paperless-ngx 的设置系统由四个主层级 + 一个前端兜底层级构成
 
 > **重要例外**：
 > 1. 某些系统级字段（`app_title`、`ai_enabled`、`trash_delay` 等）由后端在 API 返回时**强制注入**，会覆盖用户 UiSettings（L4）中的同名键。见第三章。
-> 2. `app_title`、`app_logo` 字段的 L1 前端 SETTINGS 默认值 `''` 实际**永远不会生效**，因为后端始终返回这两个键（值为 null 时前端直接返回 null，不回退到 L1），最终兜底由 L1b `environment.appTitle = 'Paperless-ngx'` 完成。
+> 2. `app_title`、`app_logo` 字段的 L1 前端 SETTINGS 默认值 `''` 实际**永远不会生效**——因为后端始终返回这两个键（值为 null 时前端直接返回 null，不回退到 L1）。两者的兜底机制不同：
+>    - **`app_title`**：前端 `initializeSettings()` 中通过 `environment.appTitle = 'Paperless-ngx'` 兜底（仅当值非空时才覆盖）
+>    - **`app_logo`**：`LogoComponent` 判断值非空时显示 `<img>`，值为 null 时直接渲染**内置 SVG Logo**，不存在 environment 兜底变量
 
 ---
 
@@ -30,7 +32,8 @@ Paperless-ngx 的设置系统由四个主层级 + 一个前端兜底层级构成
 
 主要文件：
 - [src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts) — SETTINGS 数组
-- [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) — appTitle 兜底值
+- [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) — `appTitle` 兜底值（仅 app_title）
+- [src-ui/src/app/components/common/logo/logo.component.ts](src-ui/src/app/components/common/logo/logo.component.ts) — LogoComponent 内置 SVG 兜底（仅 app_logo）
 
 每个设置项通过 `SETTINGS` 数组定义，包含 `key`、`type`、`default`：
 
@@ -51,11 +54,23 @@ export const SETTINGS: UiSetting[] = [
     type: 'string',
     default: '',   // ⚠️ 该默认值永远不会生效（后端始终返回 app_title 键，值为 null 时直接返回 null）
   },
+  {
+    key: SETTINGS_KEYS.APP_LOGO,
+    type: 'string',
+    default: '',   // ⚠️ 该默认值永远不会生效（后端始终返回 app_logo 键，值为 null 时直接返回 null）
+  },
   // ... 约 40 个设置项
 ]
 ```
 
-**⚠️ 重要例外**：`app_title`、`app_logo` 字段在 SETTINGS 中虽然定义了 `default: ''`，但由于后端 `UiSettingsView.get()` 始终向响应中注入这两个键（即使值为 `null`），前端 `get()` 方法只会在 `value === undefined` 时才回退到默认值，而 `null` 直接返回 `null`，因此这两个字段的 SETTINGS 默认值**永远不会被触发**。前端实际兜底由 `environment.appTitle = 'Paperless-ngx'` 完成。
+**`app_title` 与 `app_logo` 的兜底机制差异（重要）：**
+
+两个字段在 SETTINGS 中虽然定义了 `default: ''`，但由于后端 `UiSettingsView.get()` 始终向响应中注入这两个键（即使值为 `null`），前端 `get()` 方法只会在 `value === undefined` 时才回退到默认值，而 `null` 直接返回 `null`，因此这两个字段的 SETTINGS 默认值**永远不会被触发**。两者的兜底机制完全不同：
+
+| 字段 | SettingsService.get() 返回 | 前端兜底位置 | 兜底值 |
+|------|--------------------------|------------|--------|
+| `app_title` | `null` | `settings.service.ts` 的 `initializeSettings()` | `environment.appTitle = 'Paperless-ngx'` |
+| `app_logo` | `null` | `LogoComponent.customLogo` getter | 值为 null/falsy 时渲染**内置 SVG Logo**（无字符串兜底） |
 
 ### 2.2 L2：Django 环境变量与代码默认值
 
@@ -294,9 +309,11 @@ def get(self, request, format=None):
 后端覆盖逻辑：
 ```
 用户 UiSettings["app_title"]
-    ↓ 被后端覆盖
+    | 被后端覆盖
+    v
 settings.APP_TITLE (L2)
-    ↓ 若 L3 有值则再次被覆盖
+    | 若 L3 有值则再次被覆盖
+    v
 GeneralConfig.app_title (L3)
 ```
 
@@ -388,12 +405,89 @@ if (this.get(SETTINGS_KEYS.APP_TITLE)?.length) {
 | L3/L2 均未设置 + 前端显示 | `'Paperless-ngx'` | 来自 `environment.appTitle` 默认值（前端兜底） |
 | L3/L2 均未设置 + SettingsService.get() 返回 | `null` | API 返回 JSON null，不触发前端 SETTINGS 默认值 `''` |
 
-##### (2) `ai_enabled` —— AI 开关
+##### (2) `app_logo` —— 应用 Logo
+
+后端覆盖逻辑与 `app_title` 一致：
+```
+用户 UiSettings["app_logo"]
+    | 被后端覆盖
+    v
+settings.APP_LOGO (L2，默认 None)
+    | 若 L3 有值则再次被覆盖
+    v
+GeneralConfig.app_logo (L3，FileField 的 .url 路径)
+```
+
+`GeneralConfig` 内部合并（注意 FileField 特殊处理）：
+```python
+# GeneralConfig.__post_init__
+self.app_logo = app_config.app_logo.url if app_config.app_logo else None
+# L3 DB 存了文件 → 返回 URL 字符串（如 "/logo/custom.png"）
+# L3 DB 未存文件 → 返回 None
+```
+
+然后在 `UiSettingsView.get()` 中：
+```python
+ui_settings["app_logo"] = settings.APP_LOGO  # settings.APP_LOGO 默认值是 None
+if general_config.app_logo is not None and len(general_config.app_logo) > 0:
+    ui_settings["app_logo"] = general_config.app_logo
+```
+
+**后端最终优先级：L3 DB (非空) > L2 环境变量 > 用户 UiSettings**
+
+**后端返回值的三种可能：**
+
+| L3 DB | L2 环境变量 | 后端 API 返回值（JSON） |
+|--------|-------------|------------------------|
+| 已上传文件 | 任意 | `"/logo/filename.png"`（FileField 的 URL 字符串） |
+| 未上传 | `"/logo/custom.png"` | `"/logo/custom.png"` |
+| 未上传 | 未设置 | `null` |
+
+**前端兜底：LogoComponent 内置 SVG，无 environment 兜底**
+
+与 `app_title` 不同，`app_logo` **没有** `environment.appLogo` 之类的兜底变量。Logo 组件通过 getter 直接判断：
+
+```typescript
+// logo.component.ts
+get customLogo(): string {
+  return this.settingsService.get(SETTINGS_KEYS.APP_LOGO)?.length
+    ? environment.apiBaseUrl.replace(
+        /\/api\/$/,
+        this.settingsService.get(SETTINGS_KEYS.APP_LOGO)
+      )
+    : null   // ← null 或空字符串时返回 null
+}
+```
+
+模板逻辑：
+```html
+<!-- logo.component.html -->
+@if (customLogo) {
+    <img src="{{customLogo}}" ... />  <!-- 自定义 logo -->
+} @else {
+    <svg ...>  <!-- 内置 Paperless-ngx SVG Logo -->
+    </svg>
+}
+```
+
+**`app_logo` 完整路径总结：**
+
+| 层级 | 值 | 说明 |
+|------|-----|------|
+| L3 DB 已上传文件 | URL 字符串 | 拼接 `apiBaseUrl` 后显示 `<img>` |
+| L2 环境变量非空 | 字符串 | 拼接 `apiBaseUrl` 后显示 `<img>` |
+| L3/L2 均未设置 + 页面显示 | 内置 SVG | `LogoComponent` 直接渲染内联 SVG，无字符串兜底 |
+| L3/L2 均未设置 + SettingsService.get() 返回 | `null` | API 返回 JSON null，不触发前端 SETTINGS 默认值 `''` |
+
+> **注意**：`app_title` 和 `app_logo` 的前端兜底机制完全独立——`app_title` 通过 `environment.appTitle` 提供字符串兜底，`app_logo` 通过组件内置 SVG 提供图形兜底，两者互不相关。
+
+##### (3) `ai_enabled` —— AI 开关
 
 覆盖逻辑：
 ```
 用户 UiSettings["ai_enabled"]
-    ↓ 被后端覆盖
+    | 被后端覆盖
+    v
 AIConfig.ai_enabled (L3 > L2 合并)
 ```
 
@@ -403,9 +497,9 @@ AIConfig.ai_enabled = app_config.ai_enabled or settings.AI_ENABLED
 ```
 
 **最终优先级：(L3 DB if True else L2 环境变量) > 用户 UiSettings**
-⚠️ 当 L3 DB 存 `False` 且 L2 为 `True` 时，错误地返回 L2 的 `True`。
+注意：当 L3 DB 存 `False` 且 L2 为 `True` 时，错误地返回 L2 的 `True`。
 
-##### (3) `trash_delay` —— 回收站延迟天数
+##### (4) `trash_delay` —— 回收站延迟天数
 
 覆盖逻辑最简单：
 ```python
@@ -472,7 +566,7 @@ get(key: string): any {
     }
 
     if (value !== undefined) {
-        // ⚠️ null 直接返回 null，不回退到默认值！
+        // 注意：null 直接返回 null，不回退到默认值！
         if (value === null) return null
         switch (setting.type) {
             case 'boolean': return JSON.parse(value)
@@ -538,65 +632,78 @@ this.configService.saveConfig(...).subscribe(() => {
 
 ```
 前端读取设置 SettingsService.get(key)
-        │
-        ▼
-  ┌───────────────────────────────────┐
-  │ 1. 后端 UiSettings JSON 字段值     │ ← L4 用户偏好（每用户）
-  │    （可能被后续注入覆盖）           │
-  └──────────────┬────────────────────┘
-                 │
-                 ▼
-  ┌───────────────────────────────────┐
-  │ 2. 后端强制注入的系统值             │ ← 在 UiSettingsView.get() 中赋值
-  │    （覆盖步骤 1 的同名键）           │   包括：trash_delay, app_title,
-  │                                     │   ai_enabled, auditlog_enabled 等
-  └──────────────┬────────────────────┘
-                 │
-                 ├─ 后端返回键存在且值非 null → 类型转换后返回
-                 │
-                 ├─ 后端返回键存在且值为 null → 直接返回 null ❗
-                 │    （不回退到前端默认值）  │
-                 │
-                 ▼ 后端完全不返回该键（undefined）
-  ┌───────────────────────────────────┐
-  │ 3. 前端 SETTINGS[i].default        │ ← L1 前端硬编码默认值
-  └──────────────┬────────────────────┘
-                 │
-                 ▼
+        |
+        v
+  +-----------------------------------+
+  | 1. 后端 UiSettings JSON 字段值     | <-- L4 用户偏好（每用户）
+  |    （可能被后续注入覆盖）           |
+  +--------------+--------------------+
+                 |
+                 v
+  +-----------------------------------+
+  | 2. 后端强制注入的系统值             | <-- 在 UiSettingsView.get() 中赋值
+  |    （覆盖步骤 1 的同名键）           |   包括：trash_delay, app_title,
+  |                                     |   ai_enabled, auditlog_enabled 等
+  +--------------+--------------------+
+                 |
+                 +-- 后端返回键存在且值非 null --> 类型转换后返回
+                 |
+                 +-- 后端返回键存在且值为 null --> 直接返回 null
+                 |    （不回退到前端默认值）
+                 |
+                 v  后端完全不返回该键（undefined）
+  +-----------------------------------+
+  | 3. 前端 SETTINGS[i].default        | <-- L1 前端硬编码默认值
+  +--------------+--------------------+
+                 |
+                 v
               返回默认值
 ```
 
-**`null` vs `undefined` 关键边界（以 app_title 为例）：**
+**`null` vs `undefined` 关键边界（app_title 与 app_logo 对比）：**
 
+**app_title 路径：**
 ```
 后端返回 {"settings": {"app_title": null, ...}}
-        │
-        ▼
-  this.settings['app_title'] = null   ← assignSafeSettings 存入
-        │
-        ▼
-  getSettingRawValue() 返回 null      ← hasOwnProperty 判断键存在
-        │
-        ▼
-  get() 返回 null                     ← value === null，直接返回
-        │                             （不回退到 SETTINGS[i].default = ''）
-        ▼
-  initializeSettings() 中：
-  null?.length → undefined（falsy）
-  → environment.appTitle 保持 'Paperless-ngx'  ← L1b 兜底
+        |
+        v
+  SettingsService.get() 返回 null
+        |
+        v
+  initializeSettings() 中判断：
+  null?.length -> undefined (falsy)
+  -> environment.appTitle 保持 'Paperless-ngx'  (L1b 字符串兜底)
 ```
+
+**app_logo 路径：**
+```
+后端返回 {"settings": {"app_logo": null, ...}}
+        |
+        v
+  SettingsService.get() 返回 null
+        |
+        v
+  LogoComponent.customLogo getter 判断：
+  null?.length -> undefined (falsy)
+  -> customLogo = null
+  -> 模板 @else 分支渲染 <svg> 内置 Paperless-ngx Logo
+     (L1b 组件级 SVG 兜底，无 environment 变量)
+```
+
+> 两者共同点：`SettingsService.get()` 都返回 `null`，SETTINGS 中的 `default: ''` 永远不会被触发。
+> 两者不同点：兜底机制完全独立——`app_title` 用 `environment.appTitle` 字符串兜底，`app_logo` 用组件内置 SVG 兜底，两者互不相关。
 
 **后端注入值的内部优先级（以 ai_enabled 为例）：**
 ```
 ai_enabled 最终值
-    │
-    ▼
-  AIConfig.ai_enabled  ← 存在 or bug
-    │
-    ├─ app_config.ai_enabled (L3 DB) 为 True？ → 用它
-    │
-    └─ 否则 (False 或 None) → settings.AI_ENABLED (L2 环境变量)
-                          ⚠️ DB 存 False 时也会回退！
+    |
+    v
+  AIConfig.ai_enabled  <-- 存在 or bug
+    |
+    +-- app_config.ai_enabled (L3 DB) 为 True? --> 用它
+    |
+    +-- 否则 (False 或 None) --> settings.AI_ENABLED (L2 环境变量)
+                          注意：DB 存 False 时也会错误回退！
 ```
 
 ---
@@ -615,7 +722,8 @@ ai_enabled 最终值
 | [src/documents/serialisers.py](src/documents/serialisers.py) | L4 UiSettingsViewSerializer |
 | [src/documents/context_processors.py](src/documents/context_processors.py) | SSR 模板中的 L3>L2 合并 |
 | [src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts) | L1 前端 SETTINGS 默认值定义 |
-| [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) | 前端兜底默认值（`appTitle: 'Paperless-ngx'`） |
+| [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) | 前端兜底默认值（仅 `appTitle: 'Paperless-ngx'`，不含 app_logo） |
+| [src-ui/src/app/components/common/logo/logo.component.ts](src-ui/src/app/components/common/logo/logo.component.ts) | LogoComponent：app_logo 为 null 时渲染内置 SVG |
 | [src-ui/src/app/services/settings.service.ts](src-ui/src/app/services/settings.service.ts) | 前端设置加载、合并、持久化 |
 | [src-ui/src/app/services/config.service.ts](src-ui/src/app/services/config.service.ts) | L3 全局配置 CRUD |
 | [src-ui/src/app/data/paperless-config.ts](src-ui/src/app/data/paperless-config.ts) | L3 配置选项元数据（PaperlessConfigOptions） |
@@ -624,7 +732,7 @@ ai_enabled 最终值
 
 ## 七、典型场景示例
 
-### 场景 1：用户从未设置任何偏好，L3/L2 均未配置 app_title
+### 场景 1：用户从未设置任何偏好，L3/L2 均未配置 app_title 和 app_logo
 
 | 字段 | 值来源 | 最终值 |
 |------|--------|--------|
@@ -632,17 +740,21 @@ ai_enabled 最终值
 | `darkModeUseSystem` | L1 前端默认 | true |
 | `ai_enabled` | L2 环境变量 `PAPERLESS_AI_ENABLED`（默认 NO） | false |
 | `app_title`（SettingsService.get() 返回） | 后端 API 返回 JSON `null`，前端不回退到 `''` | `null` |
-| `app_title`（页面实际显示） | `environment.appTitle` 默认值（前端兜底） | `'Paperless-ngx'` |
+| `app_title`（页面实际显示） | `environment.appTitle` 默认值（前端字符串兜底） | `'Paperless-ngx'` |
+| `app_logo`（SettingsService.get() 返回） | 后端 API 返回 JSON `null`，前端不回退到 `''` | `null` |
+| `app_logo`（页面实际显示） | `LogoComponent` 值为 null/falsy（无 environment 兜底） | 渲染**内置 SVG Logo** |
 | `trash_delay` | L2 `PAPERLESS_EMPTY_TRASH_DELAY`（默认 30） | 30 |
 
 ### 场景 1b：`null` vs `undefined` 边界（SettingsService.get() 行为差异）
 
+适用于 `app_title` 和 `app_logo`，两者处理逻辑完全一致：
+
 | 后端返回 JSON | `this.settings` 中存储值 | `getSettingRawValue()` 返回 | `get()` 最终返回 | 是否触发前端 SETTINGS 默认值 |
 |--------------|------------------------|---------------------------|-----------------|--------------------------|
-| `{"app_title": null}` | `this.settings['app_title'] = null` | `null`（键存在） | `null` | ❌ 不触发（返回 null，不是 `''`） |
-| （后端根本不返回 `app_title` 键） | `this.settings` 无 `app_title` 键 | `undefined`（键不存在） | `''` | ✅ 触发 `SETTINGS[i].default` |
+| `{"app_title": null}` / `{"app_logo": null}` | 键存在，值为 `null` | `null`（键存在） | `null` | ❌ 不触发（返回 null，不是 `''`） |
+| 后端根本不返回该键 | `this.settings` 无该键 | `undefined`（键不存在） | `''` | ✅ 触发 `SETTINGS[i].default` |
 
-> 实际情况中，后端 UiSettingsView.get() 始终设置 `ui_settings["app_title"]`，所以总是属于第一种情况，前端默认值 `''` **永远不会被触发**。
+> 实际情况中，后端 `UiSettingsView.get()` 始终设置 `ui_settings["app_title"]` 和 `ui_settings["app_logo"]`，所以总是属于第一种情况，前端 SETTINGS 默认值 `''` **永远不会被触发**。
 
 ### 场景 2：管理员在 Config 页面设置了 `ai_enabled = true`
 
