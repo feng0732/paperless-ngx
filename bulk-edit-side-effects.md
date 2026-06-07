@@ -1,362 +1,549 @@
 # Bulk Edit 与任务副作用协作机制分析
 
-本文档梳理 Paperless-ngx 中批量编辑（Bulk Edit）的协作逻辑，包括：元数据变更 → 后台任务调度 → 副作用执行 → 部分失败边界处理的完整链路。
+本文档精确梳理 Paperless-ngx 中批量编辑（Bulk Edit）的协作逻辑：元数据变更 → 后台任务调度 → 副作用执行 → 部分失败边界，重点纠正事务边界、异常冒泡、重试策略与已生效副作用之间的真实关系。
 
 ---
 
 ## 一、整体架构分层
 
 ```
-API 入口层           核心逻辑层          异步任务层        信号副作用层
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│  Views.py    │──▶│ bulk_edit.py│──▶│  tasks.py  │──▶│  handlers  │
-│ (BulkEditView, │   │ (各 edit fn) │   │ (Celery)   │   │ (signals)  │
-│  Rotate/...  )│   │            │   │            │   │            │
-└──────────────┘   └──────────────┘   └──────────────┘   └──────────────┘
-                       │                 │                 │
-                       ▼                 ▼                 ▼
-                 DB 同步写         搜索索引/工作流/WebSocket推送/文件重命名
+API 入口层           核心逻辑层              异步任务层              信号副作用层
+┌──────────────┐   ┌──────────────┐       ┌──────────────┐       ┌──────────────────┐
+│  Views.py    │──▶│ bulk_edit.py│──────▶│  tasks.py  │──────▶│  signals/      │
+│ (BulkEditView, │   │ (各 edit fn) │       │ (Celery)   │       │  handlers.py   │
+│  Rotate/...  )│   │            │       │            │       │                │
+└──────────────┘   └──────────────┘       └──────────────┘       └──────────────────┘
+                       │                      │                      │
+                       ▼                      ▼                      ▼
+              DB 同步写（多数无事务）    搜索索引/LLM索引          工作流/WebSocket/文件重命名
 ```
+
+核心事实：**请求层未开启 `ATOMIC_REQUESTS`，BulkEditView.post() 外部无事务包裹。**
 
 ---
 
 ## 二、API 入口层
 
-### 2.1 主入口：[BulkEditView](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/views.py#L2797-L2916)
+### 2.1 主入口：[BulkEditView.post()](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/views.py#L2821-L2916)
 
-`BulkEditView` 是统一的批量编辑端点。其 `post` 方法流程：
+流程：序列化校验 → 权限校验 → 审计快照 → `method(documents, **parameters)` → 审计写 LogEntry → 返回 200。
 
-1. **解析请求**：通过 [BulkEditSerializer](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/serialisers.py#L1696-L1815) 解析 `method` 字段将字符串映射到 `bulk_edit` 模块对应函数（如 `"set_correspondent"` → `bulk_edit.set_correspondent`。
-
-2. **权限校验**：`_has_document_permissions()` 根据操作类型检查 `change_document`、`delete_document`、`add_document` 等权限。
-
-3. **审计日志**：若开启 AUDIT_LOG_ENABLED，执行前快照 old_value，执行后记录 LogEntry。
-
-4. **执行方法**：`result = method(documents, **parameters)` 同步执行核心函数。
-
-5. **返回 200 OK**：无论后台任务是否完成，仅表示「已成功调度」即返回。
-
-> 关键代码 [views.py#L2864-L2911](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/views.py#L2864-L2911)
+**关键事实：外部没有 `@transaction.atomic`，settings 中也没有开启 `ATOMIC_REQUESTS`。** 所以 `method()` 内部每一条独立的 ORM 语句都是**隐式自动提交**的。如果 method 内部中途抛异常：
+- 已执行的 SQL 语句**不会回滚**
+- `bulk_update_documents.apply_async()` 如果还没执行就不会被调度
+- 异常冒泡到外层 `try/except`，返回 HTTP 400
 
 ```python
+# views.py 中的异常捕获（无外层事务）
 try:
     modified_field = self.MODIFIED_FIELD_BY_METHOD.get(method.__name__, None)
     if settings.AUDIT_LOG_ENABLED and modified_field:
         old_documents = {...}
-    result = method(documents, **parameters)   # ← 同步写 DB
+    result = method(documents, **parameters)   # ← 内部语句各自提交
     if settings.AUDIT_LOG_ENABLED and modified_field:
-        # ... 写 LogEntry
-    return Response({"result": result})      # ← 立即返回，不等异步任务
+        for doc in new_documents:
+            LogEntry.objects.log_create(...)   # ← 如果 method 抛错，这里也不会执行
+    return Response({"result": result})
 except Exception as e:
-    return HttpResponseBadRequest(...)
+    return HttpResponseBadRequest(...)          # ← 已提交的 SQL 不回滚
 ```
 
-### 2.2 其他专用端点
+### 2.2 其他专用端点（Rotate/Merge/Delete/Reprocess 等）
 
-`RotateDocumentsView`、`MergeDocumentsView`、`DeleteDocumentsView`、`ReprocessDocumentsView` 等通过 `_execute_document_action()` 调用，逻辑与 BulkEditView 相似但无审计日志逻辑。见 [views.py#L2733-L2776](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/views.py#L2733-L2776)。
+通过 `_execute_document_action()` 调用，结构相同，同样无外层事务。见 [views.py#L2733-L2776](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/views.py#L2733-L2776)。
 
 ---
 
-## 三、核心逻辑层（bulk_edit.py）
+## 三、核心逻辑层（bulk_edit.py）——精确的事务边界
 
-批量编辑按副作用触发方式分为两大类：**元数据直接修改 + bulk_update_documents 异步任务** vs **新文档生成类操作（rotate/merge/split/edit_pdf/remove_password/delete_pages）**。
+各函数内部事务情况差异极大，下面逐函数说明。
 
-### 3.1 第一类：元数据直接修改
+### 3.1 modify_tags：唯一使用 transaction.atomic() 的元数据操作
 
-这类操作**同步写入数据库**后，**异步调度 `bulk_update_documents`** 触发后续副作用。
-
-典型模式（以 `set_correspondent` 为例 [bulk_edit.py#L111-L131](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L111-L131)：
+[modify_tags](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L226-L284) 是所有元数据编辑中**唯一**使用 `transaction.atomic()` 的函数：
 
 ```python
-def set_correspondent(doc_ids: list[int], correspondent: Correspondent):
-    # 1. 过滤出实际需要修改的文档
-    qs = Document.objects.filter(
-        Q(id__in=doc_ids) & ~Q(correspondent=correspondent)
-    )
-    affected_docs = list(qs.values_list("pk", flat=True))
-
-    # 2. 同步批量 UPDATE 数据库
-    qs.update(correspondent=correspondent)
-
-    # 3. 异步触发副作用任务
-    bulk_update_documents.apply_async(
-        kwargs={"document_ids": affected_docs},
-        headers={"trigger_source": PaperlessTask.TriggerSource.SYSTEM},
-    )
-    return "OK"
+with transaction.atomic():
+    if expanded_remove_tags:
+        DocumentTagRelationship.objects.filter(...).delete()     # ①
+    if expanded_add_tags:
+        DocumentTagRelationship.objects.bulk_create(to_create, ignore_conflicts=True)  # ②
+# 事务提交后才调度异步任务
+if affected_docs:
+    bulk_update_documents.apply_async(...)
 ```
 
-同类方法及关键差异：
+**异常行为**：如果 ① 或 ② 任何一步抛异常，整个事务回滚，`apply_async` 也不会执行。这是最"干净"的回滚。
 
-| 方法 | 同步 DB 操作 | affected_docs 计算方式 |
-|---|---|---|
-| [set_correspondent](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L111-L131) | `qs.update(correspondent=...) | `~Q(correspondent=...)` 过滤已相同的文档 |
-| [set_document_type](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L156-L173) | `qs.update(document_type=...) | 同上 |
-| [set_storage_path](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L134-L153) | `qs.update(storage_path=...) | 同上 |
-| [add_tag](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L176-L202) | `bulk_create` 多对多关系 | 过滤已存在的不重复创建，**含祖先 tag |
-| [remove_tag](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L205-L223) | `qs.delete()` 多对多关系 | 删除 tag 及其所有后代 tag |
-| [modify_tags](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L226-L284) | transaction.atomic 中先删后增 | 所有传入 doc_ids（测试注释说明精确过滤复杂） |
-| [modify_custom_fields](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L287-L356) | `update_or_create` + 处理 DOCUMENTLINK 对称反射 | 所有传入 doc_ids |
-| [set_permissions](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L405-L430) | 遍历设置 owner + django-guardian 权限 | 所有传入 doc_ids |
+### 3.2 set_correspondent / set_document_type / set_storage_path：单条 SQL 原子
 
-**注意**：`modify_tags` 中使用了 `transaction.atomic()` 保证 add/remove 原子性 [bulk_edit.py#L249-L276](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L249-L276)。
+以 [set_correspondent](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L111-L131) 为例：
 
-### 3.2 第二类：生成新文档/版本的操作
+```python
+qs = Document.objects.filter(Q(id__in=doc_ids) & ~Q(correspondent=correspondent))
+affected_docs = list(qs.values_list("pk", flat=True))   # SELECT
+qs.update(correspondent=correspondent)                   # ② 单条 UPDATE，原子
+bulk_update_documents.apply_async(...)                   # ③
+return "OK"
+```
 
-`rotate`、`merge`、`split`、`delete_pages`、`edit_pdf`、`remove_password` 等操作：
+**异常行为**：
+- 若 ② UPDATE 抛错（数据库层），没有已修改数据，返回 400。
+- 若 ② 成功、③ `apply_async` 抛错（如 broker 不可用）：**DB 中 correspondent 已更新且提交，但后台副作用任务没有被调度**。前端拿到 400，但文档属性实际已变。
 
-1. **同步处理 PDF 文件**（pikepdf 读写临时文件）
-2. **调度 `consume_file` 异步任务** 将临时文件通过消费管线生成新文档或新版本
-3. 若 `delete_originals=True`，用 **Celery chord** 编排：consume 全部成功 → 执行删除；失败 → 恢复 ASN
+### 3.3 add_tag / remove_tag：多步独立语句，无事务
 
-典型流程（以 `merge` + `delete_originals=True` 为例 [bulk_edit.py#L594-L608](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L594-L608)：
+以 [add_tag](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L176-L202) 为例：
+
+```python
+for t in tags_to_add:   # tag 本身 + 所有祖先
+    qs = Document.objects.filter(Q(id__in=doc_ids) & ~Q(tags__id=t.id))
+    doc_ids_missing_tag = list(qs.values_list("pk", flat=True))   # 每条 SELECT 各自提交
+    affected_docs.update(...)
+    to_create.extend(DocumentTagRelationship(document_id=doc, tag_id=t.id) ...)
+
+if to_create:
+    DocumentTagRelationship.objects.bulk_create(to_create)   # 单条 bulk INSERT
+
+if affected_docs:
+    bulk_update_documents.apply_async(...)
+```
+
+**异常行为**：如果某个祖先 tag 的 `bulk_create` 中途（数据库层唯一约束冲突等）失败，前面 tag 的行已经插入并提交，状态不完整。
+
+### 3.4 modify_custom_fields：完全无事务——逐文档逐字段 update_or_create
+
+[modify_custom_fields](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L287-L356) 是**最复杂**的事务/副作用边界，三层嵌套循环均无 transaction：
+
+```python
+for field_id, value in add_custom_fields:             # 外层：每个自定义字段
+    for doc_id in affected_docs:                      # 中层：每个文档
+        CustomFieldInstance.objects.update_or_create(  # ① 每个 (doc, field) 独立 UPSERT
+            document_id=doc_id, field_id=field_id, defaults=defaults
+        )
+        if custom_field.data_type == DOCUMENTLINK:
+            doc = Document.objects.get(id=doc_id)
+            reflect_doclinks(doc, custom_field, value)  # ② 写目标文档的对称链接
+
+# 处理 remove_custom_fields 中的 DOCUMENTLINK 对称删除
+for doclink_being_removed_instance in ...:
+    for target_doc_id in doclink_being_removed_instance.value:
+        remove_doclink(...)                              # ③ 每个目标文档独立 UPDATE
+
+# 最后批量删除被移除的 CF
+CustomFieldInstance.objects.filter(...).hard_delete()    # ④
+
+bulk_update_documents.apply_async(...)                     # ⑤
+```
+
+#### reflect_doclinks 内部（[bulk_edit.py#L967-L1027](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L967-L1027)）
+
+```python
+# 先移除不再在列表中的对称链接（逐个 remove_doclink）
+for doc_id in current_field_instance.value:
+    if doc_id not in target_doc_ids:
+        remove_doclink(...)                                # 每个目标独立 save()
+
+# 再为目标文档添加或更新对称链接
+CustomFieldInstance.objects.bulk_create(...)               # 批量插入
+CustomFieldInstance.objects.bulk_update(..., ["value_document_ids"])  # 批量更新
+Document.objects.filter(id__in=target_doc_ids).update(modified=now)   # 更新 modified
+```
+
+#### remove_doclink 内部（[bulk_edit.py#L1030-L1048](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L1030-L1048)）
+
+```python
+target_doc_field_instance = CustomFieldInstance.objects.filter(...).first()
+if target_doc_field_instance is not None and document.id in target_doc_field_instance.value:
+    target_doc_field_instance.value.remove(document.id)
+    target_doc_field_instance.save()   # ← 独立 save()，自动提交
+Document.objects.filter(id=target_doc_id).update(modified=timezone.now())
+```
+
+**modify_custom_fields 的精确异常行为**：
+
+| 抛错位置 | 已生效状态 |
+|---|---|
+| 第 1 个 (doc, field) 的 `update_or_create` | 干净，无任何变更 |
+| 处理完 doc1 的所有 field，doc2 的第 1 个 field 的 `update_or_create` | doc1 的 CustomFieldInstances 已写入提交；doc1 的 DOCUMENTLINK 对称反射可能已部分/全部完成 |
+| doc1 的 `reflect_doclinks` 中第 3 个目标文档的 `bulk_create` | doc1 自身的 CF 已写入；目标文档 1、2 的对称链接已写入提交；目标 3 未写入；`bulk_update_documents` 尚未调度 |
+| ④ `hard_delete()` | 所有 add 操作已提交；所有 remove 的 DOCUMENTLINK 对称反射已提交；硬删除尚未执行 |
+| ⑤ `apply_async` | **所有 DB 变更已提交**；但 bulk_update_documents 没调度，意味着不会触发搜索索引更新、工作流、文件重命名、WebSocket 推送 |
+
+**结论**：`modify_custom_fields` 任何一步失败都会留下**部分提交的状态**，且越往后失败，已生效的变更越多。前端收到 400 无法感知实际变更量。
+
+### 3.5 set_permissions：无事务
+
+[set_permissions](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L405-L430)：
+
+```python
+qs = Document.objects.filter(id__in=doc_ids).select_related("owner")
+if merge:
+    qs.filter(owner__isnull=True).update(owner=owner)  # ① UPDATE，自动提交
+else:
+    qs.update(owner=owner)                              # ① UPDATE，自动提交
+
+for doc in qs:                                           # ② 每个文档独立写 django-guardian 权限表
+    set_permissions_for_object(permissions=set_permissions, object=doc, merge=merge)
+
+bulk_update_documents.apply_async(...)                    # ③
+```
+
+**异常行为**：如果第 3 个文档的 `set_permissions_for_object` 抛错，前 2 个文档的 owner 和权限都已写入提交，第 3 个的 owner 已更新但 guardian 权限可能部分写入。
+
+### 3.6 生成新文档/版本类操作：rotate/merge/split/delete_pages/edit_pdf/remove_password
+
+这些操作的同步部分是 pikepdf 处理临时文件，然后调度 `consume_file`，本身不写业务 DB。`delete_originals=True` 时有 ASN 释放/恢复机制。
+
+以 merge 为例 [bulk_edit.py#L594-L608](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L594-L608)：
 
 ```python
 if delete_originals:
-    backup = release_archive_serial_numbers(affected_docs)  # 先释放 ASN，存备份
+    backup = release_archive_serial_numbers(affected_docs)  # ① UPDATE，同步提交
     try:
         consume_task.apply_async(
-            link=[delete.si(affected_docs)],                       # 成功后删原文档
-            link_error=[restore_archive_serial_numbers_task.s(backup)],  # 失败则恢复 ASN
-        )
+            link=[delete.si(affected_docs)],
+            link_error=[restore_archive_serial_numbers_task.s(backup)],
+        )                                                  # ②
     except Exception:
-        restore_archive_serial_numbers(backup)   # apply_async 抛错立即同步恢复
+        restore_archive_serial_numbers(backup)             # ② 抛错时同步恢复 ASN
         raise
 ```
 
-`split` 使用 chord（多任务并行），见 [bulk_edit.py#L673-L682](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L673-L682)：
+**精确异常行为**：
+- ① 成功，② `apply_async` 同步抛错 → ASN 被同步恢复。
+- ② 成功（任务进入队列），之后 consume_file 在 worker 中失败 → Celery 自动触发 `link_error`，异步执行 restore_archive_serial_numbers_task 恢复 ASN。
+- consume_file 成功 → Celery 触发 `link`，异步执行 `delete` 删原文档。delete 任务若失败，ASN 已经释放**不会自动恢复**，只能查 PaperlessTask 发现 BULK_DELETE 失败。
+
+chord 编排（split / edit_pdf + delete_original）同理，见 [bulk_edit.py#L673-L682](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L673-L682)。
+
+### 3.7 delete（bulk_edit.delete）：自身是 async task
+
+[delete](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L359-L392) 被 `@shared_task` 装饰，内部有 try/except：
 
 ```python
-chord(
-    header=consume_tasks,          # 多个 consume_file 并行
-    body=delete.si([doc.id]),    # 全部成功后执行删除
-).apply_async(
-    link_error=[restore_archive_serial_numbers_task.s(backup)]
-)
+try:
+    Document.objects.filter(id__in=delete_ids).delete()   # Django ORM delete，级联清理
+    with get_backend().batch_update() as batch:
+        for id in delete_ids:
+            batch.remove(id)
+    status_mgr.send_documents_deleted(delete_ids)
+except Exception as e:
+    if "Data too long for column" in str(e):
+        logger.warning(...)
+    logger.error(f"Error deleting documents: {e!s}")       # 吞掉异常
+return "OK"
 ```
 
-### 3.3 第三类：删除和重处理
+**关键**：异常被捕获并记录日志，任务最终返回 "OK"，PaperlessTask 状态会被标记为 **SUCCESS**（不是 FAILURE）。即使文档删除或索引清理失败，任务层面看不出失败，只能查日志。
 
-- **`delete`** [bulk_edit.py#L359-L392](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L359-L392)：自身就是 `@shared_task`，异步执行：级联删所有版本 → 搜索索引移除 → WebSocket 推送删除事件。含特殊异常捕获（UUID 列兼容问题）。
-- **`reprocess`** [bulk_edit.py#L395-L402](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L395-L402)：对每个文档单独调度 `update_document_content_maybe_archive_file`（重新 OCR）。
+### 3.8 reprocess：逐文档独立调度
+
+[reprocess](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L395-L402) 对每个文档单独调用 `update_document_content_maybe_archive_file.apply_async()`。某个 `apply_async` 抛错不影响其他文档已调度的任务。
 
 ---
 
-## 四、异步任务层：bulk_update_documents
+## 四、异步任务层：精确配置与状态
 
-[bulk_update_documents](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/tasks.py#L252-L275) 是元数据变更后的「统一副作用触发器」：
+### 4.1 各任务的重试/异常配置
+
+| 任务 | 装饰器 | autoretry | max_retries | 内部 try/except |
+|---|---|---|---|---|
+| [bulk_update_documents](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/tasks.py#L252-L275) | `@shared_task` | 无 | 无 | **无** |
+| [consume_file](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/tasks.py#L123-L220) | `@shared_task(bind=True)` | 无 | 无 | 各 plugin 级 try/except，Exception 重新 raise；外层 try/finally |
+| [bulk_edit.delete](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L359-L392) | `@shared_task` | 无 | 无 | **有**，吞异常返回 OK |
+| [update_document_content_maybe_archive_file](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/tasks.py#L278-L396) | `@shared_task` | 无 | 无 | 有 try/except（逐文档） |
+| [workflows.webhooks.send_webhook](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/workflows/webhooks.py#L71-L76) | `@shared_task(retry_backoff=True, autoretry_for=(HTTPStatusError,), max_retries=3, throws=(HTTPError,))` | HTTPStatusError | 3 | 无 |
+
+**核心事实：bulk_update_documents / consume_file / delete / reprocess 都没有应用级自动重试。** 只有 webhook 任务有 `autoretry_for + max_retries=3`。
+
+Celery 框架级（broker 连接失败等）的重试与应用无关。
+
+### 4.2 bulk_update_documents 内部执行顺序与异常冒泡
+
+[bulk_update_documents](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/tasks.py#L252-L275)：
 
 ```python
 @shared_task
 def bulk_update_documents(document_ids) -> None:
     documents = Document.objects.filter(id__in=document_ids)
 
-    for doc in documents:
-        clear_document_caches(doc.pk)                    # 1. 清缓存
-        document_updated.send(                           # 2. 发自定义信号
+    for doc in documents:                 # ← 外层无 try/except
+        clear_document_caches(doc.pk)     # ①
+        document_updated.send(            # ② Django Signal.send()，不是 send_robust()
             sender=None,
             document=doc,
             logging_group=uuid.uuid4(),
         )
-        post_save.send(Document, instance=doc, created=False)  # 3. 发 Django post_save
+        post_save.send(Document, instance=doc, created=False)  # ③
 
-    with get_backend().batch_update() as batch:          # 4. 更新搜索索引
+    with get_backend().batch_update() as batch:   # ④
         for doc in documents:
             batch.add_or_update(doc)
 
-    if ai_config.llm_index_enabled:                       # 5. （可选）更新 LLM 索引
+    if ai_config.llm_index_enabled:                # ⑤
         update_llm_index(rebuild=False)
 ```
 
-这个任务被登记在 `TRACKED_TASKS` 中 [handlers.py#L1013](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1013)，其状态由 Celery 信号追踪（PENDING → STARTED → SUCCESS/FAILURE）。
+**关键点**：
+
+1. **Django Signal.send()**（不是 `.send_robust()`）的行为：依次调用所有 receiver，任何一个 receiver 抛异常，**立即终止分发**，异常**直接冒泡**给 send() 的调用者。
+
+2. **document_updated 信号 receiver 的注册顺序**（[apps.py#L32-L33](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/apps.py#L32-L33)）：
+   - 先 `run_workflows_updated` → `run_workflows`（触发工作流，内部可能再做 document.save()）
+   - 后 `send_websocket_document_updated`（WebSocket 推送）
+
+   如果 `run_workflows_updated` 抛错，`send_websocket_document_updated` **永远不会执行**。
+
+3. **post_save 信号**触发 `update_filename_and_move_files`，该函数内部有 try/except 吞掉 `OSError / DatabaseError / CannotMoveFilesException` 并尝试回滚文件位置（见 [handlers.py#L613-L644](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L613-L644)），但该异常**不会冒泡**，因为被 handler 内部捕获。
+
+#### bulk_update_documents 失败时的精确已生效副作用（假设 3 个文档，在 doc2 的 run_workflows 中抛错）：
+
+```
+doc1:
+  ① clear_document_caches(doc1.pk)          ✓ 已生效（缓存被清，不可逆）
+  ② document_updated.send(doc1):
+     - run_workflows_updated(doc1)          ✓ 可能已执行完，工作流 mutation 已写入 DB
+     - send_websocket_document_updated(doc1) ✓ 可能已推送
+  ③ post_save.send(doc1):
+     - update_filename_and_move_files(doc1) ✓ 文件可能已移动
+  （循环继续）
+doc2:
+  ① clear_document_caches(doc2.pk)          ✓ 已生效
+  ② document_updated.send(doc2):
+     - run_workflows_updated(doc2)          ✗ 抛错
+     - send_websocket_document_updated(doc2) 未执行
+  ③ post_save.send(doc2)                    未执行
+doc3:
+  全部未执行
+④ 搜索索引 batch_update                     未执行（循环未结束就抛了）
+⑤ LLM 索引更新                              未执行
+```
+
+最终结果：
+- PaperlessTask 状态为 **FAILURE**（由 [task_failure_handler](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1226-L1278) 写入）
+- doc1 的所有副作用已经发生且不可逆
+- doc2 缓存被清，部分工作流可能已写入
+- doc3 完全未处理
+- 搜索索引未更新（与 DB 状态不一致）
+- **不会自动重试**（任务未配置 autoretry）
+
+### 4.3 PaperlessTask 状态流转
+
+[PaperlessTask](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/models.py#L664-L693) 的状态机：
+
+```
+PENDING ──▶ STARTED ──▶ SUCCESS
+   │          │
+   │          └──────▶ FAILURE
+   └─────────────────▶ REVOKED  (任务在启动前被取消)
+```
+
+由 Celery 信号驱动（[handlers.py#L1005-L1313](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1313)）：
+
+| Celery 信号 | PaperlessTask 写入 |
+|---|---|
+| `before_task_publish` | 创建记录，Status = PENDING |
+| `task_prerun` | Status = STARTED，date_started |
+| `task_postrun` (state=SUCCESS) | Status = SUCCESS，date_done，duration，wait_time |
+| `task_postrun` (state=FAILURE) | **跳过**（由 task_failure 全权处理） |
+| `task_failure` | Status = FAILURE，result_data（含 error_type / error_message / traceback）|
+| `task_revoked` | Status = REVOKED，date_done |
+
+被登记追踪的任务（[TRACKED_TASKS](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017)）：`consume_file`、`train_classifier`、`sanity_check`、`llmindex_index`、`empty_trash`、`check_scheduled_workflows`、**`bulk_update_documents`**（TaskType.BULK_UPDATE）、**`reprocess_document`**、`build_share_link_bundle`、**`bulk_edit.delete`**（TaskType.BULK_DELETE）。
+
+注意 `consume_file` 在 link/link_error/chord 中的子任务（delete、restore_archive_serial_numbers_task）**不在 TRACKED_TASKS 中**，不会产生 PaperlessTask 记录。
 
 ---
 
-## 五、信号副作用层
+## 五、信号副作用层——执行顺序与异常
 
-信号连接在 [apps.py](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/apps.py#L10-L37) 的 `ready()` 中注册：
+### 5.1 信号连接注册（[apps.py#L24-L33](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/apps.py#L24-L33)）
 
 ```python
-document_updated.connect(run_workflows_updated)
-document_updated.connect(send_websocket_document_updated)
+# document_consumption_finished（仅消费流程，与 bulk edit 无关）
+document_consumption_finished.connect(add_inbox_tags)
+document_consumption_finished.connect(set_correspondent)
+document_consumption_finished.connect(set_document_type)
+document_consumption_finished.connect(set_tags)
+document_consumption_finished.connect(set_storage_path)
+document_consumption_finished.connect(add_to_index)
+document_consumption_finished.connect(run_workflows_added)
+document_consumption_finished.connect(add_or_update_document_in_llm_index)
+
+# document_updated（bulk_update_documents 触发）
+document_updated.connect(run_workflows_updated)          # ① 先执行
+document_updated.connect(send_websocket_document_updated)  # ② 后执行
 ```
 
-另有 Django ORM 信号：
-- `post_save(sender=Document)` → `update_filename_and_move_files` [handlers.py#L431-L667](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L431-L667)
+Django ORM 信号（与 `.send()` 同样行为）：
+- `post_save(sender=Document)` → `update_filename_and_move_files`
 - `post_save(sender=CustomFieldInstance)` → `update_filename_and_move_files`
 - `m2m_changed(sender=Document.tags.through)` → `update_filename_and_move_files`
 
-### 5.1 run_workflows_updated → run_workflows
+### 5.2 run_workflows_updated → run_workflows（DOCUMENT_UPDATED）
 
-[handlers.py#L819-L829](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L819-L829) → [run_workflows](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L854-L998)
+[run_workflows](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L854-L998) 在每个 workflow 执行前检查：
 
-DOCUMENT_UPDATED 触发类型的工作流执行逻辑：
+```python
+document.refresh_from_db()          # ① 防并发覆盖
+except Document.DoesNotExist:       # 硬删则跳过剩余 workflow
+    break
+if document.is_deleted:             # 软删则跳过剩余 workflow
+    break
+# 匹配工作流，执行 actions
+document.save(
+    update_fields=["title", "correspondent", "document_type", "storage_path", "owner", "modified"]
+)
+```
 
-1. `document.refresh_from_db()` 防止并发覆盖（重要注释见 [handlers.py#L895-L905](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L895-L905)）
-2. 检查文档是否已被软删除（`is_deleted`），是则跳过
-3. 匹配工作流，按顺序执行 action：ASSIGNMENT / REMOVAL / EMAIL / WEBHOOK / PASSWORD_REMOVAL / MOVE_TO_TRASH
-4. 保存文档字段（title / correspondent / document_type / storage_path / owner）
-5. **注意**：这里的 `document.save(update_fields=[...])` 会再次触发 `post_save` → `update_filename_and_move_files`，可能引起连锁副作用
+**注意**：这里的 `document.save(update_fields=[...])` 会再次触发 `post_save` → `update_filename_and_move_files`（连锁副作用）。但该 save 只写白名单字段，不会回滚并发写入的 `filename` / `archive_filename`（见注释 [handlers.py#L968-L984](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L968-L984)）。
 
-### 5.2 send_websocket_document_updated
+### 5.3 send_websocket_document_updated
 
-[handlers.py#L832-L851](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L832-L851)：通过 WebSocket 向前端推送文档变更通知（modified 时间戳、owner、权限等）。
+[handlers.py#L832-L851](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L832-L851)：刷新文档后 WebSocket 推送 modified / owner_id / 权限。
 
-### 5.3 update_filename_and_move_files
+### 5.4 update_filename_and_move_files
 
-[handlers.py#L434-L667](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L434-L667)：根据 storage_path / 文件名模板重新计算文件名，必要时移动磁盘文件。使用 `FileLock(settings.MEDIA_LOCK)` 全局锁保护，失败时尝试回滚文件位置。
+[handlers.py#L434-L667](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L434-L667)：
+- 使用 `FileLock(settings.MEDIA_LOCK)` 全局互斥锁
+- 失败时尝试回滚文件到原位置（[handlers.py#L621-L639](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L621-L639)）
+- 异常被内部捕获，**不会冒泡**给调用者
 
 ---
 
-## 六、完整调用链路时序图（以 set_correspondent 为例）
+## 六、完整调用链路时序图（以 modify_custom_fields 为例，精确标注事务边界）
 
 ```
 前端 POST /api/documents/bulk_edit/
     │
     ▼
 BulkEditView.post()
-    │  1. 序列化校验 method="set_correspondent"
+    │  （无外层事务）
+    │  1. 序列化 method="modify_custom_fields"
     │  2. 权限校验
     │  3. 审计快照
-    │  4. 调用 bulk_edit.set_correspondent([1,2,3], correspondent_id=5)
+    │  4. 调用 bulk_edit.modify_custom_fields(
+    │        [doc1, doc2],
+    │        add_custom_fields={cf_doclink_id: [doc3.id]},
+    │        remove_custom_fields=[]
+    │     )
     │
     ▼
-bulk_edit.set_correspondent()
-    │  a. DB: UPDATE documents SET correspondent_id=5 WHERE id IN (1,2,3) AND correspondent_id != 5
-    │  b. 计算 affected_docs = [1,2,3]（假设都变了）
-    │  c. bulk_update_documents.apply_async(document_ids=[1,2,3])
-    │  d. return "OK"
+bulk_edit.modify_custom_fields()   （无 transaction.atomic）
+    │
+    ├─ FOR field_id IN add_custom_fields:
+    │    ├─ FOR doc_id IN [doc1, doc2]:
+    │    │    ├─ CustomFieldInstance.objects.update_or_create(doc1, cf_doclink)  ← DB 提交
+    │    │    ├─ reflect_doclinks(doc1, cf_doclink, [doc3.id])
+    │    │    │    ├─ remove_doclink() ...                                    ← DB 提交（无则跳过）
+    │    │    │    ├─ CustomFieldInstance.objects.bulk_create(doc3 侧链接)     ← DB 提交
+    │    │    │    └─ Document.objects.filter(id=doc3).update(modified=now)    ← DB 提交
+    │    │    ├─ CustomFieldInstance.objects.update_or_create(doc2, cf_doclink)  ← DB 提交
+    │    │    └─ reflect_doclinks(doc2, cf_doclink, [doc3.id])                  ← DB 提交
+    │
+    ├─ FOR remove_custom_fields 的对称反射:
+    │    └─ remove_doclink(...) ...                                             ← DB 提交
+    │
+    ├─ CustomFieldInstance.objects.filter(...).hard_delete()                    ← DB 提交（无删除则跳过）
+    │
+    ├─ bulk_update_documents.apply_async([doc1.id, doc2.id])                  ← 入队，返回任务 ID
+    │
+    └─ return "OK"
     │
     ▼
-BulkEditView 记录审计日志 → return HTTP 200 {"result": "OK"}
+BulkEditView: 写审计日志 → return HTTP 200 {"result": "OK"}
     │
-    │  ═══════════ 前端已拿到响应，以下是后台异步 ═══════════
+    │  ═══════════ 前端已拿到响应，以下后台异步 ═══════════
     │
     ▼
-Celery Worker: bulk_update_documents([1,2,3])
+Celery Worker: bulk_update_documents([doc1, doc2])
     │
-    ├─ for doc 1,2,3:
-    │    ├─ clear_document_caches(doc.pk)
-    │    ├─ document_updated.send(document=doc)
-    │    │      ├─► run_workflows_updated()
-    │    │      │      └─ run_workflows(DOCUMENT_UPDATED)
-    │    │      │         ├─ 匹配并执行工作流 actions
-    │    │      │         └─ document.save(...)  ← 再次触发 post_save
-    │    │      └─► send_websocket_document_updated()
-    │    │             └─ WebSocket 推送
-    │    └─ post_save.send(Document, instance=doc)
-    │           └─► update_filename_and_move_files()
-    │                ├─ 生成新文件名
-    │                ├─ 移动源文件/归档文件
-    │                └─ Document.objects.update(filename=..., modified=...)
+    ├─ doc1:
+    │    ├─ clear_document_caches(doc1.pk)                         ✓ 缓存失效
+    │    ├─ document_updated.send(doc1):
+    │    │    ├─ run_workflows_updated(doc1) → run_workflows():
+    │    │    │    ├─ refresh_from_db
+    │    │    │    ├─ 匹配并执行 DOCUMENT_UPDATED 工作流 actions
+    │    │    │    └─ document.save(update_fields=[...])            ← 触发 post_save
+    │    │    │           └─► update_filename_and_move_files(doc1)
+    │    │    │                 └─ 文件可能被移动 / 文件名更新
+    │    │    └─ send_websocket_document_updated(doc1)              ← WebSocket 推送
+    │    └─ post_save.send(Document, instance=doc1)
+    │         └─► update_filename_and_move_files(doc1) （若工作流没触发则这里触发）
     │
-    └─ 搜索索引批量更新 batch.add_or_update(doc)
+    ├─ doc2:
+    │    └─ ... 同上 ...
+    │
+    └─ 搜索索引批量 batch.add_or_update(doc1, doc2)                ← 索引刷新
 ```
 
 ---
 
-## 七、部分失败边界处理
+## 七、部分失败边界——精确对照表
 
-### 7.1 边界一：同步操作部分文档失败（元数据类操作）
+### 7.1 同步阶段各函数异常时的真实状态
 
-**策略**：Django ORM 的 `QuerySet.update()` 是**原子单条 SQL**，要么全部成功要么全部失败。`bulk_create`/`delete` 同理。
+| 函数 | 事务包裹 | 中途抛错时已生效内容 | 异步任务是否调度 |
+|---|---|---|---|
+| set_correspondent | 无（单条 UPDATE 原子） | UPDATE 成功则 correspondent 已写入；否则无 | UPDATE 成功但 apply_async 失败则任务未调度 |
+| set_document_type | 无（单条 UPDATE 原子） | 同上 | 同上 |
+| set_storage_path | 无（单条 UPDATE 原子） | 同上 | 同上 |
+| add_tag | 无 | 部分祖先 tag 的 DocumentTagRelationship 可能已插入 | 取决于抛错位置，apply_async 前抛则不调度 |
+| remove_tag | 无（单条 DELETE 原子） | DELETE 成功则 tag 关系已移除 | DELETE 成功但 apply_async 失败则任务未调度 |
+| **modify_tags** | **transaction.atomic()** | **全部回滚** | 不调度 |
+| **modify_custom_fields** | **无** | **前面 (doc, field) 的 CF 已写入；DOCUMENTLINK 对称反射部分写入；目标文档 modified 已更新** | apply_async 前抛则不调度 |
+| set_permissions | 无 | 前面文档的 owner 已 UPDATE；guardian 权限表逐文档写入到抛错点 | apply_async 前抛则不调度 |
+| merge/split/edit_pdf (delete_originals=False) | 无（只写临时文件） | 临时文件可能残留（OS 级） | apply_async 前抛则不调度 consume_file |
+| merge/split/edit_pdf (delete_originals=True) | ASN 释放+恢复保护 | ASN 可能已释放；apply_async 抛错时同步恢复 | apply_async 成功后 consume 失败会 link_error 恢复 ASN |
 
-如果在同步阶段异常：
+### 7.2 bulk_update_documents 异步任务中途失败
 
-- `modify_tags` 中的 `transaction.atomic()` 保证 add/remove 同生共死。
-- 异常冒泡到 `BulkEditView.post()` 的 `try/except`，返回 400 Bad Request。
-- **此时 DB 回滚，没有文档被修改，也不会调度异步任务**。
+| 抛错位置 | 已生效副作用（不可逆） | PaperlessTask 状态 | 自动重试 |
+|---|---|---|---|
+| doc1 的 clear_document_caches | doc1 缓存被清 | FAILURE | 否 |
+| doc1 的 run_workflows_updated | doc1 缓存被清；工作流 mutations 可能已写入 DB；WebSocket 未推送 | FAILURE | 否 |
+| doc1 的 send_websocket_document_updated | doc1 缓存被清；工作流全部执行完；WebSocket 推送（部分？） | FAILURE | 否 |
+| doc2 循环开始时 doc1 已完整处理；doc2 缓存被清 | doc1 的所有副作用、doc2 缓存清、doc2 部分工作流 | FAILURE | 否 |
+| 搜索索引 batch_update 内 | 所有文档的缓存清、信号链已走完 | FAILURE | 否 |
+| LLM 索引 update_llm_index | 所有文档的缓存清、信号链、搜索索引已走完 | FAILURE | 否 |
 
-### 7.2 边界二：PDF 处理阶段部分文档失败（rotate/merge/split 等）
-
-**策略**：**跳过失败文档，继续处理成功的。
-
-典型代码（rotate 中 [bulk_edit.py#L460-L498](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L460-L498)：
-
-```python
-for pair in docs_by_root_id.values():
-    if pair.source_doc.mime_type != "application/pdf":
-        logger.warning(f"Document {pair.root_doc.id} is not a PDF, skipping rotation.")
-        continue          # ← 非 PDF 跳过
-    try:
-        # ... pikepdf 处理 ...
-        consume_file.apply_async(...)
-    except Exception as e:
-        logger.exception(f"Error rotating document {pair.root_doc.id}: {e}")
-        # ← 单个文档异常，跳过不影响其他文档
-```
-
-merge 中 [bulk_edit.py#L544-L547](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L544-L547) 类似：
-
-```python
-except Exception as e:
-    logger.exception(f"Error merging document {doc.id}, it will not be included in the merge: {e}")
-```
-
-**最终结果**：HTTP 200 OK，但部分文档未被处理，仅日志记录。前端无法从响应得知哪些失败。
-
-### 7.3 边界三：异步任务 bulk_update_documents 部分失败
-
-`bulk_update_documents` 是一个 Celery 任务。如果在 for 循环中单个文档的信号处理器抛异常：
-
-- **document_updated.send() 中的异常会冒泡，导致整个任务失败。
-- Celery 会根据重试策略重试。
-- 已经处理完的文档的副作用（如搜索索引在循环之后批量提交，部分文档可能已触发了工作流/WebSocket 等，但后续文档未处理。
-- 失败时 `task_failure_handler` 记录 PaperlessTask.Status.FAILURE。
-
-### 7.4 边界四：consume_file 成功但后续 delete 失败（chord/link 编排）
-
-以 merge+delete_originals=True 为例：
+### 7.3 chord/link 编排失败（delete_originals=True 时）
 
 ```
-consume_file 成功 ──link──▶ delete(affected_docs)
-           │
-           └──link_error──▶ restore_archive_serial_numbers_task(backup)
+                    consume_file 成功
+                   ┌───────────────────────────────▶ delete(原文档)
+                   │                                (独立任务，若失败 ASN 不自动恢复，
+                   │                                 无独立 PaperlessTask 记录)
+                   │
+chord(header=consume_tasks)
+                   │
+                   │ consume_file 失败
+                   └───────────────────────────────▶ restore_archive_serial_numbers_task
+                                                     (独立任务，不在 TRACKED_TASKS 中)
 ```
 
-- consume_file 失败 → **自动触发 link_error → 恢复 ASN。原文档保留，ASN 还原。
-- consume_file 成功 → delete 执行。delete 是独立任务，若 delete 失败 ASN 已经释放不会自动恢复（delete 是软删除+文件清理，失败可查任务状态）。
+### 7.4 bulk_edit.delete（async task）失败
 
-### 7.5 边界五：ASN 释放与 apply_async 抛错同步恢复
-
-在 merge/split/edit_pdf 中，release_archive_serial_numbers() 在调度任务前同步执行。如果 `apply_async()` 本身异常（如 broker 不可用）：
-
-```python
-try:
-    chord(...).apply_async(link_error=[...])
-except Exception:
-    restore_archive_serial_numbers(backup)   # ← 同步恢复
-    raise
-```
-
-见 [bulk_edit.py#L600-L606](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L600-L606)、[bulk_edit.py#L673-L682](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L673-L682)。
-
-### 7.6 边界六：自定义字段 DOCUMENTLINK 对称反射失败
-
-[modify_custom_fields](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L325-L327) 中调用 `reflect_doclinks()`，如果目标文档的反射写入失败，异常会冒泡导致整个批量操作回滚（非事务性，已修改的文档的 CF 不会回滚）。
-
-### 7.7 边界七：工作流执行期间文档被删除/软删
-
-在 `run_workflows` 中每轮 workflow 前检查：
-
-```python
-document.refresh_from_db()           # 防并发覆盖
-except Document.DoesNotExist:       # 硬删
-    break
-if document.is_deleted:             # 软删
-    break
-```
-
-见 [handlers.py#L896-L913](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L896-L913)。
+异常被 try/except 吞掉，返回 "OK"，所以：
+- PaperlessTask.Status = **SUCCESS**（不是 FAILURE！）
+- 部分文档可能已被删除，部分未删除
+- 搜索索引可能部分更新
+- 错误信息仅出现在日志中
 
 ---
 
-## 八、关键设计总结
+## 八、关键设计总结（修正版）
 
-| 关注点 | 设计 |
+| 关注点 | 真实设计（修正后） |
 |---|---|
-| **同步/异步分界** | DB 元数据修改同步完成；搜索索引、工作流、WebSocket、文件重命名全部异步 |
-| **任务编排** | Celery chord（多任务→删原文档）、link（单任务→删原文档）、link_error（失败补偿） |
-| **失败原子性** | 元数据修改靠 Django ORM + transaction；PDF 处理逐文档 try/except 部分成功；ASN 有备份+恢复机制 |
-| **可观测性** | TRACKED_TASKS 登记 Celery 任务状态（PENDING/STARTED/SUCCESS/FAILURE/REVOKED）；AUDIT_LOG 记录变更前后值 |
-| **并发安全** | update_filename_and_move_files 使用全局 FileLock；run_workflows 每次 refresh_from_db；document.save 指定 update_fields 避免回滚并发写 |
+| **同步/异步分界** | DB 元数据修改同步完成；搜索索引、工作流、WebSocket、文件重命名全部异步（bulk_update_documents） |
+| **事务策略** | 仅 `modify_tags` 用 `transaction.atomic()`；其他元数据操作全部隐式自动提交，逐语句独立 |
+| **请求级事务** | BulkEditView 外层无事务；未开启 ATOMIC_REQUESTS；同步阶段抛错不回滚已提交 SQL |
+| **任务重试** | 仅 webhook 任务配置 `autoretry_for + max_retries=3`；bulk_update_documents / consume_file / delete / reprocess 均无应用级重试 |
+| **信号异常冒泡** | 用 `Signal.send()` 非 `send_robust()`；第一个 receiver 抛异常立即终止分发并冒泡；receiver 注册顺序：run_workflows_updated → send_websocket_document_updated |
+| **bulk_update_documents 失败** | 外层 for 无 try/except；单个文档的信号异常导致整个任务失败，已处理文档的副作用不回滚 |
+| **ASN 恢复机制** | apply_async 同步抛错 → 同步恢复；consume_file 异步失败 → Celery link_error 异步恢复；delete 子任务失败 → 不恢复 ASN |
+| **bulk_edit.delete 失败可观测性** | 异常被内部捕获，PaperlessTask 状态为 SUCCESS，失败信息仅在日志中 |
+| **update_filename_and_move_files 异常** | 内部 try/except 吞异常，尝试回滚文件位置，异常不冒泡不影响任务状态 |
+| **并发安全** | 文件操作使用全局 FileLock；工作流每次 refresh_from_db；工作流保存时指定 update_fields 白名单避免回滚 filename 字段 |
