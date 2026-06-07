@@ -20,9 +20,15 @@
 | 后端批量编辑 | `src/documents/bulk_edit.py` | `reprocess()` 函数，驱动前端"Reprocess"按钮 |
 | 后端管理命令 | `src/documents/management/commands/document_thumbnails.py` | `document_thumbnails` CLI：批量重建缩略图 |
 | 后端命令基类 | `src/documents/management/commands/base.py` | `PaperlessCommand`：多进程 + 进度条基础设施 |
-| 后端进度推送 | `src/documents/plugins/helpers.py` | `ProgressManager`、`ProgressStatusOptions`、`BaseStatusManager._fail()` |
+| 后端进度推送 | `src/documents/plugins/helpers.py` | `ProgressManager`、`ProgressStatusOptions`、`BaseStatusManager._fail()`、`group_send("status_updates")` |
+| 后端信号处理 | `src/documents/signals/handlers.py` | Celery 信号：`before_task_publish`、`task_prerun`、`task_postrun`、`task_failure`、`task_revoked`，驱动 `PaperlessTask` 全生命周期 |
+| 后端 Celery 初始化 | `src/paperless/celery.py` | Celery App 初始化、signed-pickle 序列化、worker_process_init 钩子 |
+| 前端根组件 | `src-ui/src/app/app.component.ts` | `AppComponent.failedSubscription` / `successSubscription` 订阅消费结果、触发 Toast |
+| 前端 Toast 服务 | `src-ui/src/app/services/toast.service.ts` | `ToastService.showError()` / `show()` 分发 Toast 消息 |
+| 前端 Toast 组件 | `src-ui/src/app/components/common/toast/toast.component.ts` | Toast 渲染、错误详情展示、复制剪贴板 |
+| 前端 Toast 样式 | `src-ui/src/app/components/common/toast/toast.component.scss` | `.toast.error` 红色错误样式 |
 | 前端 REST 服务 | `src-ui/src/app/services/rest/document.service.ts` | `getThumbUrl()`、`getPreviewUrl()`、`reprocessDocuments()` |
-| 前端 WebSocket 状态 | `src-ui/src/app/services/websocket-status.service.ts` | `FileStatus`、`FILE_STATUS_MESSAGES`、进度换算 |
+| 前端 WebSocket 状态 | `src-ui/src/app/services/websocket-status.service.ts` | `FileStatus`、`FILE_STATUS_MESSAGES`、`documentConsumptionFailedSubject`、进度换算 |
 | 前端预览弹窗 | `src-ui/src/app/components/common/preview-popup/preview-popup.component.ts` | 列表页悬停预览 + `onError()` 处理 |
 | 前端预览弹窗模板 | `src-ui/src/app/components/common/preview-popup/preview-popup.component.html` | 错误态、密码锁、PDF Viewer 渲染 |
 | 前端文档详情 | `src-ui/src/app/components/document-detail/document-detail.component.ts` | `reprocess()`、`onError()`、`pdfPreviewLoaded()`、`tiffError`、`previewText` |
@@ -108,9 +114,123 @@ with FileLock(settings.MEDIA_LOCK):
 
 ---
 
-## 三、缩略图生成失败后的用户可见状态（完整链路）
+## 三、缩略图生成失败后的用户可见状态（完整端到端链路）
 
-### 3.1 后端：`_fail()` 触发失败
+本章节梳理缩略图生成异常时，从 Celery 任务发布 → 后端 WebSocket 推送 → 前端 Toast 显示 → PaperlessTask 失败入库的完整链路。
+
+```
+                                  ┌─────────────────────────────────────────────┐
+                                  │  用户上传/触发 consume_file                  │
+                                  └──────────────────────┬──────────────────────┘
+                                                         │
+                                            ┌────────────▼────────────┐
+                                            │ Celery Broker           │
+                                            │ before_task_publish     │
+                                            │ → PaperlessTask(PENDING)│
+                                            └────────────┬────────────┘
+                                                         │
+                                            ┌────────────▼────────────┐
+                                            │ Celery Worker           │
+                                            │ task_prerun             │
+                                            │ → PaperlessTask(STARTED)│
+                                            └────────────┬────────────┘
+                                                         │
+                                         ┌───────────────▼───────────────┐
+                                         │ ConsumerPlugin.run()          │
+                                         │   parser.get_thumbnail() 异常 │
+                                         │   except Exception → _fail()  │
+                                         └───────┬───────────────────┬───┘
+                                                 │                   │
+                              ┌──────────────────▼──┐        ┌───────▼──────────────────┐
+                              │ ProgressManager       │        │ task_failure signal       │
+                              │ send_progress(        │        │ → PaperlessTask(FAILURE)  │
+                              │   100/100 FAILED)     │        │   result_data(error_type, │
+                              │ group_send("status   │        │   error_message, tb)      │
+                              │   _updates")          │        └──────────────────────────┘
+                              └──────────┬────────────┘
+                                         │ WebSocket
+                                         ▼
+                              ┌──────────────────────────────────┐
+                              │ WebsocketStatusService           │
+                              │ handleProgressUpdate()            │
+                              │ status.phase = FAILED            │
+                              │ documentConsumptionFailedSubject  │
+                              │          .next(status)            │
+                              └──────────┬───────────────────────┘
+                                         │ subscribe
+                                         ▼
+                              ┌──────────────────────────────────┐
+                              │ AppComponent                      │
+                              │ failedSubscription                │
+                              │ → toastService.showError(...)     │
+                              └──────────┬───────────────────────┘
+                                         │
+                                         ▼
+                              ┌──────────────────────────────────┐
+                              │ ToastComponent (.toast.error)     │
+                              │ 红色背景 + 错误消息 + 10s 自动消失 │
+                              └──────────────────────────────────┘
+```
+
+### 3.1 阶段一：任务发布 → PaperlessTask(PENDING)
+
+Celery 任务发布到 Broker 前，`before_task_publish` 信号创建 PaperlessTask 记录。
+
+- 仓库相对路径：`src/documents/signals/handlers.py`
+- 稳定位置：`TRACKED_TASKS` 字典、`before_task_publish_handler()` 函数
+- 行号范围：L1005-L1017（TRACKED_TASKS）、L1103-L1141（handler）
+
+```python
+TRACKED_TASKS: dict[str, PaperlessTask.TaskType] = {
+    "documents.tasks.consume_file": PaperlessTask.TaskType.CONSUME_FILE,
+    "documents.tasks.update_document_content_maybe_archive_file": PaperlessTask.TaskType.REPROCESS_DOCUMENT,
+    # ... 其他任务
+}
+
+@before_task_publish.connect
+def before_task_publish_handler(sender=None, headers=None, body=None, **kwargs):
+    task_name = headers.get("task", "")
+    task_type = TRACKED_TASKS.get(task_name)
+    if task_type is None:
+        return
+    _, task_kwargs, _ = body
+    task_id = headers["id"]
+    input_data = _extract_input_data(task_type, task_kwargs)   # 含 filename, mime_type
+    trigger_source = _determine_trigger_source(headers)
+    owner_id = _extract_owner_id(task_type, task_kwargs)
+    PaperlessTask.objects.create(
+        task_id=task_id,
+        task_type=task_type,
+        trigger_source=trigger_source,
+        status=PaperlessTask.Status.PENDING,    # 初始状态
+        input_data=input_data,
+        owner_id=owner_id,
+    )
+```
+
+- 仓库相对路径：`src/paperless/celery.py`
+- 稳定位置：Celery App 初始化（`app = Celery("paperless")`）、信号自动发现（`app.autodiscover_tasks()`）
+- 行号范围：L57-L66
+
+### 3.2 阶段二：Worker 执行 → PaperlessTask(STARTED)
+
+Worker 取到任务开始执行时，`task_prerun` 信号更新状态为 STARTED。
+
+- 仓库相对路径：`src/documents/signals/handlers.py`
+- 稳定位置：`task_prerun_handler()` 函数
+- 行号范围：L1144-L1162
+
+```python
+@task_prerun.connect
+def task_prerun_handler(sender=None, task_id=None, task=None, **kwargs):
+    close_old_connections()
+    PaperlessTask.objects.filter(task_id=task_id).update(
+        status=PaperlessTask.Status.STARTED,
+        date_started=timezone.now(),
+    )
+```
+
+### 3.3 阶段三：缩略图生成异常 → `_fail()` 触发
 
 缩略图生成异常被 `run()` 的最外层 `try/except` 捕获，调用 `_fail()` 方法。
 
@@ -125,34 +245,270 @@ except Exception as e:
     self._fail(str(e), "...", exc_info=True, exception=e)
 ```
 
-### 3.2 `_fail()` 做了什么
+### 3.4 阶段四：`_fail()` 三副作用 + WebSocket 推送
 
 - 仓库相对路径：`src/documents/plugins/helpers.py`
 - 稳定位置：`BaseStatusManager._fail()` 方法
 - 行号范围：L82-L105
 
 `_fail()` 产生三个副作用：
-1. **WebSocket 推送**：`100/100 FAILED` + 错误消息 → 用户 UI 立刻可见
+1. **WebSocket 推送**：调用 `send_progress()` → `100/100 FAILED` + 错误消息
 2. **错误日志**：`logger.exception(...)` 写入日志文件
-3. **抛出 ConsumerError**：终止 Celery 任务，任务最终落库 `PaperlessTask.status = FAILURE`
+3. **抛出 ConsumerError**：终止 Celery 任务，触发 `task_failure` 信号
 
-### 3.3 前端 WebSocket 实时接收失败态
+**WebSocket 推送的具体实现：**
+
+- 仓库相对路径：`src/documents/plugins/helpers.py`
+- 稳定位置：`ProgressManager.send_progress()` → `BaseStatusManager.send()` → `self._channel.group_send("status_updates", payload)`
+- 行号范围：L107-L116（send）、L125-L150（send_progress）
+
+```python
+def send(self, payload: WebsocketPayload) -> None:
+    self.open()
+    async_to_sync(self._channel.group_send)("status_updates", payload)
+
+def send_progress(self, status, message, current_progress, max_progress, *, document_id=None, ...):
+    data: ProgressUpdateData = {
+        "filename": self.filename,
+        "task_id": self.task_id,
+        "current_progress": current_progress,  # 100
+        "max_progress": max_progress,          # 100
+        "status": status,                      # "FAILED"
+        "message": message,                    # 错误消息字符串
+        "document_id": document_id,
+        "owner_id": owner_id,
+        "users_can_view": users_can_view or [],
+        "groups_can_view": groups_can_view or [],
+    }
+    payload: StatusUpdatePayload = {"type": "status_update", "data": data}
+    self.send(payload)
+```
+
+### 3.5 阶段五：前端 WebSocket 接收 → Subject 分发
 
 - 仓库相对路径：`src-ui/src/app/services/websocket-status.service.ts`
-- 稳定位置：`FileStatus.updateFromStatus()` → 当 `status === "FAILED"` 时的分支
-- 行号范围：L99-L107
+- 稳定位置：`connect()` 中 `onmessage` 回调 → `handleProgressUpdate()` → `case FileStatusPhase.FAILED` → `documentConsumptionFailedSubject.next(status)`
+- 行号范围：L163-L206（connect/onmessage）、L228-L269（handleProgressUpdate）、L318-L324（onDocumentConsumptionFailed）
 
-进度换算：
+```typescript
+// connect() 建立 WebSocket 连接
+this.statusWebSocket = new WebSocket(`${environment.webSocketProtocol}//.../status/`)
+this.statusWebSocket.onmessage = (ev: MessageEvent) => {
+  const { type, data: messageData } = JSON.parse(ev.data)
+  switch (type) {
+    case WebsocketStatusType.STATUS_UPDATE:
+      this.handleProgressUpdate(messageData as WebsocketProgressMessage)
+      break
+  }
+}
+
+// handleProgressUpdate() 分发状态
+handleProgressUpdate(messageData: WebsocketProgressMessage) {
+  let status = this.get(messageData.task_id, messageData.filename).status
+  status.updateProgress(FileStatusPhase.WORKING, messageData.current_progress, messageData.max_progress)
+  if (messageData.status in FileStatusPhase) {
+    status.phase = FileStatusPhase[messageData.status]  // "FAILED" → FileStatusPhase.FAILED
+  }
+  switch (status.phase) {
+    case FileStatusPhase.FAILED:
+      this.documentConsumptionFailedSubject.next(status)  // 发布失败事件
+      break
+  }
+}
+
+// 对外暴露订阅接口
+onDocumentConsumptionFailed() {
+  return this.documentConsumptionFailedSubject
+}
+```
+
+**进度换算**
 - 仓库相对路径：`src-ui/src/app/services/websocket-status.service.ts`
 - 稳定位置：`FileStatus.getProgress()` 中 `case FileStatusPhase.FAILED: return 1.0`
 - 行号范围：L61-L78
 
-**用户可见表现**：上传进度条直接走到 100%，红色失败提示显示错误消息文本。
+### 3.6 阶段六：AppComponent 订阅 → ToastService.showError
 
-### 3.4 持久化失败记录：PaperlessTask 表
+- 仓库相对路径：`src-ui/src/app/app.component.ts`
+- 稳定位置：`AppComponent.ngOnInit()` 中 `failedSubscription`、`successSubscription`、`newDocumentSubscription`
+- 行号范围：L76-L136（ngOnInit）、L38-L41（subscription 声明）、L51-L61（ngOnDestroy 取消订阅）
 
+```typescript
+export class AppComponent implements OnInit, OnDestroy {
+  newDocumentSubscription: Subscription
+  successSubscription: Subscription
+  failedSubscription: Subscription     // 失败订阅声明
+
+  ngOnInit(): void {
+    this.websocketStatusService.connect()
+
+    // 成功订阅
+    this.successSubscription = this.websocketStatusService
+      .onDocumentConsumptionFinished()
+      .subscribe((status) => {
+        this.tasksService.reload()
+        if (this.showNotification(SETTINGS_KEYS.NOTIFICATIONS_CONSUMER_SUCCESS)) {
+          this.toastService.show({
+            content: $localize`Document ${status.filename} was added to Paperless-ngx.`,
+            delay: 10000,
+            actionName: $localize`Open document`,
+            action: () => { this.router.navigate(['documents', status.documentId]) },
+          })
+        }
+      })
+
+    // ── 失败订阅（核心） ──────────────────────────────────────
+    this.failedSubscription = this.websocketStatusService
+      .onDocumentConsumptionFailed()
+      .subscribe((status) => {
+        this.tasksService.reload()
+        if (this.showNotification(SETTINGS_KEYS.NOTIFICATIONS_CONSUMER_FAILED)) {
+          this.toastService.showError(
+            $localize`Could not add ${status.filename}\: ${status.message}`
+          )
+        }
+      })
+    // ─────────────────────────────────────────────────────────
+
+    // 新文档检测订阅
+    this.newDocumentSubscription = this.websocketStatusService
+      .onDocumentDetected()
+      .subscribe((status) => {
+        this.tasksService.reload()
+        if (this.showNotification(SETTINGS_KEYS.NOTIFICATIONS_CONSUMER_NEW_DOCUMENT)) {
+          this.toastService.show({
+            content: $localize`Document ${status.filename} is being processed...`,
+            delay: 5000,
+          })
+        }
+      })
+  }
+
+  ngOnDestroy(): void {
+    this.websocketStatusService.disconnect()
+    if (this.successSubscription) this.successSubscription.unsubscribe()
+    if (this.failedSubscription)  this.failedSubscription.unsubscribe()
+    if (this.newDocumentSubscription) this.newDocumentSubscription.unsubscribe()
+  }
+
+  // 仪表板页可配置是否抑制通知
+  private showNotification(key) {
+    if (this.router.url == '/dashboard' &&
+        this.settings.get(SETTINGS_KEYS.NOTIFICATIONS_CONSUMER_SUPPRESS_ON_DASHBOARD)) {
+      return false
+    }
+    return this.settings.get(key)
+  }
+}
+```
+
+### 3.7 阶段七：Toast 渲染与错误样式
+
+- 仓库相对路径：`src-ui/src/app/services/toast.service.ts`
+- 稳定位置：`ToastService.showError()` 方法、`Toast` 接口
+- 行号范围：L1-L21（Toast 接口）、L57-L64（showError）
+
+```typescript
+export interface Toast {
+  id?: string
+  content: string
+  delay: number
+  delayRemaining?: number
+  action?: any
+  actionName?: string
+  classname?: string
+  error?: any
+}
+
+showError(content: string, error: any = null, delay: number = 10000) {
+  this.show({
+    content: content,
+    delay: delay,
+    classname: 'error',    // ← 关键：传入 error class
+    error,
+  })
+}
+```
+
+- 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.html`
+- 稳定位置：`<ngb-toast [class]="toast.classname">`
+- 行号范围：L1-L6
+
+- 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.scss`
+- 稳定位置：`::ng-deep .toast.error` 红色错误样式
+- 行号范围：L5-L15
+
+```scss
+::ng-deep .toast.error {
+    border-color: hsla(350, 79%, 40%, 0.4);  // 红色边框
+}
+::ng-deep .toast.error .toast-body {
+    background-color: hsla(350, 79%, 40%, 0.8);  // 红色半透明背景
+}
+```
+
+- 仓库相对路径：`src-ui/src/app/components/common/toast/toast.component.ts`
+- 稳定位置：`ToastComponent.getErrorText()`（截断 200 字符）、`copyError()`（复制剪贴板）、`isDetailedError()`（判断是否 HTTP 错误）
+- 行号范围：L52-L75
+
+**用户可见表现**：页面右下角弹出红色 Toast，显示 "Could not add <文件名>: <错误消息>"，10 秒后自动消失，进度条显示剩余时间。
+
+### 3.8 阶段八：Celery 失败入库 → PaperlessTask(FAILURE)
+
+ConsumerError 抛出后，Celery 的 `task_failure` 信号触发，更新 PaperlessTask 记录。
+
+- 仓库相对路径：`src/documents/signals/handlers.py`
+- 稳定位置：`task_failure_handler()` 函数
+- 行号范围：L1226-L1278
+
+```python
+@task_failure.connect
+def task_failure_handler(sender=None, task_id=None, exception=None, traceback=None, **kwargs):
+    close_old_connections()
+
+    result_data: dict = {
+        "error_type": type(exception).__name__ if exception else "Unknown",
+        "error_message": str(exception) if exception else "Unknown error",
+    }
+    if traceback:
+        tb_str = "".join(_tb.format_tb(traceback))
+        result_data["traceback"] = tb_str[:5000]   # 截断到 5000 字符
+
+    now = timezone.now()
+    update_fields: dict = {
+        "status": PaperlessTask.Status.FAILURE,
+        "result_data": result_data,
+        "date_done": now,
+    }
+
+    task_qs = PaperlessTask.objects.filter(task_id=task_id)
+    task_instance = task_qs.values("date_started", "date_created").first()
+    if task_instance:
+        date_started = task_instance["date_started"]
+        if date_started:
+            update_fields["duration_seconds"] = (now - date_started).total_seconds()
+        date_created = task_instance["date_created"]
+        if date_started and date_created:
+            update_fields["wait_time_seconds"] = (date_started - date_created).total_seconds()
+        task_qs.update(**update_fields)
+```
+
+**状态映射表**
+- 仓库相对路径：`src/documents/signals/handlers.py`
+- 稳定位置：`_CELERY_STATE_TO_STATUS` 字典
+- 行号范围：L1019-L1023
+
+```python
+_CELERY_STATE_TO_STATUS: dict[str, PaperlessTask.Status] = {
+    "SUCCESS": PaperlessTask.Status.SUCCESS,
+    "FAILURE": PaperlessTask.Status.FAILURE,
+    "REVOKED": PaperlessTask.Status.REVOKED,
+}
+```
+
+**PaperlessTask 状态枚举**
 - 仓库相对路径：`src/documents/models.py`
-- 稳定位置：`PaperlessTask.Status.FAILURE` 枚举
+- 稳定位置：`PaperlessTask.Status` 枚举类
 - 行号范围：L670-L679
 
 ```python
@@ -164,15 +520,25 @@ class Status(models.TextChoices):
     REVOKED = "revoked"
 ```
 
+**PaperlessTask 关键字段**
 - 仓库相对路径：`src/documents/models.py`
-- 稳定位置：`PaperlessTask.result_data`、`PaperlessTask.date_done`、`PaperlessTask.duration_seconds`
-- 行号范围：L786-L791
+- 稳定位置：`PaperlessTask.task_id`、`task_type`、`status`、`input_data`、`result_data`、`date_created`、`date_started`、`date_done`、`duration_seconds`、`wait_time_seconds`
+- 行号范围：L740-L800
 
-**用户可见表现**：失败后文档**不会入库**（消费事务整体回滚）。用户只能在：
-- 上传 Toast 通知中看到错误摘要
-- `/api/tasks/` 任务列表（系统状态对话框）中看到历史失败记录，包含 `task_type=consume_file`、`status=failure`、错误消息
+**用户可见表现**：
+- 失败后文档**不会入库**（消费事务整体回滚）
+- `/api/tasks/` 任务列表（系统状态对话框）中看到历史失败记录，包含 `task_type=consume_file`、`status=failure`
+- `result_data` 含 `error_type`（如 `ConsumerError`）、`error_message`、`traceback`（最多 5000 字符）
 
-### 3.5 已入库文档的缩略图缺失
+### 3.9 补充：任务撤销（REVOKED）路径
+
+- 仓库相对路径：`src/documents/signals/handlers.py`
+- 稳定位置：`task_revoked_handler()` 函数
+- 行号范围：L1281-L1313
+
+任务在执行前/执行中被撤销时触发，更新状态为 `PaperlessTask.Status.REVOKED`。
+
+### 3.10 已入库文档的缩略图缺失
 
 如果缩略图文件因磁盘损坏/迁移丢失（文档已入库），用户可见表现：
 
