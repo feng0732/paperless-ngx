@@ -161,16 +161,95 @@ def update_filename_and_move_files(sender, instance, **kwargs):
 | ORM 操作 | 是否触发 `post_save(CustomFieldInstance)` | 是否触发同步文件重命名 | SQL 原子性 |
 |---|---|---|---|
 | `Model.save()`（单实例） | **是** | 如果模板用到 custom_fields 则**是** | 单条 UPDATE/INSERT，原子（零行失败） |
-| `update_or_create()` | **是**（底层调 `.save()`） | **是** | SELECT + 单条 INSERT/UPDATE（两条语句，非原子） |
+| `update_or_create()` | **是**（底层调 `.save()`） | **是** | **内部 `transaction.atomic()` 包裹**：SELECT（select_for_update 行锁）+ UPSERT（.save()），DB 层面原子；但 post_save 异常会导致 **DB 回滚 + 文件已移动** 的不一致 |
 | `QuerySet.bulk_create(list)` | **否** | **否** | 单条 INSERT（多 VALUES），原子（零行失败） |
 | `QuerySet.bulk_update(list, fields)` | **否** | **否** | 单条 UPDATE（CASE WHEN），原子（零行失败） |
 | `QuerySet.update(field=value)` | **否** | **否** | 单条 UPDATE，原子（零行失败） |
-| `QuerySet.hard_delete()` | **否**（不触发 per-instance 信号） | **否** | 单条 DELETE，原子（零行失败） |
+| `QuerySet.hard_delete()` | **否（不触发 post_save）**；但 Django 原生会触发 per-instance `pre_delete`/`post_delete`（paperless-ngx 未注册对应 handler） | **否** | 调用 Django 原生 `QuerySet.delete()`，单条 DELETE SQL 原子（零行失败）；会遍历对象发 `pre_delete`/`post_delete`，但 CustomFieldInstance 无 post_delete handler，故无同步副作用 |
 
 `update_filename_and_move_files` 内部的异常处理：
 - 捕获 `(OSError, DatabaseError, CannotMoveFilesException)` 并尝试回滚文件位置，**不冒泡**。
 - 其他异常（如 `TypeError`、`AttributeError`、`ValueError` 等）**会冒泡**，终止整个批量操作。
 - 执行在全局 `FileLock(settings.MEDIA_LOCK)` 内。
+
+---
+
+#### 前置知识补充：框架级行为精确核对（Django update_or_create + django-soft-delete hard_delete）
+
+##### A. Django 5.2 `QuerySet.update_or_create` 的内部实现与事务范围
+
+Django 源码（`django/db/models/query.py`）中 `update_or_create` 的核心逻辑：
+
+```python
+def update_or_create(self, defaults=None, create_defaults=None, **kwargs):
+    self._for_write = True
+    defaults = defaults or {}
+    resolve_callables(defaults)
+    create_defaults = create_defaults or {}
+    resolve_callables(create_defaults)
+
+    with transaction.atomic(using=self.db):   # ← 关键：整个操作在 atomic 内
+        try:
+            obj = self.select_for_update().get(**kwargs)  # 行锁 SELECT
+        except self.model.DoesNotExist:
+            params = {**kwargs, **defaults, **create_defaults}
+            obj, created = self._create_object_from_params(kwargs, params)
+            if created:
+                return obj, created
+        for k, v in defaults.items():
+            setattr(obj, k, v() if callable(v) else v)
+        obj.save(using=self.db)   # ← 触发 post_save 信号
+    return obj, False
+```
+
+**对 modify_custom_fields 的影响**：
+- DB 层面：SELECT（行锁） + UPSERT（INSERT/UPDATE）在同一事务中，**原子**。
+- 信号层面：`obj.save()` 在 `with transaction.atomic()` 内部执行，post_save handler 同步触发。
+- 异常分支 1（handler 内部吞异常）：post_save 抛 `OSError/DatabaseError/CannotMoveFilesException` → handler 内部捕获不冒泡 → atomic 块正常退出，DB 提交，CF 实例已写入。
+- 异常分支 2（handler 冒泡异常）：post_save 抛其他异常（如 TypeError）→ 异常从 `.save()` → `obj.save()` → 冒泡出 `with transaction.atomic()` → **atomic 块回滚**，DB 中 CF 实例的 UPSERT 被撤销 → 但同步执行的文件重命名/移动**已经发生且无法回滚** → **DB 无记录但文件已移动**的不一致状态。
+
+##### B. django-soft-delete==1.0.18 的 `hard_delete` 实现与信号触发
+
+paperless-ngx 使用 `django-soft-delete~=1.0.18`（见 [pyproject.toml#L38](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/pyproject.toml#L38)），包名 `django_softdelete`，GitHub: https://github.com/san4ezy/django_softdelete
+
+###### B.1 `QuerySet.hard_delete()`（paperless-ngx 实际调用的）
+
+`django_softdelete/managers.py` 中 `SoftDeleteQuerySet.hard_delete()`：
+
+```python
+class SoftDeleteQuerySet(models.query.QuerySet):
+    def hard_delete(self):
+        return super().delete()   # ← 直接调用 Django 原生 QuerySet.delete()
+```
+
+Django 原生 `QuerySet.delete()` 的行为：
+- **不是单条 SQL 批量删除**。它先创建 `Collector`，收集所有要删除的对象（含级联），**遍历每个对象发送 `pre_delete` 和 `post_delete` 信号**（per-instance），最后才执行 SQL DELETE。
+- 所以 `QuerySet.hard_delete()` **会触发 Django 原生的 per-instance `pre_delete` / `post_delete` 信号**。
+
+但 paperless-ngx 中 [handlers.py#L431-L442](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L431-L442) 只为 `CustomFieldInstance` 注册了 `post_save` handler：
+
+```python
+@receiver(post_save, sender=CustomFieldInstance)
+def update_filename_and_move_files(sender, instance, **kwargs):
+```
+
+**没有注册 `post_delete(CustomFieldInstance)` handler**。所以：
+- 虽然 `hard_delete()` 触发了 Django 原生的 `post_delete` 信号，但 paperless-ngx 没有监听，**不会触发同步文件重命名**。
+- SQL DELETE 本身仍是单条语句原子（零行失败）。
+
+###### B.2 单实例 `Model.hard_delete()`（paperless-ngx 中未直接使用，仅作对比）
+
+`django_softdelete/models.py` 中 `SoftDeleteModel.hard_delete()`：
+
+```python
+def hard_delete(self, *args, **kwargs):
+    response = super().delete(*args, **kwargs)  # Django 原生 Model.delete()
+    post_hard_delete.send(sender=self.__class__, instance=self)  # 自定义信号
+    return response
+```
+
+- 先调 Django 原生 `Model.delete()`（触发 `pre_delete` + `post_delete`）。
+- 然后发送库自定义的 `post_hard_delete` 信号（paperless-ngx 未注册）。
 
 ---
 
@@ -187,12 +266,14 @@ def modify_custom_fields(doc_ids, add_custom_fields, remove_custom_fields):
     for field_id, value in add_custom_fields:                  # 外层：每个字段
         for doc_id in affected_docs:                            # 中层：每个文档
             # ── 步骤 ①：update_or_create 写源文档的 CustomFieldInstance ──
-            CustomFieldInstance.objects.update_or_create(     # 两条 SQL：SELECT + UPSERT
+            CustomFieldInstance.objects.update_or_create(     # Django 内部 transaction.atomic()
                 document_id=doc_id, field_id=field_id, defaults=defaults
             )
-            #  ↑ 触发 post_save(CustomFieldInstance) → 同步执行 update_filename_and_move_files
+            #  ↑ 内部：with transaction.atomic(): select_for_update().get() → obj.save()
+            #  ↑ .save() 触发 post_save(CustomFieldInstance) → 同步执行 update_filename_and_move_files
             #    可能同步移动 doc_id 对应的磁盘文件（如果文件名模板用了 custom_fields）
-            #    如果同步文件重命名抛非预期异常 → 冒泡终止整个批量操作
+            #    如果文件重命名抛 OSError/DatabaseError/CannotMoveFilesException：handler 内部捕获不冒泡
+            #    如果抛其他非预期异常 → 冒泡出 update_or_create 的 atomic 块 → DB UPSERT 被回滚，但磁盘文件已移动且不回滚 → **DB 回滚+文件已移动**的不一致状态
 
             # ── 步骤 ②：DOCUMENTLINK 类型的对称反射 ──
             if custom_field.data_type == DOCUMENTLINK and value and doc_id not in value:
@@ -220,8 +301,11 @@ def modify_custom_fields(doc_ids, add_custom_fields, remove_custom_fields):
     CustomFieldInstance.objects.filter(
         document_id__in=affected_docs,
         field_id__in=remove_custom_fields,
-    ).hard_delete()                                          # 单条 DELETE SQL，原子
-    #  ↑ 不触发 post_save/post_delete（QuerySet 批量操作不触发 per-instance 信号）
+    ).hard_delete()                                          # SoftDeleteQuerySet.hard_delete()
+    #  ↑ 实现：return super().delete()  →  Django 原生 QuerySet.delete()
+    #  ↑ Django 原生 delete() 会遍历对象，发送 per-instance pre_delete / post_delete 信号
+    #  ↑ 但 paperless-ngx 只为 CustomFieldInstance 注册了 post_save handler（未注册 post_delete）
+    #  ↑ 所以：不会触发同步文件重命名；单条 DELETE SQL 原子（零行失败）
 
     # ═══════════════ 第四阶段：调度异步副作用 ═══════════════
     # ── 步骤 ⑤：apply_async ──
@@ -301,7 +385,8 @@ def remove_doclink(document, field, target_doc_id):
 | 抛错位置 | 已生效（已提交，不回滚） | 未生效 | 同步副作用已发生 |
 |---|---|---|---|
 | 第 1 次 `update_or_create(doc1, field)` 的 SELECT 阶段 | 零 | 全部 | 零 |
-| 第 1 次 `update_or_create(doc1, field)` 的 UPSERT 成功，但 post_save 抛异常 | **doc1 的 CustomFieldInstance 已写入** | doc2 的 CF；所有对称反射；remove 阶段；hard_delete；bulk_update_documents | **doc1 的同步文件重命名部分执行（异常位置决定）** |
+| 第 1 次 `update_or_create(doc1, field)` 的 UPSERT 成功，但 post_save 抛**非预期异常**（TypeError/ValueError 等） | **磁盘文件已移动（update_filename_and_move_files 在异常前已部分/全部执行，不回滚）** | **doc1 的 CustomFieldInstance：被 update_or_create 内部 atomic 回滚，未写入 DB**；doc2 的 CF；所有对称反射；remove 阶段；hard_delete；bulk_update_documents | **doc1 的同步文件重命名部分/全部执行（异常位置决定），且不回滚** → **DB 无记录但文件已移动**的不一致 |
+| 第 1 次 `update_or_create(doc1, field)` 的 post_save 抛 **OSError/DatabaseError/CannotMoveFilesException**（handler 内部捕获） | doc1 的 CustomFieldInstance 已写入（handler 吞异常不冒泡，atomic 正常提交） | doc2 及后续 | doc1 的同步文件重命名尝试，失败时 handler 内部尝试回滚文件位置（可能成功也可能部分失败） |
 | doc1 的 `reflect_doclinks` Phase A 第 1 次 `remove_doclink` 的 `.save()` 抛 DB 异常 | doc1 的 CF 已写入；之前的 remove_doclink 调用（如果有多目标移除）已提交 | doc1 其余目标；doc2 全部；bulk_create/bulk_update；remove 阶段；hard_delete | 之前 remove_doclink 触发的目标文档同步重命名 |
 | doc1 的 `reflect_doclinks` Phase C `bulk_create` 抛 IntegrityError（并发冲突） | doc1 的 CF；Phase A 中所有 remove_doclink 提交；同步重命名 | doc3, doc4 的 CF 实例（零行插入）；doc3, doc4 的 modified 更新；doc2 全部；remove 阶段；hard_delete | Phase A 中目标文档的同步重命名 |
 | doc1 的 `reflect_doclinks` Phase C `bulk_update` 失败 | doc1 的 CF；Phase A 所有提交；bulk_create 已写入（doc3, doc4 新增的 CF） | doc3, doc4 已有 CF 的 value 更新（零行）；doc3, doc4 的 modified；doc2 全部；remove 阶段；hard_delete | 同上 |
@@ -314,9 +399,11 @@ def remove_doclink(document, field, target_doc_id):
 ---
 
 **关键结论**：
-- `modify_custom_fields` 的每个 `update_or_create`、每个 `remove_doclink`、`reflect_doclinks` Phase A 的每次循环都是**独立提交点**，中途任何异常都会留下部分提交的状态。
+- `modify_custom_fields` 的每个 `update_or_create`（内部有 Django atomic）、每个 `remove_doclink`、`reflect_doclinks` Phase A 的每次循环都是**独立提交点**，中途任何异常都会留下部分提交的状态。
+- `update_or_create` 的特殊失败边界：post_save 抛非预期异常 → DB UPSERT 被内部 atomic 回滚，但同步文件移动**已经发生且不回滚**，造成「DB 无记录但文件已移动」的不一致。
 - `bulk_create`、`bulk_update`、`hard_delete()`、`QuerySet.update()` 各自是**原子单条 SQL**（零行失败），但它们之间不在事务中。
-- **同步副作用（文件重命名/移动）在 `.save()` 和 `update_or_create` 之后立即发生**，不等待批量操作完成，也不参与任何事务回滚。
+- `hard_delete()` 会触发 Django 原生 per-instance `pre_delete`/`post_delete` 信号，但 paperless-ngx 未为 CustomFieldInstance 注册 post_delete handler，所以**不会触发同步文件重命名**。
+- **同步副作用（文件重命名/移动）在 `.save()` 和 `update_or_create` 之后立即发生**，不等待批量操作完成，也不参与任何 DB 事务回滚。
 - 越往后期失败，已生效的变更越多；apply_async 失败时所有 DB 和文件系统变更已不可逆转，仅后台异步任务缺失。
 
 ### 3.5 set_permissions：无事务
@@ -658,7 +745,7 @@ Celery Worker: bulk_update_documents([doc1, doc2])
 | **add_tag** | **无** | **零行写入（bulk_create 原子失败，无 ignore_conflicts，零行插入）** | **bulk_create 前抛错（Tag.objects.get 失败）则不调度；bulk_create 成功但 apply_async 失败则不调度** |
 | remove_tag | 无（单条 DELETE 原子） | DELETE 成功则 tag 关系已移除 | DELETE 成功但 apply_async 失败则任务未调度 |
 | **modify_tags** | **transaction.atomic()** | **全部回滚** | 不调度 |
-| **modify_custom_fields** | **无** | **每个 `update_or_create` / 每个 `remove_doclink` / reflect_doclinks Phase A 每次循环都是独立提交点；`bulk_create`/`bulk_update`/`hard_delete`各自原子（零行失败）但互相不在事务中；同步文件重命名在每次 `.save()`/`update_or_create` 后立即发生且不可逆** | apply_async 前抛则不调度 |
+| **modify_custom_fields** | **外层无；但每个 `update_or_create` 内部有 Django `transaction.atomic()`** | **每个 `update_or_create`（内部 atomic，DB 原子但信号异常导致 DB 回滚+文件已移动）/ 每个 `remove_doclink` / reflect_doclinks Phase A 每次循环都是独立提交点；`bulk_create`/`bulk_update`/`hard_delete`各自原子（零行失败）但互相不在事务中；`hard_delete` 触发 Django 原生 pre_delete/post_delete 但无 handler 注册；同步文件重命名在每次 `.save()`/`update_or_create` 后立即发生且不可逆** | apply_async 前抛则不调度 |
 | set_permissions | 无 | 前面文档的 owner 已 UPDATE；guardian 权限表逐文档写入到抛错点 | apply_async 前抛则不调度 |
 | merge/split/edit_pdf (delete_originals=False) | 无（只写临时文件） | 临时文件可能残留（OS 级） | apply_async 前抛则不调度 consume_file |
 | merge/split/edit_pdf (delete_originals=True) | ASN 释放+恢复保护 | ASN 可能已释放；apply_async 抛错时同步恢复 | apply_async 成功后 consume 失败会 link_error 恢复 ASN |
@@ -723,16 +810,18 @@ chord(header=consume_tasks)
 
 ---
 
-## 八、关键设计总结（三次修正版）
+## 八、关键设计总结（四次修正版）
 
-| 关注点 | 真实设计（三次修正后） |
+| 关注点 | 真实设计（四次修正后） |
 |---|---|
 | **同步/异步分界** | DB 元数据修改同步完成；搜索索引、工作流、WebSocket 全部异步（bulk_update_documents）；**文件重命名/移动分同步+异步两路**：`.save()`/`update_or_create` 触发 CustomFieldInstance.post_save → 同步重命名；Document.post_save 在 bulk_update_documents 中异步触发 |
-| **事务策略** | 仅 `modify_tags` 用 `transaction.atomic()` + `bulk_create(ignore_conflicts=True)`；其他元数据操作全部隐式自动提交，逐语句独立 |
+| **事务策略** | 仅 `modify_tags` 用 `transaction.atomic()` + `bulk_create(ignore_conflicts=True)`；其他元数据操作外层无事务，但**每个 `update_or_create` 内部有 Django `transaction.atomic()` 包裹**（DB 原子但文件系统不回滚） |
 | **add_tag vs modify_tags** | add_tag：一次 bulk_create，无 ignore_conflicts，并发冲突抛 IntegrityError（零行插入）；modify_tags：transaction + ignore_conflicts，并发冲突静默跳过，失败全回滚 |
-| **modify_custom_fields 失败边界** | 每个 `update_or_create` / 每个 `remove_doclink` / reflect_doclinks Phase A 每次循环都是**独立提交点**；`bulk_create`/`bulk_update`/`hard_delete()`/`QuerySet.update()`各自是**原子单条 SQL**（零行失败），但互相不在事务中 |
-| **ORM 操作 vs 信号触发** | `.save()`/`update_or_create` 触发 post_save → 同步文件重命名；`bulk_create`/`bulk_update`/`QuerySet.update()`/`hard_delete()` **不触发** post_save，无同步副作用 |
-| **同步副作用（文件重命名）** | CustomFieldInstance post_save 同步触发 update_filename_and_move_files；捕获 `OSError/DatabaseError/CannotMoveFilesException` 不冒泡，其余异常冒泡终止整个批量；同步文件移动无事务回滚 |
+| **modify_custom_fields 失败边界** | 每个 `update_or_create`（内部 Django atomic，信号异常导致 **DB 回滚+文件已移动**不一致）/ 每个 `remove_doclink` / reflect_doclinks Phase A 每次循环都是**独立提交点**；`bulk_create`/`bulk_update`/`hard_delete()`/`QuerySet.update()`各自是**原子单条 SQL**（零行失败），但互相不在事务中 |
+| **ORM 操作 vs 信号触发** | `.save()`/`update_or_create` 触发 post_save → 同步文件重命名；`bulk_create`/`bulk_update`/`QuerySet.update()` **不触发** post_save；`QuerySet.hard_delete()` 触发 Django 原生 `pre_delete`/`post_delete`（per-instance），但 CustomFieldInstance 无 post_delete handler，故无同步副作用 |
+| **update_or_create 精确边界** | 内部 `with transaction.atomic(using=self.db): select_for_update().get() → obj.save()`；post_save 抛 OSError/DatabaseError/CannotMoveFilesException 被 handler 吞掉不冒泡，atomic 正常提交；post_save 抛其他非预期异常 → 冒泡出 atomic → **DB UPSERT 回滚，但同步文件移动已发生且不可逆** → DB 无记录但文件已移动 |
+| **hard_delete 精确行为** | django-soft-delete 的 `SoftDeleteQuerySet.hard_delete()` → `super().delete()`（Django 原生 QuerySet.delete）；原生 delete 会遍历对象发 per-instance `pre_delete`/`post_delete`；paperless-ngx 只为 CustomFieldInstance 注册了 post_save handler，所以**不触发同步文件重命名** |
+| **同步副作用（文件重命名）** | CustomFieldInstance post_save 同步触发 update_filename_and_move_files；捕获 `OSError/DatabaseError/CannotMoveFilesException` 不冒泡，其余异常冒泡终止整个批量；同步文件移动无事务回滚；与 Django atomic 叠加时可能出现 DB 回滚但文件已移动的不一致 |
 | **请求级事务** | BulkEditView 外层无事务；未开启 ATOMIC_REQUESTS；同步阶段抛错不回滚已提交 SQL |
 | **任务重试** | 仅 webhook 任务配置 `autoretry_for + max_retries=3`；bulk_update_documents / consume_file / delete / reprocess 均无应用级重试 |
 | **信号异常冒泡** | 用 `Signal.send()` 非 `send_robust()`；第一个 receiver 抛异常立即终止分发并冒泡；receiver 注册顺序：run_workflows_updated → send_websocket_document_updated |
@@ -758,3 +847,7 @@ chord(header=consume_tasks)
 | **3** | **3.4 modify_custom_fields** | **笼统说"三层嵌套循环均无 transaction"，未区分各 ORM 操作的原子性差异，完全遗漏同步副作用** | **`update_or_create`/`.save()` 触发 post_save → 同步文件重命名；`bulk_create`/`bulk_update`/`QuerySet.update()`/`hard_delete()`不触发信号；循环内每次迭代是独立提交点；Phase C 三条 SQL 各自原子但互不在事务中** | [bulk_edit.py#L287-L356](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L287-L356)、[handlers.py#L431-L442](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L431-L442) |
 | **3** | **reflect_doclinks Phase C** | **未区分 bulk_create、bulk_update、modified 更新三条 SQL 的原子性和信号差异** | **三条 SQL 各自原子（零行失败）但互不在事务中；均不触发 post_save，无同步副作用；① 成功② 失败时 create 已提交 update 零行；①② 成功③ 失败时 modified 未更新** | [bulk_edit.py#L256-L265](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L256-L265) |
 | **3** | **remove_doclink** | **只说"独立 save()，自动提交"，未区分两条 SQL 和同步副作用** | **两条独立 UPDATE（CF.save + Document.modified）均原子但互不在事务中；.save() 触发 post_save → 同步文件重命名；save 成功但 modified 失败时 CF 已提交 modified 未更新** | [bulk_edit.py#L1030-L1048](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L1030-L1048) |
+| **4** | **ORM 对照表 update_or_create** | **"SELECT + 单条 INSERT/UPDATE（两条语句，非原子）"** | **Django 内部 `with transaction.atomic(using=self.db): select_for_update().get() → obj.save()`，DB 层面原子；但 post_save 抛非预期异常 → 冒泡出 atomic → DB UPSERT 回滚，同步文件移动已发生且不可逆 → DB 无记录但文件已移动的不一致** | Django 5.2 `QuerySet.update_or_create` 源码、[bulk_edit.py#L320](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L320) |
+| **4** | **ORM 对照表 hard_delete** | **"否（不触发 per-instance 信号）"** | **django-soft-delete `SoftDeleteQuerySet.hard_delete()` → `super().delete()`（Django 原生 QuerySet.delete）；原生 delete 遍历对象发 per-instance `pre_delete`/`post_delete`；但 CustomFieldInstance 只注册了 post_save handler，无 post_delete handler，故不触发同步文件重命名** | `django_softdelete/managers.py` 的 `SoftDeleteQuerySet.hard_delete` 源码、[handlers.py#L431-L442](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L431-L442) |
+| **4** | **3.4.4 失败边界表 update_or_create post_save 异常** | **"doc1 的 CustomFieldInstance 已写入"** | **分两种情况：（1）抛 OSError/DatabaseError/CannotMoveFilesException：handler 内部捕获不冒泡，atomic 正常提交，CF 已写入，文件尝试回滚；（2）抛其他非预期异常：冒泡出 update_or_create 的 atomic 块 → DB UPSERT 被回滚（CF 未写入），但磁盘文件已移动不回滚 → 不一致状态** | Django 5.2 `QuerySet.update_or_create` 源码、[handlers.py#L613-L644](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L613-L644) |
+| **4** | **3.4.1 步骤④ hard_delete 注释** | **"不触发 post_save/post_delete（QuerySet 批量操作不触发 per-instance 信号）"** | **Django 原生 QuerySet.delete() 不是单条 SQL 批量删除，而是先遍历所有对象发 per-instance `pre_delete`/`post_delete` 信号，再执行 DELETE；但 paperless-ngx 只为 CustomFieldInstance 注册了 post_save，所以仍不触发同步文件重命名** | `django_softdelete/managers.py` 源码、Django `QuerySet.delete` 源码 |
