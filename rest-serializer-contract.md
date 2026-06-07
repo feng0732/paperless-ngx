@@ -332,9 +332,11 @@ def __init__(self, *args, **kwargs) -> None:
             pass
 ```
 
-### 3.3 DocumentSerializer：PATCH/PUT 自动触发 full_perms=true
+### 3.3 DocumentSerializer：PATCH/PUT 自动触发 full_perms=true（仅 Document 独有）
 
 位置：`src/documents/serialisers.py#L1213-L1224`
+
+DocumentSerializer 重写了 `__init__`，检测到 PATCH/PUT 请求时强制 `full_perms=True`：
 
 ```python
 def __init__(self, *args, **kwargs) -> None:
@@ -348,14 +350,17 @@ def __init__(self, *args, **kwargs) -> None:
     super().__init__(*args, **kwargs)
 ```
 
+> **关键差异**：SavedViewSerializer、TagSerializer、CorrespondentSerializer 等其他继承 OwnedObjectSerializer 的类**都没有重写 `__init__`**，不会根据 HTTP 方法自动改变 full_perms。它们的 full_perms 完全由 `PassUserMixin` 从 query 参数读取（默认 false）。
+
 ### 3.4 字段裁剪结果矩阵
 
-| 场景 | `full_perms` | `all_fields` | `permissions` | `user_can_change` | `is_shared_by_requester` |
-|------|:---:|:---:|:---:|:---:|:---:|
-| 列表 GET (默认) | false | false | ❌ | ✅ | ✅ |
-| 列表 GET `?full_perms=true` | true | false | ✅ | ❌ | ❌ |
-| PATCH/PUT 响应 | **自动 true** | - | ✅ | ❌ | ❌ |
-| OpenAPI schema | - | true | ✅ | ✅ | ✅ |
+| 场景 | Serializer | `full_perms` 来源 | `full_perms` | `all_fields` | `permissions` | `user_can_change` | `is_shared_by_requester` |
+|------|------|------|:---:|:---:|:---:|:---:|:---:|
+| 列表 GET (默认) | 所有 OwnedObjectSerializer 子类 | PassUserMixin query 默认 | false | false | ❌ | ✅ | ✅ |
+| 列表 GET `?full_perms=true` | 所有 OwnedObjectSerializer 子类 | PassUserMixin query 参数 | true | false | ✅ | ❌ | ❌ |
+| PATCH/PUT 响应 | DocumentSerializer | DocumentSerializer.__init__ 自动强制 | **true** | - | ✅ | ❌ | ❌ |
+| PATCH/PUT 响应 | SavedView / Tag / Correspondent 等 | PassUserMixin query 默认（请求 URL 通常不带 ?full_perms=true） | **false** | - | ❌ | ✅ | ✅ |
+| OpenAPI schema | 所有 | all_fields=True 参数 | - | true | ✅ | ✅ | ✅ |
 
 ### 3.5 BulkPermissionMixin：列表批量预取权限（防 N+1）
 
@@ -756,6 +761,11 @@ class SavedViewSerializer(OwnedObjectSerializer):
         ]
 ```
 
+> **full_perms 关键差异**：SavedViewSerializer **没有重写 `__init__`**，完全继承 OwnedObjectSerializer 的字段裁剪逻辑。它不会像 DocumentSerializer 那样在 PATCH/PUT 时自动强制 full_perms=true。SavedView 的 full_perms 完全由请求 URL 的 query 参数决定（通过 PassUserMixin 解析）。因此：
+> - `GET /api/saved_views/?full_perms=true` → 响应含完整 `permissions` 矩阵，不含 `user_can_change`
+> - `GET /api/saved_views/`（默认）→ 响应含 `user_can_change`，不含完整 `permissions`
+> - `PATCH /api/saved_views/{id}/`（默认）→ 响应含 `user_can_change`，**不含完整 `permissions`**，前端必须重新 GET 才能拿到更新后的权限矩阵
+
 **filter_rules 嵌套写入：** `update()` 中先删后重建
 
 位置：`src/documents/serialisers.py#L1480-L1512`
@@ -1123,17 +1133,18 @@ bulk_edit_objects(objects, operation, permissions = null, merge = null, all = fa
 
 ## 6. 完整数据流示例：SavedView 权限编辑
 
-### Step 1：SavedViewsComponent 加载列表（带完整权限）
+### Step 1：SavedViewsComponent 加载列表（前端显式传 full_perms=true）
 
 ```
 GET /api/saved_views/?full_perms=true
 ```
 
 后端：
-1. `PassUserMixin.get_serializer()` 注入 `user`, `full_perms=true`
-2. `BulkPermissionMixin.get_serializer_context()` 预取所有 SavedView 的权限到 context
-3. `SavedViewSerializer.__init__()` → `OwnedObjectSerializer.__init__()`：`full_perms=true`，移除 `user_can_change`
-4. `get_permissions()` 从 context 批量缓存读取，返回完整权限矩阵
+1. 前端 SavedViewsComponent.reloadViews() 在调用 list() 时显式传入 `{ full_perms: true }` 作为 extraParams
+2. `PassUserMixin.get_serializer()` 从 query_params 解析到 `full_perms=true`，连同 `user` 一起注入 Serializer
+3. `BulkPermissionMixin.get_serializer_context()` 检测到 full_perms=true，预取所有 SavedView 的权限到 context 缓存
+4. `SavedViewSerializer.__init__()` → 继承 `OwnedObjectSerializer.__init__()`：full_perms=true → 移除 `user_can_change` 和 `is_shared_by_requester`，保留完整 `permissions` 矩阵
+5. `get_permissions()` 从 context 批量缓存读取，返回完整权限矩阵
 
 ### Step 2：响应 JSON
 
@@ -1191,14 +1202,32 @@ Content-Type: application/json
 }
 ```
 
-### Step 5：后端处理写入
+### Step 5：后端处理写入 + 前端 reload 获取完整权限
 
-1. `SavedViewSerializer.__init__()` 检测到 PATCH → 自动 `full_perms=true`
-2. `validate_set_permissions()` 校验所有 user_id/group_id 存在
-3. `OwnedObjectSerializer.update()` 校验当前用户是 owner / superuser（否则 PermissionDenied）
-4. `_set_permissions()` → `set_permissions_for_object()` 通过 django-guardian 更新权限表
+后端处理写入：
+1. `PassUserMixin.get_serializer()`：请求 URL `PATCH /api/saved_views/5/` **不带** `?full_perms=true` query 参数，因此解析为 `full_perms=false`，注入 Serializer
+2. `SavedViewSerializer.__init__()` → 继承 `OwnedObjectSerializer.__init__()`：full_perms=false → 移除 `permissions` 字段，只保留 `user_can_change` 和 `is_shared_by_requester`（注意：SavedViewSerializer **没有** DocumentSerializer 那种 PATCH 自动 full_perms=true 的逻辑）
+3. `validate_set_permissions()` 校验所有 user_id/group_id 存在
+4. `OwnedObjectSerializer.update()` 校验当前用户是 owner / superuser（否则 PermissionDenied）
+5. `_set_permissions()` → `set_permissions_for_object()` 通过 django-guardian 更新权限表
    - change 权限会自动附带 view 权限
-5. 返回带完整 `permissions` 的响应（PATCH 自动 full_perms=true）
+6. **PATCH 响应**：因为 full_perms=false，响应中**不包含完整 `permissions` 矩阵**，只有 `user_can_change`、`is_shared_by_requester` 等轻量字段
+
+前端 patch 成功后的动作（关键！SavedView 前端不靠 PATCH 响应拿完整权限）：
+
+```typescript
+this.savedViewService.patch(view as SavedView).subscribe({
+    next: () => {
+        this.toastService.showInfo($localize`Permissions updated`)
+        modal.close()
+        this.reloadViews()  // ← 重新 GET /api/saved_views/?full_perms=true 获取完整权限
+    },
+})
+```
+
+> **Document vs SavedView 对比**：
+> - Document PATCH：后端 DocumentSerializer.__init__ 自动强制 full_perms=true，PATCH 响应直接带完整 permissions，前端无需额外 reload
+> - SavedView PATCH：后端无自动强制，PATCH 响应只有 user_can_change，前端必须显式 reloadViews() 重新 GET 才能拿到更新后的完整权限矩阵
 
 ---
 
