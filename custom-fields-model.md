@@ -414,18 +414,504 @@ DocumentLink 的 `contains` 操作有特殊处理：通过反向查询交集实�
 
 ---
 
-## 7. 关键文件索引
+## 8. 保存入口全景：DocumentMetadataOverrides 与四大写入路径
+
+Custom Fields 的保存并非只有 API 序列化器一条路径。系统中有一个核心数据载体 `DocumentMetadataOverrides`，以及围绕它的 **四大保存入口**。理解这些入口才能真正把握字段值是如何流转的。
+
+### 8.1 数据载体：DocumentMetadataOverrides
+
+定义位置：[data_models.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/data_models.py#L12-L147)
+
+这是一个 dataclass，用于在消费/导入/工作流等多个环节之间传递「覆盖值」。与 Custom Fields 相关的字段：
+
+```python
+@dataclasses.dataclass
+class DocumentMetadataOverrides:
+    custom_fields: dict | None = None   # {field_id: value, ...}
+```
+
+#### update() 合并逻辑
+
+[data_models.py L94-L97](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/data_models.py#L94-L97)
+
+```python
+if self.custom_fields is None:
+    self.custom_fields = other.custom_fields
+elif other.custom_fields is not None:
+    self.custom_fields.update(other.custom_fields)
+```
+
+行为：后者覆盖前者的同名字段，保留不同字段。这使得多个工作流的赋值可以叠加。
+
+#### from_document() 反向构造
+
+[data_models.py L127-L130](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/data_models.py#L127-L130)
+
+```python
+overrides.custom_fields = {
+    custom_field.field.id: custom_field.value
+    for custom_field in doc.custom_fields.all()
+}
+```
+
+从已有文档提取当前值，用于「文档更新」场景下的 websocket 状态同步等。
+
+---
+
+### 8.2 路径一：API / WebUI 上传 → 消费者异步写入
+
+这是最常见的入口：用户在 WebUI 上传文件或通过 REST API POST `/api/documents/post_document/`。
+
+#### 入口代码：views.py DocumentViewSet.post_document()
+
+[views.py L3100-L3160](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/views.py#L3100-L3160)
+
+```python
+cf = serializer.validated_data.get("custom_fields")
+# 支持两种格式：
+#   dict: {field_id: value, ...}  → 直接使用
+#   list: [field_id, ...]         → 值全部置为 None
+custom_fields = None
+if isinstance(cf, dict) and cf:
+    custom_fields = cf
+elif isinstance(cf, list) and cf:
+    custom_fields = dict.fromkeys(cf, None)
+
+input_doc_overrides = DocumentMetadataOverrides(
+    ...,
+    custom_fields=custom_fields,
+)
+consume_file.apply_async(kwargs={"input_doc": input_doc, "overrides": input_doc_overrides})
+```
+
+#### 异步消费流程：tasks.py consume_file()
+
+[tasks.py L124-L220](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/tasks.py#L124-L220)
+
+Celery 任务按顺序执行以下插件链（每个插件都可以修改 `overrides`）：
+
+```
+ConsumerPreflightPlugin
+  → AsnCheckPlugin
+  → CollatePlugin
+  → BarcodePlugin
+  → AsnCheckPlugin（条码后重检）
+  → WorkflowTriggerPlugin  ← 在这里调用 CONSUMPTION 类型工作流，可能追加 custom_fields
+  → ConsumerPlugin          ← 最终落库
+```
+
+每个插件的核心约定：
+```python
+plugin = plugin_class(input_doc, overrides, ...)
+plugin.run()
+overrides = plugin.metadata   # 覆盖，支持链式修改
+```
+
+#### WorkflowTriggerPlugin：消费阶段的工作流注入
+
+[consumer.py L74-L87](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/consumer.py#L74-L87)
+
+```python
+class WorkflowTriggerPlugin:
+    def run(self):
+        overrides, msg = run_workflows(
+            trigger_type=WorkflowTrigger.WorkflowTriggerType.CONSUMPTION,
+            document=self.input_doc,
+            overrides=DocumentMetadataOverrides(),  # 新建空的 overrides
+        )
+        if overrides:
+            self.metadata.update(overrides)  # 与 API 传入的合并
+```
+
+注意这里传入的是一个**全新的空 overrides**，消费阶段工作流的赋值通过 `update()` 与 API 传入的值合并。
+
+#### ConsumerPlugin.apply_overrides()：最终落库
+
+[consumer.py L877-L938](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/consumer.py#L877-L938)
+
+Document 对象创建后，调用 `apply_overrides()` 将 `metadata.custom_fields` 写入数据库：
+
+```python
+if self.metadata.custom_fields:
+    for field in CustomField.objects.filter(
+        id__in=self.metadata.custom_fields.keys(),
+    ).distinct():
+        value_field_name = CustomFieldInstance.get_value_field_name(
+            data_type=field.data_type,
+        )
+        args = {
+            "field": field,
+            "document": document,
+            value_field_name: self.metadata.custom_fields.get(field.id, None),
+        }
+        CustomFieldInstance.objects.create(**args)
+```
+
+**关键特征**：
+- 使用 `objects.create()` 直接插入，**不经过序列化器验证**
+- 不处理 DocumentLink 的对称链接（`reflect_doclinks`）
+- 如果字段已存在（虽理论上不会发生，因为文档刚创建），会触发 UniqueConstraint 异常
+
+---
+
+### 8.3 路径二：文档导入导出（document_importer / document_exporter）
+
+用于备份恢复或实例迁移。
+
+#### 导出：document_exporter.py
+
+[document_exporter.py L396-L397](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/management/commands/document_exporter.py#L396-L397)
+
+```python
+"custom_fields": CustomField.objects.all(),
+"custom_field_instances": CustomFieldInstance.global_objects.all(),  # 包含软删除
+```
+
+使用 Django 标准序列化器，导出**所有字段值（含软删除）**。
+
+#### 导入：document_importer.py load_data_to_database()
+
+[document_importer.py L354-L430](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/management/commands/document_importer.py#L354-L430)
+
+使用 `bulk_create(..., update_conflicts=True)` 按 PK 批量 upsert。**关键特征**：
+
+1. **禁用信号**：导入时禁用以下信号以避免性能损耗和级联副作用
+   - `update_filename_and_move_files`（Document + CustomFieldInstance）
+   - `check_paths_and_prune_custom_fields`（CustomField）
+   - auditlog 全部模型
+
+2. **禁用约束检查**：`connection.constraint_checks_disabled()` 允许乱序导入
+
+3. **排除 GeneratedField**：`value_monetary_amount` 由数据库自动生成，不手动写入
+
+4. **不做任何验证**：直接反序列化写入，信任导出文件的完整性
+
+---
+
+### 8.4 路径三：工作流（Workflow）分配与移除
+
+工作流是自动化的核心，Custom Fields 是其重要的操作对象。工作流在三种触发时机执行：
+
+| 触发类型 | 触发时机 | 操作对象 | 执行模式 |
+|----------|----------|----------|----------|
+| `CONSUMPTION` | 文档消费过程中 | `DocumentMetadataOverrides` | 修改 overrides（不落库） |
+| `DOCUMENT_ADDED` | 文档刚创建完成 | Document 实例 | 直接修改数据库 |
+| `DOCUMENT_UPDATED` | 文档字段更新后 | Document 实例 | 直接修改数据库 |
+| `SCHEDULED` | 定时调度 | Document 实例 | 直接修改数据库 |
+
+#### WorkflowAction 的 Custom Fields 相关字段
+
+[models.py L1671-L1784](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/models.py#L1671-L1784)
+
+```python
+class WorkflowAction:
+    assign_custom_fields = models.ManyToManyField(CustomField, ...)
+    assign_custom_fields_values = models.JSONField(...)  # {"field_id_str": value, ...}
+    remove_custom_fields = models.ManyToManyField(CustomField, ...)
+    remove_all_custom_fields = models.BooleanField(default=False)
+```
+
+`assign_custom_fields_values` 的 key 是字段 ID 的**字符串形式**，这是因为 JSONField 中 key 必须是字符串。
+
+#### run_workflows()：统一调度器
+
+[signals/handlers.py L854-L960](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/signals/handlers.py#L854-L960)
+
+核心分支逻辑：
+
+```python
+if action.type == WorkflowAction.WorkflowActionType.ASSIGNMENT:
+    if use_overrides:
+        apply_assignment_to_overrides(action, overrides)      # 消费阶段：写到 overrides
+    else:
+        apply_assignment_to_document(action, document, ...)   # 已存在文档：直接落库
+
+elif action.type == WorkflowAction.WorkflowActionType.REMOVAL:
+    if use_overrides:
+        apply_removal_to_overrides(action, overrides)
+    else:
+        apply_removal_to_document(action, document)
+```
+
+`use_overrides = (overrides is not None)`，消费阶段传 overrides 就走 overrides 分支，否则走 document 分支。
+
+#### apply_assignment_to_document()：直接落库
+
+[workflows/mutations.py L86-L110](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/mutations.py#L86-L110)
+
+```python
+if action.has_assign_custom_fields:
+    for field in action.assign_custom_fields.all():
+        value_field_name = CustomFieldInstance.get_value_field_name(
+            data_type=field.data_type,
+        )
+        args = {
+            value_field_name: action.assign_custom_fields_values.get(
+                str(field.pk), None,
+            ),
+        }
+        # 注释：for some reason update_or_create doesn't work here
+        instance = CustomFieldInstance.objects.filter(
+            field=field, document=document,
+        ).first()
+        if instance and args[value_field_name] is not None:
+            setattr(instance, value_field_name, args[value_field_name])
+            instance.save()
+        elif not instance:
+            CustomFieldInstance.objects.create(**args, field=field, document=document)
+```
+
+**关键特征**：
+- 手动实现了 `update_or_create`（注释说 update_or_create 不工作，推测与 SoftDeleteModel 的管理器有关）
+- **值为 None 时不更新已有实例**（静默跳过，不会清值）
+- 不经过序列化器验证
+- 不处理 DocumentLink 对称链接
+
+#### apply_assignment_to_overrides()：写入 overrides
+
+[workflows/mutations.py L180-L191](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/mutations.py#L180-L191)
+
+```python
+if action.has_assign_custom_fields:
+    if overrides.custom_fields is None:
+        overrides.custom_fields = {}
+    overrides.custom_fields.update({
+        field.pk: action.assign_custom_fields_values.get(str(field.pk), None)
+        for field in action.assign_custom_fields.all()
+    })
+```
+
+消费阶段不直接落库，而是写入 overrides，最终由 ConsumerPlugin.apply_overrides() 统一落库。
+
+#### apply_removal_to_document()：硬删除实例
+
+[workflows/mutations.py L266-L272](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/mutations.py#L266-L272)
+
+```python
+if action.remove_all_custom_fields:
+    CustomFieldInstance.objects.filter(document=document).hard_delete()
+elif action.has_remove_custom_fields:
+    CustomFieldInstance.objects.filter(
+        field__in=action.remove_custom_fields.all(),
+        document=document,
+    ).hard_delete()
+```
+
+使用 `hard_delete()` 直接从数据库删除（绕过软删除）。不会通知 DocumentLink 的对称方。
+
+#### apply_removal_to_overrides()：从 overrides 中移除
+
+[workflows/mutations.py L348-L354](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/mutations.py#L348-L354)
+
+```python
+if action.remove_all_custom_fields:
+    overrides.custom_fields = None
+elif action.has_remove_custom_fields and overrides.custom_fields:
+    for field in action.remove_custom_fields.filter(
+        pk__in=overrides.custom_fields.keys(),
+    ):
+        overrides.custom_fields.pop(field.pk, None)
+```
+
+#### SCHEDULED 触发器的特殊用法
+
+[tasks.py L494-L506](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/tasks.py#L494-L506)
+
+调度工作流可以用某个 CustomField 的日期值作为「调度触发时间」：
+
+```python
+cf_filter_kwargs = {
+    "field": trigger.schedule_date_custom_field,
+    "value_date__isnull": False,
+    "value_date__lte": threshold,
+    "value_date__gte": earliest_date,
+}
+recent_cf_instances = CustomFieldInstance.objects.filter(**cf_filter_kwargs)
+matched_ids = [cfi.document_id for cfi in recent_cf_instances]
+```
+
+这是 CustomFieldInstance 直接被业务逻辑查询的典型场景，绕过了搜索索引，使用 ORM 直接过滤。
+
+---
+
+### 8.5 路径四：信号驱动的级联更新
+
+CustomField **定义**的变更会触发已有实例的级联更新。
+
+#### check_paths_and_prune_custom_fields + process_cf_select_update
+
+[signals/handlers.py L671-L710](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/signals/handlers.py#L671-L710)
+
+当 CustomField（且类型为 SELECT）保存时触发：
+
+```python
+@receiver(models.signals.post_save, sender=CustomField)
+def check_paths_and_prune_custom_fields(sender, instance, **kwargs):
+    if instance.data_type == CustomField.FieldDataType.SELECT and instance.fields.count() > 0:
+        process_cf_select_update.apply_async(kwargs={"custom_field": instance})
+```
+
+异步任务 `process_cf_select_update` 做两件事：
+
+1. **清理失效选项**：已移除的 option id 对应的实例值被置为 None
+   ```python
+   select_options = {opt["id"]: opt["label"] for opt in custom_field.extra_data.get("select_options", [])}
+   custom_field.fields.exclude(value_select__in=select_options.keys()).update(value_select=None)
+   ```
+
+2. **触发文件名更新**：如果文件名模板使用了该自定义字段，重新生成文件名
+   ```python
+   for cf_instance in custom_field.fields.select_related("document").iterator():
+       update_filename_and_move_files(CustomFieldInstance, cf_instance)
+   ```
+
+#### update_filename_and_move_files：文件名联动
+
+[signals/handlers.py L431-L442](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/signals/handlers.py#L431-L442)
+
+```python
+@receiver(models.signals.post_save, sender=CustomFieldInstance, weak=False)
+def update_filename_and_move_files(sender, instance, **kwargs):
+    if isinstance(instance, CustomFieldInstance):
+        if not _filename_template_uses_custom_fields(instance.document):
+            return
+        instance = instance.document
+    # ... 后续执行文件重命名和移动
+```
+
+只要文件名模板中包含 `custom_fields` 占位符，任何 CustomFieldInstance 的保存都会触发文件重命名。
+
+---
+
+## 9. 各保存路径与验证、搜索、展示的关系
+
+### 9.1 四大路径的验证差异对比
+
+并非所有路径都经过第4章描述的序列化器验证。以下是完整对比：
+
+| 保存路径 | 是否经过 CustomFieldInstanceSerializer 验证 | 是否处理 DocumentLink 对称链接 | 值为 None 时行为 |
+|----------|------------------------------------------|-----------------------------|------------------|
+| **API 单实例**（CustomFieldInstanceViewSet） | ✅ 完整验证（URL、整数范围、货币格式、SELECT id 合法性、DocumentLink 权限等） | ✅ `reflect_doclinks` / `remove_doclink` | 清空该字段值 |
+| **API 文档更新**（DocumentSerializer.custom_fields） | ✅ 内部调用 CustomFieldInstanceSerializer | ✅ | 清空该字段值 |
+| **批量编辑**（bulk_edit.modify_custom_fields） | ❌ 无验证 | ✅ `reflect_doclinks`（仅 add） | 清值或创建空实例 |
+| **API 上传→ConsumerPlugin** | ❌ 无验证 | ❌ | 创建值为 None 的实例 |
+| **工作流 apply_assignment_to_document** | ❌ 无验证 | ❌ | 不更新已有实例（静默跳过） |
+| **工作流 apply_removal_to_document** | N/A（删除） | ❌ | hard_delete |
+| **document_importer 导入** | ❌ 无验证，信任导出数据 | ❌ | 按导出值原样写入 |
+| **SELECT 定义变更→process_cf_select_update** | ❌ 只清理失效选项 id | N/A | 失效选项置为 None |
+
+#### 验证缺失的影响与风险
+
+1. **DocumentLink 不对称**：通过消费者/工作流写入的文档链接不会自动创建反向链接。只有 API 单实例/文档更新和批量编辑路径会调用 `reflect_doclinks()`。
+   - 修复方式：在这些路径手动调用，或接受「非 API 路径产生的链接是单向的」。
+
+2. **非法值可落库**：消费者和工作流路径没有类型检查。如果工作流配置了非法的日期字符串或超出 int4 范围的整数，会触发数据库层 IntegrityError 或静默产生脏数据。
+   - 设计考量：工作流的字段值是管理员在后台配置的，假设其可信；消费者的 metadata 来源也是受控的（API 或工作流）。
+
+3. **SELECT 无效值**：除了 API 路径会校验 option id 是否存在，其他路径都不校验。但 `process_cf_select_update` 会在字段定义变更时做一次兜底清理。
+
+### 9.2 保存与搜索索引的关系
+
+搜索索引的更新依赖 Django 信号，不依赖具体保存路径。
+
+#### add_to_index 信号
+
+[signals/handlers.py L794-L800](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/signals/handlers.py#L794-L800)
+
+`document_consumption_finished` 和 `document_updated` 信号触发 `add_to_index()`，调用搜索后端的 `add_or_update()`。
+
+搜索后端遍历 `document.custom_fields.all()`，使用 `value_for_search` 属性将值转为字符串后写入 Tantivy 索引（见 5.1 节）。
+
+#### 各路径的索引触发情况
+
+| 保存路径 | 触发搜索重索引的方式 |
+|----------|-------------------|
+| API 单实例保存/删除 | Document.post_save → document_updated 信号 |
+| API 文档更新 | Document.post_save → document_updated 信号 |
+| 批量编辑 | bulk_update_documents 完成后手动发送 document_updated |
+| API 上传→ConsumerPlugin | `document_consumption_finished` 信号 |
+| 工作流（DOCUMENT_ADDED/UPDATED） | 触发 Document.save() → document_updated 信号 |
+| 工作流（CONSUMPTION） | 最终由 ConsumerPlugin 触发 document_consumption_finished |
+| document_importer 导入 | ⚠️ **禁用信号**，导入后需手动调用 `document_index` 命令重建索引 |
+| SELECT 定义变更 | 触发 CustomFieldInstance 的 post_save → update_filename_and_move_files，但**不会触发 Document 的 document_updated** |
+
+**注意**：`process_cf_select_update` 虽然修改了 CustomFieldInstance 的值（`value_select=None`），但它触发的是 CustomFieldInstance 的 post_save，而搜索索引依赖 Document 级别的信号。因此 SELECT 字段 option 被删除后，已有文档的搜索索引可能还残留旧的 label 值，需要手动重建索引或等待下次文档更新。
+
+### 9.3 保存与前端展示的关系
+
+前端展示依赖 API 返回的完整数据，展示逻辑本身是「读时处理」（SELECT id→label、货币格式化、日期本地化），与保存路径无关。但保存路径影响**数据能否被正确读取**：
+
+1. **SELECT 类型的读写一致性**：
+   - 保存时写入的是 option id（16 位字符串）
+   - 展示时从 `field.extra_data.select_options` 中反查 label
+   - 如果非 API 路径写入了不存在的 option id，展示时会显示空值
+   - `process_cf_select_update` 的清理逻辑可以部分缓解此问题
+
+2. **DocumentLink 类型的展示依赖**：
+   - 展示组件需要额外请求文档标题（`value_document_ids` 只存 ID）
+   - 不对称的链接（通过消费者/工作流写入）在目标文档的展示中不会出现反向链接
+
+3. **文件名模板与保存路径的交互**：
+   - 如果文件名模板使用了 `{custom_fields.xxx}`，CustomFieldInstance 的保存会触发文件重命名
+   - document_importer 导入时禁用了该信号，导入后文件名可能与模板不匹配，需要手动 `renaming_suggestions` 或重新触发
+
+4. **Websocket 通知**：
+   - API 更新文档后，`send_websocket_document_updated` 会使用 `DocumentMetadataOverrides.from_document()` 提取当前 custom_fields 值，推送给前端
+   - 工作流修改 Document 后触发的 Document.save() 也会走同样路径
+   - 消费者路径在 `document_consumption_finished` 后同样会通知
+
+### 9.4 全景关系图
+
+```
+                    ┌────────────────────────────────────────────┐
+                    │          保存入口（四条路径）                │
+                    └────────────────────────────────────────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+            ┌───────────┐   ┌───────────┐   ┌───────────┐
+            │序列化器验证│   │  直接ORM  │   │ bulk导入  │
+            │ (仅API)   │   │(工作流/消费)│   │(无验证)   │
+            └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
+                  │               │               │
+                  └───────────────┼───────────────┘
+                                  ▼
+                    ┌──────────────────────────────┐
+                    │   CustomFieldInstance 落库     │
+                    └───────────────┬──────────────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+            ┌───────────┐   ┌───────────┐   ┌───────────┐
+            │post_save  │   │搜索索引   │   │前端展示   │
+            │信号触发   │──▶│add_to_index│  │(读时处理) │
+            │文件重命名 │   │(需信号)   │   │id→label   │
+            └───────────┘   └───────────┘   └───────────┘
+```
+
+---
+
+## 10. 关键文件索引
 
 | 功能 | 文件路径 |
 |------|----------|
 | 数据模型定义 | [src/documents/models.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/models.py) |
+| MetadataOverrides 数据载体 | [src/documents/data_models.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/data_models.py) |
 | API 序列化 + 验证 | [src/documents/serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/serialisers.py) |
 | 过滤器 + 查询解析器 | [src/documents/filters.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/filters.py) |
 | 批量编辑 + DocLink 对称处理 | [src/documents/bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/bulk_edit.py) |
+| 消费者主流程（落库逻辑） | [src/documents/consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/consumer.py) |
+| Celery 任务调度（consume_file） | [src/documents/tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/tasks.py) |
+| 工作流分配/移除 mutations | [src/documents/workflows/mutations.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/mutations.py) |
+| 工作流执行上下文/actions | [src/documents/workflows/actions.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/actions.py) |
+| 工作流工具（Prefetch/annotate） | [src/documents/workflows/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/workflows/utils.py) |
+| 信号处理（工作流、索引、文件名） | [src/documents/signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/signals/handlers.py) |
+| 文档导入命令 | [src/documents/management/commands/document_importer.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/management/commands/document_importer.py) |
+| 文档导出命令 | [src/documents/management/commands/document_exporter.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/management/commands/document_exporter.py) |
 | URL 验证器 | [src/documents/validators.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/validators.py) |
 | 搜索索引写入 | [src/documents/search/_backend.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/search/_backend.py) |
 | 搜索索引 Schema | [src/documents/search/_schema.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/search/_schema.py) |
-| API 视图 | [src/documents/views.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/views.py) |
+| API 视图（上传入口） | [src/documents/views.py](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src/documents/views.py) |
 | 前端数据模型 | [src-ui/src/app/data/custom-field.ts](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src-ui/src/app/data/custom-field.ts) |
 | 前端展示组件 | [src-ui/src/app/components/common/custom-field-display/](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src-ui/src/app/components/common/custom-field-display/) |
 | 前端编辑组件 | [src-ui/src/app/components/common/input/custom-fields-values/](file:///d:/fz/0601/solo-dogfeeding/code/60-paperless-ngx/src-ui/src/app/components/common/input/custom-fields-values/) |
