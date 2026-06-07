@@ -316,25 +316,76 @@ def modify_tags(doc_ids, add_tags, remove_tags):
 | WorkflowAction | remove_tags / remove_document_types / remove_correspondents | 工作流动作：移除 |
 | PaperlessMailRule | assign_tags | 邮件规则：分配标签 |
 
-##### C. 存储为字符串/数字 ID 的引用（完全不会被自动检测或迁移）
+##### C. SavedViewFilterRule（存储为 rule_type + value，完全无外键约束，按存储形式分三类）
 
-| 表 | 字段 | 说明 |
-|---|---|---|
-| SavedViewFilterRule | `rule_type` + `value` | 保存视图的过滤规则，value 存的是实体 ID 的字符串形式，完全无外键约束 |
+模型定义：[models.py#L578-L648](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src/documents/models.py#L578-L648)
+- 后端枚举：`SavedViewFilterRule.RULE_TYPES`（0-49）
+- 前端常量：[filter-rule-type.ts](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src-ui/src/app/data/filter-rule-type.ts)
+- 字段定义：`value = models.CharField(max_length=255, blank=True, null=True)`
 
-见 [models.py#L578-L648](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src/documents/models.py#L578-L648)
+**核心发现**：
+1. `value` 是 CharField，存字符串形式
+2. multi=true 的 ID 列表**不是逗号分隔存在一条规则里**，而是**每个实体 ID 对应一条独立的 SavedViewFilterRule 记录**
+   证据：[filter-editor.component.ts#L895-L911](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src-ui/src/app/components/document-list/filter-editor/filter-editor.component.ts#L895-L911)
+   ```typescript
+   this.correspondentSelectionModel.getSelectedItems().forEach((correspondent) => {
+     filterRules.push({
+       rule_type: FILTER_HAS_CORRESPONDENT_ANY,
+       value: correspondent.id?.toString(),  // 每个 ID 一条规则
+     })
+   })
+   ```
 
-RULE_TYPES 中对应实体的枚举：
-- `3 = correspondent is`
-- `4 = document type is`
-- `6 = has tag`
-- `7 = has any tag`
-- `17 = does not have tag`
-- `22 = has tags in`
-- `26 = has correspondent in`
-- `27 = does not have correspondent in`
-- `28 = has document type in`
-- `29 = does not have document type in`
+下面按实体分类，逐一对照前后端常量，区分是否存实体 ID：
+
+**Tag 相关 rule_type（4 种存 ID，1 种布尔）**
+
+| 值 | 后端枚举文本 | 前端常量 | datatype / multi | value 内容 | 删除 Tag 后影响 |
+|---|---|---|---|---|---|
+| 5 | is in inbox | FILTER_IS_IN_INBOX | boolean / false | `'true'` | 不存实体 ID，无影响 |
+| 6 | has tag | FILTER_HAS_TAGS_ALL | Tag / true | **单个 Tag ID 字符串**（每个 ID 一条记录） | 规则静默失效，过滤结果为空 |
+| 7 | has any tag | FILTER_HAS_ANY_TAG | boolean / false | `'true'` 或 `'false'`（`'false'` = "无任何标签"） | **不存实体 ID**，布尔过滤，无影响 |
+| 17 | does not have tag | FILTER_DOES_NOT_HAVE_TAG | Tag / true | **单个 Tag ID 字符串** | 规则静默失效 |
+| 22 | has tags in | FILTER_HAS_TAGS_ANY | Tag / true | **单个 Tag ID 字符串**（每个 ID 一条记录） | 规则静默失效 |
+
+证据：
+- FILTER_HAS_ANY_TAG 布尔值：[filter-editor.component.ts#L854-L855](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src-ui/src/app/components/document-list/filter-editor/filter-editor.component.ts#L854-L855)
+  ```typescript
+  filterRules.push({ rule_type: FILTER_HAS_ANY_TAG, value: 'false' })
+  ```
+
+**Correspondent 相关 rule_type（2 种存 ID，1 种 isnull 标记）**
+
+| 值 | 后端枚举文本 | 前端常量 | datatype / multi | value 内容 | 删除 Correspondent 后影响 |
+|---|---|---|---|---|---|
+| 3 | correspondent is | FILTER_CORRESPONDENT | Correspondent / false | `null`（= 无联系人）或 `'-1'`（= NEGATIVE_NULL_FILTER_VALUE，有联系人） | **不存实体 ID**，仅 isnull 语义，无影响 |
+| 26 | has correspondent in | FILTER_HAS_CORRESPONDENT_ANY | Correspondent / true | **单个 Correspondent ID 字符串** | 规则静默失效 |
+| 27 | does not have correspondent in | FILTER_DOES_NOT_HAVE_CORRESPONDENT | Correspondent / true | **单个 Correspondent ID 字符串**（排除 id>0，过滤掉 -1） | 规则静默失效 |
+
+证据：
+- value=null 表示 isnull：[filter-editor.component.ts#L880-L884](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src-ui/src/app/components/document-list/filter-editor/filter-editor.component.ts#L880-L884)
+- value='-1' 表示 not isnull：[filter-editor.component.ts#L886-L893](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src-ui/src/app/components/document-list/filter-editor/filter-editor.component.ts#L886-L893)
+- 排除时过滤 id>0：[filter-editor.component.ts#L903-L911](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src-ui/src/app/components/document-list/filter-editor/filter-editor.component.ts#L903-L911)
+
+**DocumentType 相关 rule_type（2 种存 ID，1 种 isnull 标记）**
+
+| 值 | 后端枚举文本 | 前端常量 | datatype / multi | value 内容 | 删除 DocumentType 后影响 |
+|---|---|---|---|---|---|
+| 4 | document type is | FILTER_DOCUMENT_TYPE | DocumentType / false | `null`（= 无文档类型）或 `'-1'`（= 有文档类型） | **不存实体 ID**，仅 isnull 语义，无影响 |
+| 28 | has document type in | FILTER_HAS_DOCUMENT_TYPE_ANY | DocumentType / true | **单个 DocumentType ID 字符串** | 规则静默失效 |
+| 29 | does not have document type in | FILTER_DOES_NOT_HAVE_DOCUMENT_TYPE | DocumentType / true | **单个 DocumentType ID 字符串** | 规则静默失效 |
+
+**StoragePath 相关 rule_type（2 种存 ID，1 种 isnull 标记，额外补充）**
+
+| 值 | 后端枚举文本 | 前端常量 | datatype / multi | value 内容 |
+|---|---|---|---|---|
+| 25 | storage path is | FILTER_STORAGE_PATH | StoragePath / false | `null` 或 `'-1'` |
+| 30 | has storage path in | FILTER_HAS_STORAGE_PATH_ANY | StoragePath / true | **单个 StoragePath ID 字符串** |
+| 31 | does not have storage path in | FILTER_DOES_NOT_HAVE_STORAGE_PATH | StoragePath / true | **单个 StoragePath ID 字符串** |
+
+**总结**：
+- 真正存储实体 ID 的 rule_type：6、17、22、26、27、28、29、30、31
+- 不存实体 ID 的布尔/isnull rule_type（删除对应实体无影响）：3、4、5、7、25
 
 ##### D. django-guardian 对象级权限表（object_pk 是 CharField，删除实体时不会自动清理，会产生孤儿行）
 
