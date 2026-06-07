@@ -1,7 +1,9 @@
 # Paperless-ngx 缩略图与预览生成：代码证据与链路详解
 
-> 所有代码引用标注方式：`仓库相对路径`（稳定位置标识）+ 可点击绝对链接。
-> 稳定位置优先使用函数/类名（防行号漂移），必要时补充行号范围。
+> 代码引用规范：每个证据点标注三层信息，全部使用仓库相对路径，不包含任何本机绝对路径。
+> - 仓库相对路径：从项目根目录出发的文件路径
+> - 稳定位置：函数名 / 类名 / 变量名（抗行号漂移的语义锚点）
+> - 行号范围：辅助定位（基于当前仓库快照）
 
 ---
 
@@ -39,7 +41,7 @@
 
 - 仓库相对路径：`src/documents/consumer.py`
 - 稳定位置：`ConsumerPlugin.run()` → `document_parser.get_thumbnail()` 调用点
-- 代码链接：[consumer.py#L526-L536](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L526-L536)
+- 行号范围：L526-L536
 
 ```python
 # ConsumerPlugin.run() 内部
@@ -60,13 +62,13 @@ thumbnail = document_parser.get_thumbnail(
 
 - 仓库相对路径：`src/documents/consumer.py`
 - 稳定位置：`ConsumerStatusShortMessage.GENERATING_THUMBNAIL`
-- 代码链接：[consumer.py#L113-L122](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L113-L122)
+- 行号范围：L113-L122
 
 ### 2.2 存储路径计算
 
 - 仓库相对路径：`src/documents/models.py`
 - 稳定位置：`Document.thumbnail_path` 属性
-- 代码链接：[models.py#L479-L484](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L479-L484)
+- 行号范围：L479-L484
 
 ```python
 @property
@@ -82,7 +84,7 @@ def thumbnail_path(self) -> Path:
 
 - 仓库相对路径：`src/documents/consumer.py`
 - 稳定位置：`ConsumerPlugin._write()` 调用点，`FileLock(settings.MEDIA_LOCK)` 块内
-- 代码链接：[consumer.py#L689-L700](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L689-L700)
+- 行号范围：L689-L700
 
 ```python
 with FileLock(settings.MEDIA_LOCK):
@@ -95,7 +97,7 @@ with FileLock(settings.MEDIA_LOCK):
 
 - 仓库相对路径：`src/documents/tasks.py`
 - 稳定位置：`update_document_content_maybe_archive_file()` 函数
-- 代码链接：[tasks.py#L316-L376](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/tasks.py#L316-L376)
+- 行号范围：L316-L376
 
 ```python
 thumbnail = parser.get_thumbnail(document.source_path, mime_type)
@@ -114,7 +116,7 @@ with FileLock(settings.MEDIA_LOCK):
 
 - 仓库相对路径：`src/documents/consumer.py`
 - 稳定位置：`ConsumerPlugin.run()` 的 `except ParseError` / `except Exception` 分支
-- 代码链接：[consumer.py#L555-L568](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/consumer.py#L555-L568)
+- 行号范围：L555-L568
 
 ```python
 except ParseError as e:
@@ -127,7 +129,7 @@ except Exception as e:
 
 - 仓库相对路径：`src/documents/plugins/helpers.py`
 - 稳定位置：`BaseStatusManager._fail()` 方法
-- 代码链接：[helpers.py#L82-L105](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/plugins/helpers.py#L82-L105)
+- 行号范围：L82-L105
 
 `_fail()` 产生三个副作用：
 1. **WebSocket 推送**：`100/100 FAILED` + 错误消息 → 用户 UI 立刻可见
@@ -138,20 +140,20 @@ except Exception as e:
 
 - 仓库相对路径：`src-ui/src/app/services/websocket-status.service.ts`
 - 稳定位置：`FileStatus.updateFromStatus()` → 当 `status === "FAILED"` 时的分支
-- 代码链接：[websocket-status.service.ts#L99-L107](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts#L99-L107)
+- 行号范围：L99-L107
 
 进度换算：
 - 仓库相对路径：`src-ui/src/app/services/websocket-status.service.ts`
 - 稳定位置：`FileStatus.getProgress()` 中 `case FileStatusPhase.FAILED: return 1.0`
-- 代码链接：[websocket-status.service.ts#L61-L78](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts#L61-L78)
+- 行号范围：L61-L78
 
 **用户可见表现**：上传进度条直接走到 100%，红色失败提示显示错误消息文本。
 
 ### 3.4 持久化失败记录：PaperlessTask 表
 
 - 仓库相对路径：`src/documents/models.py`
-- 稳定位置：`PaperlessTask.Status.FAILURE` 枚举 + 字段
-- 代码链接：[models.py#L670-L679](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L670-L679)
+- 稳定位置：`PaperlessTask.Status.FAILURE` 枚举
+- 行号范围：L670-L679
 
 ```python
 class Status(models.TextChoices):
@@ -164,9 +166,9 @@ class Status(models.TextChoices):
 
 - 仓库相对路径：`src/documents/models.py`
 - 稳定位置：`PaperlessTask.result_data`、`PaperlessTask.date_done`、`PaperlessTask.duration_seconds`
-- 代码链接：[models.py#L786-L791](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L786-L791)
+- 行号范围：L786-L791
 
-**用户可见表现**：失败后文档**不会入库**（因为消费事务整体回滚）。用户只能在：
+**用户可见表现**：失败后文档**不会入库**（消费事务整体回滚）。用户只能在：
 - 上传 Toast 通知中看到错误摘要
 - `/api/tasks/` 任务列表（系统状态对话框）中看到历史失败记录，包含 `task_type=consume_file`、`status=failure`、错误消息
 
@@ -177,18 +179,18 @@ class Status(models.TextChoices):
 **列表页卡片缩略图**：
 - 仓库相对路径：`src-ui/src/app/components/document-list/document-card-small/document-card-small.component.html`
 - 稳定位置：`<img class="card-img doc-img" [src]="getThumbUrl()">`
-- 代码链接：[document-card-small.component.html#L5](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-list/document-card-small/document-card-small.component.html#L5)
+- 行号：L5
 
 - 仓库相对路径：`src-ui/src/app/components/document-list/document-card-large/document-card-large.component.html`
 - 稳定位置：`<img [src]="getThumbUrl()" class="card-img doc-img">`
-- 代码链接：[document-card-large.component.html#L5](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-list/document-card-large/document-card-large.component.html#L5)
+- 行号：L5
 
 **表现**：浏览器 `<img>` 加载 `/api/documents/<id>/thumb/` 返回 404，图片位置显示为空白破图图标（浏览器默认行为）。前端未绑定 `(error)` 事件做额外兜底。
 
 **详情页缩略图覆盖层**：
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.html`
 - 稳定位置：`<img [src]="thumbUrl" ... alt="Document loading...">`
-- 代码链接：[document-detail.component.html#L458-L467](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L458-L467)
+- 行号范围：L458-L467
 
 **表现**：同样是浏览器默认破图标，覆盖层在 `previewLoaded` 为 true 前持续显示。
 
@@ -201,7 +203,7 @@ class Status(models.TextChoices):
 **命令实现**
 - 仓库相对路径：`src/documents/management/commands/document_thumbnails.py`
 - 稳定位置：`Command` 类、`_process_document()` 函数
-- 代码链接：[document_thumbnails.py#L1-L70](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/management/commands/document_thumbnails.py#L1-L70)
+- 行号范围：L1-L70
 
 ```python
 def _process_document(doc_id: int) -> None:
@@ -255,7 +257,7 @@ python manage.py document_thumbnails --no-progress-bar
 **命令基类提供的能力**
 - 仓库相对路径：`src/documents/management/commands/base.py`
 - 稳定位置：`PaperlessCommand.process_parallel()`、`PaperlessCommand.track()`
-- 代码链接：[base.py#L464-L550](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/management/commands/base.py#L464-L550)
+- 行号范围：L464-L550
 
 `process_parallel()` 行为：
 - `--processes 1` 时主进程顺序执行（方便测试和调试）
@@ -267,7 +269,7 @@ python manage.py document_thumbnails --no-progress-bar
 **前端入口（详情页）**
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
 - 稳定位置：`DocumentDetailComponent.reprocess()` 方法
-- 代码链接：[document-detail.component.ts#L1373-L1406](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L1373-L1406)
+- 行号范围：L1373-L1406
 
 ```typescript
 reprocess() {
@@ -288,12 +290,12 @@ reprocess() {
 **前端入口（列表页批量）**
 - 仓库相对路径：`src-ui/src/app/components/document-list/bulk-editor/bulk-editor.component.ts`
 - 稳定位置：`BulkEditorComponent.reprocessSelected()` 方法
-- 代码链接：[bulk-editor.component.ts#L891-L906](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-list/bulk-editor/bulk-editor.component.ts#L891-L906)
+- 行号范围：L891-L906
 
 **HTTP 请求**
 - 仓库相对路径：`src-ui/src/app/services/rest/document.service.ts`
 - 稳定位置：`DocumentService.reprocessDocuments()`
-- 代码链接：[document.service.ts#L352-L356](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/rest/document.service.ts#L352-L356)
+- 行号范围：L352-L356
 
 ```typescript
 reprocessDocuments(selection: DocumentSelectionQuery) {
@@ -306,12 +308,12 @@ reprocessDocuments(selection: DocumentSelectionQuery) {
 **后端 API 路由**
 - 仓库相对路径：`src/documents/views.py`
 - 稳定位置：`DocumentViewSet` 中 `reprocess` action 注册
-- 代码链接：[views.py#L3002-L3023](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L3002-L3023)
+- 行号范围：L3002-L3023
 
 **后端执行**
 - 仓库相对路径：`src/documents/bulk_edit.py`
 - 稳定位置：`reprocess()` 函数
-- 代码链接：[bulk_edit.py#L395-L402](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/bulk_edit.py#L395-L402)
+- 行号范围：L395-L402
 
 ```python
 def reprocess(doc_ids: list[int]) -> Literal["OK"]:
@@ -323,16 +325,16 @@ def reprocess(doc_ids: list[int]) -> Literal["OK"]:
     return "OK"
 ```
 
-**任务类型**
+**任务类型枚举**
 - 仓库相对路径：`src/documents/models.py`
 - 稳定位置：`PaperlessTask.TaskType.REPROCESS_DOCUMENT = "reprocess_document"`
-- 代码链接：[models.py#L691](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/models.py#L691)
+- 行号：L691
 
 - 仓库相对路径：`src-ui/src/app/data/paperless-task.ts`
 - 稳定位置：`PaperlessTaskType.ReprocessDocument = 'reprocess_document'`
-- 代码链接：[paperless-task.ts#L12](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/data/paperless-task.ts#L12)
+- 行号：L12
 
-**用户可见表现**：点击 Reprocess → 弹出确认框 → 确认后 Toast 提示 "will begin in the background" → 任务列表中出现 `task_type=reprocess_document` 的新任务 → 执行过程中缩略图会被重新生成。
+**用户可见表现**：点击 Reprocess → 弹出确认框 → 确认后 Toast 提示 "will begin in the background" → 任务列表中出现 `task_type=reprocess_document` 的新任务 → 执行过程中缩略图被重新生成。
 
 ---
 
@@ -343,7 +345,7 @@ def reprocess(doc_ids: list[int]) -> Literal["OK"]:
 **详情页处理逻辑**
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
 - 稳定位置：`DocumentDetailComponent.onError()` 方法
-- 代码链接：[document-detail.component.ts#L1502-L1507](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L1502-L1507)
+- 行号范围：L1502-L1507
 
 ```typescript
 onError(event) {
@@ -357,7 +359,7 @@ onError(event) {
 **详情页模板渲染**
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.html`
 - 稳定位置：`@if (requiresPassword)` 块 + `<div class="password-prompt">`
-- 代码链接：[document-detail.component.html#L509-L515](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L509-L515)
+- 行号范围：L509-L515
 
 ```html
 @if (requiresPassword) {
@@ -373,12 +375,12 @@ onError(event) {
 **预览弹窗处理逻辑**
 - 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.ts`
 - 稳定位置：`PreviewPopupComponent.onError()` 方法
-- 代码链接：[preview-popup.component.ts#L109-L115](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.ts#L109-L115)
+- 行号范围：L109-L115
 
 **预览弹窗模板**
 - 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.html`
 - 稳定位置：`@if (requiresPassword)` → `file-earmark-lock` 图标
-- 代码链接：[preview-popup.component.html#L20-L24](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.html#L20-L24)
+- 行号范围：L20-L24
 
 ```html
 @if (requiresPassword) {
@@ -395,7 +397,7 @@ onError(event) {
 **预览弹窗处理逻辑**
 - 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.ts`
 - 稳定位置：`PreviewPopupComponent.onError()` 的 else 分支 → `this.error = true`
-- 代码链接：[preview-popup.component.ts#L109-L115](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.ts#L109-L115)
+- 行号范围：L109-L115
 
 ```typescript
 onError(event: any) {
@@ -410,7 +412,7 @@ onError(event: any) {
 **预览弹窗模板渲染**
 - 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.html`
 - 稳定位置：`@if (error)` → "Error loading preview" 斜体文本
-- 代码链接：[preview-popup.component.html#L8-L11](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.html#L8-L11)
+- 行号范围：L8-L11
 
 ```html
 @if (error) {
@@ -426,8 +428,8 @@ onError(event: any) {
 
 **详情页 TIFF 渲染逻辑**
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
-- 稳定位置：`DocumentDetailComponent.tryRenderTiff()` 方法中的两个错误处理分支
-- 代码链接：[document-detail.component.ts#L1940-L1984](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L1940-L1984)
+- 稳定位置：`DocumentDetailComponent.tryRenderTiff()` 方法中的两个错误处理分支（HTTP 请求错误 + UTIF.js 解码异常）
+- 行号范围：L1940-L1984
 
 ```typescript
 // HTTP 请求失败分支
@@ -444,7 +446,7 @@ catch (err) {
 **详情页模板渲染**
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.html`
 - 稳定位置：`@case (ContentRenderType.TIFF)` 中的 `@if (!tiffError) / @else`
-- 代码链接：[document-detail.component.html#L496-L503](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L496-L503)
+- 行号范围：L496-L503
 
 ```html
 @case (ContentRenderType.TIFF) {
@@ -458,10 +460,10 @@ catch (err) {
 }
 ```
 
-**元数据加载时重置**
+**元数据加载时重置 tiffError**
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
 - 稳定位置：`loadMetadataForSelectedVersion()` 中 `this.tiffError = null`
-- 代码链接：[document-detail.component.ts#L384-L416](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L384-L416)
+- 行号范围：L384-L416
 
 **用户可见表现**：预览区域显示浅灰背景、带滚动条的错误文本，包含具体异常信息（如 "An error occurred loading tiff: TypeError: ..."）。
 
@@ -470,7 +472,7 @@ catch (err) {
 **详情页预览文本加载逻辑**
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.ts`
 - 稳定位置：加载 `content` 字段时的 `.subscribe({ error: ... })` 回调
-- 代码链接：[document-detail.component.ts#L509-L514](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L509-L514)
+- 行号范围：L509-L514
 
 ```typescript
 .subscribe({
@@ -483,7 +485,7 @@ catch (err) {
 **详情页模板渲染**
 - 仓库相对路径：`src-ui/src/app/components/document-detail/document-detail.component.html`
 - 稳定位置：`@case (ContentRenderType.Text)` → `<div>{{previewText}}</div>`
-- 代码链接：[document-detail.component.html#L488-L489](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L488-L489)
+- 行号范围：L488-L489
 
 ```html
 @case (ContentRenderType.Text) {
@@ -494,7 +496,7 @@ catch (err) {
 **预览弹窗模板渲染**
 - 仓库相对路径：`src-ui/src/app/components/common/preview-popup/preview-popup.component.html`
 - 稳定位置：`@if (previewText)` → 同样式文本容器
-- 代码链接：[preview-popup.component.html#L14-L15](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/components/common/preview-popup/preview-popup.component.html#L14-L15)
+- 行号范围：L14-L15
 
 **用户可见表现**：预览区域直接显示 "An error occurred loading content: ..." 错误信息，不打断其他操作。
 
@@ -507,7 +509,7 @@ catch (err) {
 **缓存 Key 构造**
 - 仓库相对路径：`src/documents/caching.py`
 - 稳定位置：`get_thumbnail_modified_key()` 函数
-- 代码链接：[caching.py#L329-L331](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L329-L331)
+- 行号范围：L329-L331
 
 ```python
 def get_thumbnail_modified_key(document_id: int) -> str:
@@ -517,12 +519,12 @@ def get_thumbnail_modified_key(document_id: int) -> str:
 **TTL 常量**
 - 仓库相对路径：`src/documents/caching.py`
 - 稳定位置：`CACHE_50_MINUTES = 50 * 60`
-- 代码链接：[caching.py#L46-L48](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L46-L48)
+- 行号范围：L46-L48
 
 **读缓存逻辑**
 - 仓库相对路径：`src/documents/conditionals.py`
 - 稳定位置：`thumbnail_last_modified()` 函数
-- 代码链接：[conditionals.py#L120-L146](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/conditionals.py#L120-L146)
+- 行号范围：L120-L146
 
 ```python
 def thumbnail_last_modified(request, pk: int) -> datetime | None:
@@ -540,7 +542,7 @@ def thumbnail_last_modified(request, pk: int) -> datetime | None:
 **缓存失效**
 - 仓库相对路径：`src/documents/caching.py`
 - 稳定位置：`clear_document_caches()` 函数
-- 代码链接：[caching.py#L336-L345](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/caching.py#L336-L345)
+- 行号范围：L336-L345
 
 ```python
 def clear_document_caches(document_id: int) -> None:
@@ -556,16 +558,16 @@ def clear_document_caches(document_id: int) -> None:
 **装饰器挂载**
 - 仓库相对路径：`src/documents/views.py`
 - 稳定位置：`DocumentViewSet.thumb()` 的 `@last_modified` 装饰器
-- 代码链接：[views.py#L1565-L1583](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1565-L1583)
+- 行号范围：L1565-L1583
 
 - 仓库相对路径：`src/documents/views.py`
 - 稳定位置：`DocumentViewSet.preview()` 的 `@condition(etag_func=..., last_modified_func=...)` 装饰器
-- 代码链接：[views.py#L1538-L1563](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1538-L1563)
+- 行号范围：L1538-L1563
 
 **preview ETag 计算**
 - 仓库相对路径：`src/documents/conditionals.py`
 - 稳定位置：`preview_etag()` 函数
-- 代码链接：[conditionals.py#L94-L106](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/conditionals.py#L94-L106)
+- 行号范围：L94-L106
 
 ```python
 def preview_etag(request, pk: int) -> str | None:
@@ -586,14 +588,14 @@ def preview_etag(request, pk: int) -> str | None:
 **预览端点**
 - 仓库相对路径：`src/documents/views.py`
 - 稳定位置：`DocumentViewSet.preview()` 方法
-- 代码链接：[views.py#L1544-L1563](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1544-L1563)
+- 行号范围：L1544-L1563
 
 路由：`GET /api/documents/<id>/preview/?original=true&version=<id>`
 
 **缩略图端点**
 - 仓库相对路径：`src/documents/views.py`
 - 稳定位置：`DocumentViewSet.thumb()` 方法
-- 代码链接：[views.py#L1568-L1583](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L1568-L1583)
+- 行号范围：L1568-L1583
 
 路由：`GET /api/documents/<id>/thumb/?version=<id>`
 
@@ -601,7 +603,7 @@ def preview_etag(request, pk: int) -> str | None:
 
 - 仓库相对路径：`src/documents/views.py`
 - 稳定位置：`serve_file()` 函数
-- 代码链接：[views.py#L4473-L4522](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/views.py#L4473-L4522)
+- 行号范围：L4473-L4522
 
 ```python
 def serve_file(*, doc, use_archive, disposition, follow_formatting=False):
@@ -623,7 +625,7 @@ def serve_file(*, doc, use_archive, disposition, follow_formatting=False):
 
 - 仓库相对路径：`src-ui/src/app/services/rest/document.service.ts`
 - 稳定位置：`DocumentService.getThumbUrl()` / `getPreviewUrl()`
-- 代码链接：[document.service.ts#L215-L237](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/rest/document.service.ts#L215-L237)
+- 行号范围：L215-L237
 
 ---
 
@@ -633,7 +635,7 @@ def serve_file(*, doc, use_archive, disposition, follow_formatting=False):
 
 - 仓库相对路径：`src/documents/plugins/helpers.py`
 - 稳定位置：`ProgressManager.send_progress()` 方法
-- 代码链接：[helpers.py#L119-L150](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src/documents/plugins/helpers.py#L119-L150)
+- 行号范围：L119-L150
 
 推送数据结构包含：`filename`、`task_id`、`current_progress`、`max_progress`、`status`（STARTED/WORKING/SUCCESS/FAILED）、`message`（如 `"generating_thumbnail"`）、`document_id`。
 
@@ -641,7 +643,7 @@ def serve_file(*, doc, use_archive, disposition, follow_formatting=False):
 
 - 仓库相对路径：`src-ui/src/app/services/websocket-status.service.ts`
 - 稳定位置：`FILE_STATUS_MESSAGES` 常量
-- 代码链接：[websocket-status.service.ts#L25-L42](file:///d:/fz/0601/solo-dogfeeding/code/63-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts#L25-L42)
+- 行号范围：L25-L42
 
 ```typescript
 export const FILE_STATUS_MESSAGES = {
