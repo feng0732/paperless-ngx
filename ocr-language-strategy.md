@@ -29,11 +29,14 @@ MIME 类型检测
 
 ---
 
-## 2. OCR 语言配置全链路
+## 2. OCR 语言配置全链路（后台配置的生效边界）
 
-### 2.1 配置来源与优先级（数据库 → 环境变量）
+> ⚠️ **重要前置说明**：本节描述的「数据库优先，环境变量兜底」机制，**仅适用于 Tesseract OCR 和 dateparser**。
+> **NLTK 分词语言和搜索（Tantivy）语言完全不读取数据库后台配置**，只在 Django 启动时从环境变量推导一次，详见第 3 节。
 
-OCR 语言采用 **数据库优先，环境变量兜底** 的双层机制。
+### 2.1 Tesseract/dateparser 共用的配置来源（数据库 → 环境变量）
+
+Tesseract OCR 和 dateparser 共用一套「数据库优先，环境变量兜底」的语言加载机制。
 
 **第一层：环境变量默认值**（`src/paperless/settings/__init__.py:884`）：
 
@@ -73,8 +76,8 @@ class OcrConfig(OutputTypeConfig):
         self.mode = app_config.mode or ModeChoices(settings.OCR_MODE)
 ```
 
-**配置加载优先级总结**：
-1. 读取数据库 `ApplicationConfiguration` 单例的 `language` 字段
+**Tesseract/dateparser 共用的配置加载优先级**：
+1. 读取数据库 `ApplicationConfiguration` 单例的 `language` 字段（后台配置）
 2. 若为空（`None` 或空字符串），回退到 `settings.OCR_LANGUAGE`（即环境变量 `PAPERLESS_OCR_LANGUAGE`）
 3. 环境变量也未设置时，使用硬编码默认值 `"eng"`
 
@@ -109,15 +112,32 @@ def construct_ocrmypdf_parameters(self, ...):
 
 ---
 
-## 3. 语言配置的下游推导
+## 3. 语言配置的下游推导（生效边界详解）
 
-OCR 语言不仅用于 Tesseract，还被分别推导为 **dateparser 语言**、**NLTK 分词语言**和 **搜索（Tantivy）语言**。三者取值来源各不相同。
+OCR 语言被推导为 **dateparser 语言**、**NLTK 分词语言**和 **搜索（Tantivy）语言**三个下游组件。四个组件对「后台数据库配置」的读取能力完全不同，这是最容易混淆的地方：
 
-### 3.1 dateparser 语言处理（两层 fallback）
+| 组件 | 能否读取后台 `ApplicationConfiguration.language` | 能否被后台配置覆盖 |
+|------|----------------------------------------------|------------------|
+| Tesseract OCR | ✅ 能，每次解析时实时读取 | ✅ 完全生效 |
+| dateparser | ✅ 能，每次创建解析器时实时读取 | ✅ 生效（除非显式设了 `PAPERLESS_DATE_PARSER_LANGUAGES`） |
+| NLTK | ❌ 不能，只读取 `settings.OCR_LANGUAGE`（环境变量） | ❌ 完全不生效 |
+| 搜索 (Tantivy) | ❌ 不能，只读环境变量 | ❌ 完全不生效 |
 
-dateparser 的语言配置采用 **显式环境变量优先，OCR 语言自动推导兜底** 的策略。
+### 3.1 dateparser 语言处理（与 Tesseract 的异同）
 
-**第一层：显式环境变量**（`src/paperless/settings/__init__.py:961-967`）：
+dateparser 和 Tesseract **都能读取后台数据库配置**，但 dateparser 多了一层自己的独立环境变量覆盖。
+
+**两者相同点**：
+- 都会通过 `OcrConfig()` 读取数据库 `ApplicationConfiguration.language`，为空时回退到环境变量 `PAPERLESS_OCR_LANGUAGE`
+- 后台修改语言后，下一次解析/日期解析就会生效（无需重启服务）
+
+**两者不同点**：
+- Tesseract 没有独立的语言环境变量，只能走 OcrConfig 的「数据库 → OCR 环境变量」链路
+- dateparser 额外支持 `PAPERLESS_DATE_PARSER_LANGUAGES` 独立配置，设置后**完全绕过** OCR 语言配置（包括后台数据库）
+
+#### dateparser 的两层 fallback
+
+**第一层（最高优先级）：独立环境变量 `PAPERLESS_DATE_PARSER_LANGUAGES`**（`src/paperless/settings/__init__.py:961-967`）：
 
 ```python
 DATE_PARSER_LANGUAGES = (
@@ -146,18 +166,18 @@ def parse_dateparser_languages(languages: str | None) -> list[str]:
     return list(LocaleDataLoader().get_locale_map(locales=language_list))
 ```
 
-**第二层：OCR 语言自动推导**（`src/documents/plugins/date_parsing/__init__.py:64-93`）：
+**第二层（兜底）：通过 `OcrConfig()` 从 OCR 语言动态推导**（`src/documents/plugins/date_parsing/__init__.py:64-93`）：
 
-在 `get_date_parser()` 工厂函数中：
+在 `get_date_parser()` 工厂函数中，每次创建日期解析器时都会**实时**执行：
 
 ```python
-ocr_config = OcrConfig()
+ocr_config = OcrConfig()   # ← 每次都会 new OcrConfig()，实时读取数据库
 languages = settings.DATE_PARSER_LANGUAGES or ocr_to_dateparser_languages(
-    ocr_config.language,
+    ocr_config.language,   # ← 这里的 language 已合并了后台数据库配置
 )
 ```
 
-当 `settings.DATE_PARSER_LANGUAGES` 为 `None`（即未显式设置环境变量）时，调用 `ocr_to_dateparser_languages()` 从 OCR 语言动态推导（`src/paperless/utils.py:118-169`）：
+当 `settings.DATE_PARSER_LANGUAGES` 为 `None`（即未显式设置独立环境变量）时，调用 `ocr_to_dateparser_languages()` 从 OCR 语言动态推导（`src/paperless/utils.py:118-169`）：
 
 ```python
 def ocr_to_dateparser_languages(ocr_languages: str) -> list[str]:
@@ -200,9 +220,11 @@ def ocr_to_dateparser_languages(ocr_languages: str) -> list[str]:
 - 整个推导过程抛异常 → 返回空列表 `[]`，记录 warning 日志
 - 最终结果为空 → 记录 info 日志，dateparser 使用自身默认的多语言模式
 
-### 3.2 NLTK 语言的取值来源
+### 3.2 NLTK 语言（完全不读取后台数据库配置）
 
-NLTK 语言 **仅来源于 OCR_LANGUAGE 的第一个主语言**，不支持显式独立配置。
+NLTK 分词语言的取值有两个绝对限制：
+1. **没有独立的环境变量**，完全从 OCR 语言推导
+2. **只读取 `settings.OCR_LANGUAGE`（即环境变量 `PAPERLESS_OCR_LANGUAGE`），完全不读取数据库 `ApplicationConfiguration.language`**
 
 推导逻辑在 `_get_nltk_language_setting()`（`src/paperless/settings/__init__.py:1026-1058`）：
 
@@ -234,15 +256,22 @@ def _get_nltk_language_setting(ocr_lang: str) -> str | None:
 NLTK_LANGUAGE: str | None = _get_nltk_language_setting(OCR_LANGUAGE)
 ```
 
-**关键点**：
+**关键限制（生效边界）**：
 - 仅支持 13 种欧洲语言的 Snowball 词干还原器 / Punkt 分词器 / 停用词的交集
 - 只考虑多语言配置中的 **第一个** 主语言（例如 `eng+fra` 只取 `eng`）
 - 未命中映射表时 `NLTK_LANGUAGE = None`，表示不启用语言相关的 NLP 处理
-- 推导发生在 Django settings 加载阶段（**启动时一次**），不读取数据库的 `ApplicationConfiguration.language`
+- **推导发生在 Django settings 加载阶段（进程启动时执行一次），此后值固定不变**
+- **代码证据**：`NLTK_LANGUAGE: str | None = _get_nltk_language_setting(OCR_LANGUAGE)`
+  直接传入的是 `settings.OCR_LANGUAGE`（来自环境变量），**完全绕过了 `OcrConfig`，因此永远不会读取数据库后台配置**
+- 管理员在后台修改 language 字段后，NLTK 语言不会发生任何变化，必须修改环境变量 `PAPERLESS_OCR_LANGUAGE` 并重启 Django 服务才能生效
 
-### 3.3 搜索语言（Tantivy stemmer）的取值来源
+### 3.3 搜索语言（Tantivy stemmer，完全不读取后台数据库配置）
 
-搜索语言采用 **显式环境变量优先，OCR 主语言推导兜底** 的策略。
+搜索语言支持显式配置，但和 NLTK 一样，**完全不读取数据库后台配置**，只从环境变量读取。
+
+两层取值来源（均不涉及数据库）：
+1. **第一优先级**：环境变量 `PAPERLESS_SEARCH_LANGUAGE` 显式设置
+2. **第二优先级**：从环境变量 `PAPERLESS_OCR_LANGUAGE` 的第一个主语言推导
 
 推导逻辑在 `_get_search_language_setting()`（`src/paperless/settings/__init__.py:1061-1101`）：
 
@@ -272,23 +301,31 @@ def _get_search_language_setting(ocr_lang: str) -> str | None:
 SEARCH_LANGUAGE: str | None = _get_search_language_setting(OCR_LANGUAGE)
 ```
 
-**关键点**：
+**关键限制（生效边界）**：
 - 支持 19 种 Tantivy 内置词干还原器语言
 - 只考虑 OCR 多语言配置中的 **第一个** 主语言
-- 显式设置 `PAPERLESS_SEARCH_LANGUAGE` 时，会校验是否在 `SUPPORTED_LANGUAGES` 中
+- 显式设置 `PAPERLESS_SEARCH_LANGUAGE` 时，会校验是否在 Tantivy `SUPPORTED_LANGUAGES` 中
 - 未命中返回 `None`，表示搜索不分词干
-- 推导发生在 Django settings 加载阶段（**启动时一次**），不读取数据库配置
+- **推导发生在 Django settings 加载阶段（进程启动时执行一次），此后值固定不变**
+- **代码证据**：`SEARCH_LANGUAGE: str | None = _get_search_language_setting(OCR_LANGUAGE)`
+  直接传入的是 `settings.OCR_LANGUAGE`（来自环境变量），`PAPERLESS_SEARCH_LANGUAGE` 也是直接从 `os.environ.get()` 读取，**完全绕过了 `OcrConfig`，因此永远不会读取数据库后台配置**
+- 管理员在后台修改 language 字段后，搜索词干语言不会发生任何变化
+  - 如果使用默认推导：必须修改 `PAPERLESS_OCR_LANGUAGE` 环境变量并重启服务，且需要重建搜索索引
+  - 如果使用显式配置：必须修改 `PAPERLESS_SEARCH_LANGUAGE` 环境变量并重启服务，且需要重建搜索索引
 
-### 3.4 语言配置链路汇总
+### 3.4 语言配置链路汇总（后台配置生效边界表）
 
-| 组件 | 第一优先级 | 第二优先级 | 推导时机 | 是否支持多语言 |
-|------|-----------|-----------|---------|---------------|
-| **Tesseract OCR** | 数据库 `ApplicationConfiguration.language` | `PAPERLESS_OCR_LANGUAGE`（默认 `eng`） | 运行时每次解析 | ✅ `eng+fra+deu` |
-| **dateparser** | `PAPERLESS_DATE_PARSER_LANGUAGES` | OCR 语言动态推导 `ocr_to_dateparser_languages()` | 运行时每次创建解析器 | ✅ 完整保留 |
-| **NLTK** | —（无独立配置） | OCR_LANGUAGE **第一个** 主语言 | Django 启动加载 settings 时 | ❌ 仅第一语言 |
-| **搜索 (Tantivy)** | `PAPERLESS_SEARCH_LANGUAGE` | OCR_LANGUAGE **第一个** 主语言 | Django 启动加载 settings 时 | ❌ 仅第一语言 |
+| 组件 | 第一优先级 | 第二优先级 | 推导时机 | 是否读取后台配置 | 是否支持多语言 |
+|------|-----------|-----------|---------|----------------|---------------|
+| **Tesseract OCR** | 数据库 `ApplicationConfiguration.language`（每次实时读） | `PAPERLESS_OCR_LANGUAGE`（默认 `eng`） | 运行时每次解析 new `OcrConfig()` | ✅ 实时生效 | ✅ `eng+fra+deu` |
+| **dateparser** | `PAPERLESS_DATE_PARSER_LANGUAGES`（设了就完全绕过 OCR 配置） | 数据库 `ApplicationConfiguration.language` + `PAPERLESS_OCR_LANGUAGE`（通过 `OcrConfig` 实时读） | 运行时每次创建解析器 new `OcrConfig()` | ✅ 实时生效 | ✅ 完整保留 |
+| **NLTK** | —（无独立配置） | `PAPERLESS_OCR_LANGUAGE` **第一个** 主语言（只读环境变量，不读数据库） | Django 启动加载 settings 时（仅一次，永久固化） | ❌ 完全不读 | ❌ 仅第一语言 |
+| **搜索 (Tantivy)** | `PAPERLESS_SEARCH_LANGUAGE`（只读环境变量） | `PAPERLESS_OCR_LANGUAGE` **第一个** 主语言（只读环境变量，不读数据库） | Django 启动加载 settings 时（仅一次，永久固化） | ❌ 完全不读 | ❌ 仅第一语言 |
 
-> **注意**：NLTK 和搜索语言在 Django 启动时从 `settings.OCR_LANGUAGE`（环境变量）推导一次，**不会** 读取数据库后台配置。若管理员仅在后台修改了 OCR 语言，NLTK 和搜索索引不会自动适配，需要重启服务或重新索引。
+> **生效边界总结**：
+> 1. **Tesseract 和 dateparser**：通过每次 new `OcrConfig()` 实时读取数据库，管理员在后台改 language **立即生效**，无需重启。
+> 2. **NLTK 和搜索语言**：在 Django 启动时直接从环境变量 `os.environ` 读取，**代码路径完全绕过 `OcrConfig`，因此数据库里的 `ApplicationConfiguration.language` 对这两个组件没有任何影响**。
+> 3. 若仅在后台修改 OCR 语言：Tesseract OCR 和日期解析会使用新语言，但文档分类（NLTK）和搜索词干还原仍使用启动时的旧语言，直到修改环境变量并重启 Django 服务（搜索还需重建索引）。
 
 ---
 
