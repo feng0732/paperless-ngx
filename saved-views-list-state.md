@@ -4,8 +4,9 @@
 
 Paperless-ngx 中的 Saved Views（保存视图）与文档列表状态形成了一个"持久化配置 ↔ 动态状态"的双向协作体系：
 
-- **后端**：负责存储 SavedView 配置（筛选规则、排序、显示模式等），并基于用户权限控制可见范围
-- **前端**：通过 `DocumentListViewService` 管理当前列表状态，支持从 SavedView 加载、修改后回写、以及 URL 参数同步
+- **后端**：存储 SavedView 配置（筛选规则、排序、显示模式等），基于 owner + django-guardian 对象权限控制可见范围
+- **前端**：通过 `DocumentListViewService` 管理当前列表状态，支持从 SavedView 加载、修改后回写、URL 参数同步
+- **用户 Scope**：由三层机制共同决定 SavedView 的可见性、可编辑性、删除权限和侧边栏/仪表盘入口
 
 ---
 
@@ -17,13 +18,15 @@ Paperless-ngx 中的 Saved Views（保存视图）与文档列表状态形成了
 
 ```python
 class SavedView(ModelWithOwner):
-    name = models.CharField(max_length=128)            # 视图名称
-    sort_field = models.CharField(...)                 # 排序字段
-    sort_reverse = models.BooleanField(default=False)  # 是否倒序
-    page_size = models.PositiveIntegerField(...)       # 分页大小
-    display_mode = models.CharField(...)               # 显示模式: table/smallCards/largeCards
-    display_fields = models.JSONField(...)             # 显示的列字段 (JSON数组)
+    name = models.CharField(max_length=128)
+    sort_field = models.CharField(...)
+    sort_reverse = models.BooleanField(default=False)
+    page_size = models.PositiveIntegerField(...)
+    display_mode = models.CharField(...)
+    display_fields = models.JSONField(...)
 ```
+
+**重要**：SavedView 模型本身**没有** `show_on_dashboard` / `show_in_sidebar` 字段。这些字段仅存在于旧 API（v9 及以下）的兼容层中，实际存储在用户个人的 `UiSettings.settings["saved_views"]` 下。
 
 SavedView 继承自 `ModelWithOwner`，该基类提供 `owner` 字段（指向 User），实现用户所有权。
 
@@ -36,44 +39,49 @@ SavedView 继承自 `ModelWithOwner`，该基类提供 `owner` 字段（指向 U
 ```python
 class SavedViewFilterRule(models.Model):
     saved_view = models.ForeignKey(SavedView, on_delete=models.CASCADE, related_name="filter_rules")
-    rule_type = models.PositiveSmallIntegerField(choices=RULE_TYPES)  # 规则类型ID (0-49)
-    value = models.CharField(max_length=255, blank=True, null=True)   # 规则值
+    rule_type = models.PositiveSmallIntegerField(choices=RULE_TYPES)
+    value = models.CharField(max_length=255, blank=True, null=True)
 ```
 
-支持 50 种规则类型，包括：
-- 标题/全文搜索 (0, 1, 19, 20)
-- 标签过滤 (6, 7, 17, 22)
-- 联系人/文档类型/存储路径 (3, 4, 25 等)
-- 日期范围 (8-16, 43-46)
-- 所有者权限 (32-35)
-- 自定义字段 (36, 38-42)
-- ASN 编号 (2, 18, 23, 24)
-- 收件箱 (5)
-- 共享 (37)
-- MIME 类型 (47)
-- 简单搜索 (48, 49)
+支持 50 种规则类型，包括标题/全文搜索、标签过滤、联系人/文档类型/存储路径、日期范围、所有者权限、自定义字段、ASN 编号、收件箱、共享、MIME 类型等。
 
-### 2.3 UiSettings 模型（用户可见性偏好）
+### 2.3 UiSettings 模型（用户个人偏好）
 
 定义于 [models.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/models.py#L652-L661)
-
-存储用户个人的 Saved View 可见性偏好：
 
 ```python
 class UiSettings(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="ui_settings")
-    settings = models.JSONField(null=True)  # JSON格式存储所有UI偏好
+    settings = models.JSONField(null=True)
 ```
 
-Saved views 相关设置存储路径：`settings.saved_views.dashboard_views_visible_ids` / `sidebar_views_visible_ids`
+与 SavedView 相关的设置路径：
+
+```
+settings.saved_views.dashboard_views_visible_ids  # 仪表盘可见的 SavedView ID 数组
+settings.saved_views.sidebar_views_visible_ids    # 侧边栏可见的 SavedView ID 数组
+settings.saved_views.dashboard_views_sort_order   # 仪表盘排序
+settings.saved_views.sidebar_views_sort_order     # 侧边栏排序
+settings.saved_views.sidebar_views_show_count     # 是否显示侧边栏文档计数
+settings.saved_views.warn_on_unsaved_change       # 是否警告未保存修改
+```
 
 ---
 
-## 3. 用户 Scope（权限范围）机制
+## 3. 用户 Scope 机制：对象权限、可见性标记、列表入口
 
-### 3.1 所有权模型
+SavedView 的"用户 Scope"由以下**四层独立但相互协作**的机制共同决定：
 
-SavedView 通过 `ModelWithOwner` 基类获取 `owner` 字段，建立用户与视图的归属关系。
+| 机制 | 存储位置 | 影响范围 |
+|------|---------|---------|
+| 对象权限（owner + django-guardian） | SavedView.owner + guardian UserObjectPermission/GroupObjectPermission | 是否能看到对象、是否能编辑、是否能删除 |
+| user_can_change 字段 | 序列化时动态计算（只读） | 前端快速判断是否可编辑 |
+| Dashboard/Sidebar 可见性设置 | 当前用户的 UiSettings.settings["saved_views"] | 是否出现在侧边栏/仪表盘入口 |
+| 旧版兼容字段（show_on_dashboard/show_in_sidebar） | 序列化层（API v9）模拟 | 兼容旧 API 客户端 |
+
+### 3.1 层一：对象级权限（决定能否看到、编辑、删除）
+
+#### 3.1.1 所有权模型
 
 定义于 [models.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/models.py#L32-L44)
 
@@ -82,24 +90,64 @@ class ModelWithOwner(models.Model):
     owner = models.ForeignKey(User, blank=True, null=True, default=None, on_delete=models.SET_NULL)
 ```
 
-### 3.2 权限过滤器
+- `owner=None`：无所有者（向后兼容旧数据），所有人均可查看和修改
+- `owner=某用户`：该用户拥有完全控制权
 
-`ObjectOwnedOrGrantedPermissionsFilter` 控制用户可访问的 SavedView 范围。
+#### 3.1.2 查询级过滤：用户能看到哪些 SavedView
 
-定义于 [filters.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/filters.py#L950-L962)
+定义于 [filters.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/filters.py#L950-L962) 的 `ObjectOwnedOrGrantedPermissionsFilter`：
 
 ```python
 class ObjectOwnedOrGrantedPermissionsFilter(ObjectPermissionsFilter):
     def filter_queryset(self, request, queryset, view):
-        objects_with_perms = super().filter_queryset(request, queryset, view)  # 通过 guardian 授权的对象
-        objects_owned = queryset.filter(owner=request.user)                     # 用户自己拥有的
-        objects_unowned = queryset.filter(owner__isnull=True)                   # 无所有者的（向后兼容）
+        objects_with_perms = super().filter_queryset(request, queryset, view)  # django-guardian 显式授权
+        objects_owned = queryset.filter(owner=request.user)                     # 用户自有
+        objects_unowned = queryset.filter(owner__isnull=True)                   # 无所有者（兼容）
         return objects_with_perms | objects_owned | objects_unowned
 ```
 
-用户可见的 SavedView 集合 = {自有的} ∪ {被授权的} ∪ {无所有者的}
+**可见集合公式**：
 
-### 3.3 视图级权限控制
+```
+用户可见 SavedView 集合
+  = {owner == 当前用户}
+  ∪ {owner IS NULL}
+  ∪ {通过 django-guardian 获得 view_savedview 权限的对象}
+```
+
+#### 3.1.3 操作级权限：能否 GET/POST/PUT/PATCH/DELETE
+
+定义于 [permissions.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/permissions.py#L28-L51) 的 `PaperlessObjectPermissions`：
+
+```python
+class PaperlessObjectPermissions(DjangoObjectPermissions):
+    perms_map = {
+        "GET":    ["%(app_label)s.view_%(model_name)s"],
+        "POST":   ["%(app_label)s.add_%(model_name)s"],
+        "PUT":    ["%(app_label)s.change_%(model_name)s"],
+        "PATCH":  ["%(app_label)s.change_%(model_name)s"],
+        "DELETE": ["%(app_label)s.delete_%(model_name)s"],
+    }
+
+    def has_object_permission(self, request, view, obj):
+        if hasattr(obj, "owner") and obj.owner is not None:
+            if request.user == obj.owner:
+                return True                              # 所有者：全部操作通过
+            else:
+                return super().has_object_permission(    # 非所有者：交给 django-guardian 判断
+                    request, view, obj
+                )
+        else:
+            return True  # 无所有者：全部操作通过
+```
+
+**权限判断逻辑**（按优先级）：
+
+1. `obj.owner is None` → **全部操作通过**（向后兼容）
+2. `request.user == obj.owner` → **全部操作通过**
+3. 否则：通过 django-guardian 判断是否具有对应的 model-level + object-level 权限（如 `documents.change_savedview`）
+
+#### 3.1.4 视图层权限装配
 
 在 [views.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/views.py#L2548-L2562) 的 `SavedViewViewSet` 中：
 
@@ -111,178 +159,462 @@ class SavedViewViewSet(BulkPermissionMixin, PassUserMixin, ModelViewSet[SavedVie
 ```
 
 - `IsAuthenticated`：必须登录
-- `PaperlessObjectPermissions`：基于 django-guardian 的对象级权限
-- `ObjectOwnedOrGrantedPermissionsFilter`：过滤查询结果集
+- `PaperlessObjectPermissions`：操作级权限（GET/PUT/PATCH/DELETE）
+- `ObjectOwnedOrGrantedPermissionsFilter`：查询结果过滤（list 时只返回可见对象）
 
-### 3.4 用户可见性偏好（Dashboard/Sidebar）
+### 3.2 层二：user_can_change 字段（前端快速判断标记）
 
-每个用户可独立配置 Saved View 在侧边栏和仪表盘的显示状态。该偏好保存在用户自己的 `UiSettings` 中，不影响 SavedView 对象本身。
+#### 3.2.1 后端计算逻辑
 
-后端处理见 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1350-L1408) 的 `_update_legacy_visibility_preferences` 方法，前端调用见 [settings.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/settings.service.ts#L728-L739) 的 `updateSavedViewsVisibility`。
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L354-L363) 的 `OwnedObjectSerializer.get_user_can_change`：
+
+```python
+def get_user_can_change(self, obj) -> bool:
+    checker = ObjectPermissionChecker(self.user) if self.user is not None else None
+    return (
+        obj.owner is None                                   # 无所有者：可改
+        or obj.owner == self.user                            # 所有者：可改
+        or (
+            self.user is not None
+            and checker.has_perm(                            # django-guardian 显式授权
+                f"change_{obj.__class__.__name__.lower()}",
+                obj
+            )
+        )
+    )
+```
+
+这个字段与 3.1.3 节中 `PaperlessObjectPermissions.has_object_permission` 对 PUT/PATCH 的判断**完全一致**，区别在于它是序列化时**附加到响应对象**的一个布尔标记，供前端直接读取，无需再做权限判断。
+
+#### 3.2.2 字段返回条件（full_perms 参数）
+
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L267-L278)：
+
+```python
+def __init__(self, *args, **kwargs) -> None:
+    super().__init__(*args, **kwargs)
+    if not self.all_fields:
+        try:
+            if self.full_perms:
+                self.fields.pop("user_can_change")      # full_perms=true：去掉简化字段
+                self.fields.pop("is_shared_by_requester")
+            else:
+                self.fields.pop("permissions")          # full_perms=false：去掉完整权限
+        except KeyError:
+            pass
+```
+
+| 请求参数 | 返回 `permissions` | 返回 `user_can_change` | 返回 `is_shared_by_requester` |
+|---------|-------------------|----------------------|-----------------------------|
+| `?full_perms=true` | ✅ 完整（view/change 的 users/groups） | ❌ | ❌ |
+| 默认 | ❌ | ✅（简化布尔值） | ✅ |
+
+其中 `permissions` 字段的完整结构由 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L309-L352) 定义：
+
+```python
+def get_permissions(self, obj) -> dict:
+    return {
+        "view":   {"users": [...], "groups": [...]},
+        "change": {"users": [...], "groups": [...]},
+    }
+```
+
+#### 3.2.3 前端使用 user_can_change
+
+定义于 [permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/permissions.service.ts#L75-L97)：
+
+```typescript
+public currentUserHasObjectPermissions(
+  action: string,
+  object: ObjectWithPermissions
+): boolean {
+  if (action === PermissionAction.View) {
+    return (
+      this.currentUserOwnsObject(object) ||
+      object.permissions?.view.users.includes(this.currentUser.id) ||
+      object.permissions?.view.groups.filter((g) =>
+        this.currentUser.groups.includes(g)
+      ).length > 0
+    )
+  } else if (action === PermissionAction.Change) {
+    return (
+      this.currentUserOwnsObject(object) ||           // owner 或无 owner
+      object.user_can_change ||                        // 后端计算的简化标记
+      object.permissions?.change.users.includes(this.currentUser.id) ||
+      object.permissions?.change.groups.filter((g) =>
+        this.currentUser.groups.includes(g)
+      ).length > 0
+    )
+  }
+}
+```
+
+前端判断 Change 权限时，会**同时**使用 `currentUserOwnsObject`、`object.user_can_change` 以及完整的 `permissions.change` 列表，任意一个满足即可。
+
+### 3.3 层三：Dashboard/Sidebar 可见性设置（用户个人偏好）
+
+这一层与 SavedView 对象权限**完全解耦**，是每个用户自己的 UI 偏好，不影响 SavedView 对象本身。
+
+#### 3.3.1 存储位置
+
+存储在请求用户自己的 `UiSettings.settings` JSON 中：
+
+```python
+UiSettings.settings["saved_views"]["dashboard_views_visible_ids"] = [1, 5, 9]
+UiSettings.settings["saved_views"]["sidebar_views_visible_ids"]   = [1, 3, 9]
+```
+
+该设置是**用户私有**的：不同用户对同一个 SavedView 可以有不同的可见性设置。
+
+#### 3.3.2 前端注入：SavedViewService.withUserVisibility
+
+定义于 [saved-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/rest/saved-view.service.ts#L75-L95)：
+
+```typescript
+private withUserVisibility(view: SavedView): SavedView {
+  return {
+    ...view,
+    show_on_dashboard: this.isDashboardVisible(view),
+    show_in_sidebar: this.isSidebarVisible(view),
+  }
+}
+
+private isDashboardVisible(view: SavedView): boolean {
+  const visibleIds = this.getVisibleViewIds(
+    SETTINGS_KEYS.DASHBOARD_VIEWS_VISIBLE_IDS
+  )
+  return visibleIds.includes(view.id)
+}
+```
+
+每次 `SavedViewService.list()` 返回结果时，前端会**根据当前用户的 UiSettings 动态注入** `show_on_dashboard` 和 `show_in_sidebar` 两个布尔字段。这两个字段**不回写到 SavedView 对象**，仅用于前端 UI 展示。
+
+#### 3.3.3 保存可见性设置
+
+定义于 [settings.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/settings.service.ts#L728-L739)：
+
+```typescript
+updateSavedViewsVisibility(
+  dashboardVisibleViewIds: number[],
+  sidebarVisibleViewIds: number[]
+): Observable<any> {
+  this.set(SETTINGS_KEYS.DASHBOARD_VIEWS_VISIBLE_IDS, [
+    ...new Set(dashboardVisibleViewIds),
+  ])
+  this.set(SETTINGS_KEYS.SIDEBAR_VIEWS_VISIBLE_IDS, [
+    ...new Set(sidebarVisibleViewIds),
+  ])
+  return this.storeSettings()  // POST /api/ui_settings/
+}
+```
+
+在 [saved-views.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L164-L238) 的 `save()` 方法中：
+
+```typescript
+public save() {
+  const groups = Object.values(this.savedViewsGroup.controls) as FormGroup[]
+  const visibilityChanged = groups.some(
+    (group) =>
+      group.get('show_on_dashboard')?.dirty ||
+      group.get('show_in_sidebar')?.dirty
+  )
+  // ...
+  groups.forEach((group) => {
+    const value = group.getRawValue()
+    if (value.show_on_dashboard) dashboardVisibleIds.push(value.id)
+    if (value.show_in_sidebar)   sidebarVisibleIds.push(value.id)
+    // 重要：发送到后端前删除这两个字段（SavedView 模型上没有）
+    delete value.show_on_dashboard
+    delete value.show_in_sidebar
+    // ...
+  })
+  // 先 patch 有修改的 SavedView 对象，再单独保存可见性设置到 UiSettings
+  if (changed.length)     saveOperation = saveOperation.pipe(switchMap(() => this.savedViewService.patchMany(changed)))
+  if (visibilityChanged)  saveOperation = saveOperation.pipe(switchMap(() =>
+    this.settings.updateSavedViewsVisibility(dashboardVisibleIds, sidebarVisibleIds)
+  ))
+}
+```
+
+#### 3.3.4 侧边栏/仪表盘列表入口
+
+定义于 [saved-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/rest/saved-view.service.ts#L97-L127)：
+
+```typescript
+get sidebarViews(): SavedView[] {
+  const sidebarViews = this.savedViews.filter((v) => this.isSidebarVisible(v))
+  const sorted: number[] = this.settingsService.get(SETTINGS_KEYS.SIDEBAR_VIEWS_SORT_ORDER)
+  return sorted?.length > 0
+    ? sorted.map((id) => sidebarViews.find((v) => v.id === id))
+            .concat(sidebarViews.filter((v) => !sorted.includes(v.id)))
+            .filter((v) => v)
+    : [...sidebarViews]
+}
+
+get dashboardViews(): SavedView[] {
+  // 类似逻辑
+}
+```
+
+注意：这里的 `this.savedViews` 已经经过 3.1.2 节的后端过滤，只包含用户有权查看的 SavedView。`sidebarViews` / `dashboardViews` 在此基础上再应用用户个人的可见性偏好。
+
+### 3.4 层四：旧版 API 兼容（show_on_dashboard/show_in_sidebar 字段模拟）
+
+API v10 将 show_on_dashboard/show_in_sidebar 从 SavedView 模型迁移到了 UiSettings。为保持向后兼容，v9 API 仍在序列化层模拟这两个字段。
+
+#### 3.4.1 序列化时注入（GET）
+
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1409-L1434)：
+
+```python
+def to_representation(self, instance):
+    ret = super().to_representation(instance)
+    api_version = self._get_api_version()
+    if api_version < 10:
+        # 从当前请求用户的 UiSettings 读取可见 ID，注入到响应中
+        dashboard_ids = set(...)
+        sidebar_ids = set(...)
+        if user is not None and hasattr(user, "ui_settings"):
+            saved_views = user.ui_settings.settings.get("saved_views", {})
+            dashboard_ids = set(saved_views.get("dashboard_views_visible_ids", []))
+            sidebar_ids = set(saved_views.get("sidebar_views_visible_ids", []))
+        ret["show_on_dashboard"] = instance.id in dashboard_ids
+        ret["show_in_sidebar"] = instance.id in sidebar_ids
+    return ret
+```
+
+这意味着 v9 API 返回的 `show_on_dashboard` / `show_in_sidebar` 是**请求用户个人**的可见性偏好，而非 SavedView 对象的固有属性。
+
+#### 3.4.2 反序列化时提取（PUT/PATCH/POST）
+
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1436-L1460)：
+
+```python
+def to_internal_value(self, data):
+    api_version = self._get_api_version()
+    if api_version >= 10:
+        return super().to_internal_value(data)
+    # v9：从请求中提取 show_on_dashboard/show_in_sidebar，放到 validated_data 中
+    normalized_data = data.copy()
+    legacy_visibility_fields = {}
+    for field_name in ("show_on_dashboard", "show_in_sidebar"):
+        if field_name in normalized_data:
+            legacy_visibility_fields[field_name] = boolean_field.to_internal_value(...)
+            del normalized_data[field_name]
+    ret = super().to_internal_value(normalized_data)
+    ret.update(legacy_visibility_fields)
+    return ret
+```
+
+#### 3.4.3 持久化到 UiSettings
+
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1350-L1408) 的 `_update_legacy_visibility_preferences`，以及在 `create` / `update` 中调用：
+
+```python
+def update(self, instance, validated_data):
+    show_on_dashboard = validated_data.pop("show_on_dashboard", None)
+    show_in_sidebar = validated_data.pop("show_in_sidebar", None)
+    # ... 更新 SavedView 基本字段和 filter_rules ...
+    ui_settings = self._update_legacy_visibility_preferences(
+        instance.id,
+        show_on_dashboard=show_on_dashboard,
+        show_in_sidebar=show_in_sidebar,
+    )
+    return instance
+
+def _update_legacy_visibility_preferences(self, saved_view_id, *, show_on_dashboard, show_in_sidebar):
+    # 将请求用户的 UiSettings.settings["saved_views"] 中对应 ID 加入或移除
+    dashboard_ids = {...}
+    sidebar_ids = {...}
+    if show_on_dashboard is not None:
+        if show_on_dashboard: dashboard_ids.add(saved_view_id)
+        else:                  dashboard_ids.discard(saved_view_id)
+    if show_in_sidebar is not None:
+        if show_in_sidebar:   sidebar_ids.add(saved_view_id)
+        else:                  sidebar_ids.discard(saved_view_id)
+    ui_settings.settings["saved_views"] = {
+        "dashboard_views_visible_ids": sorted(dashboard_ids),
+        "sidebar_views_visible_ids": sorted(sidebar_ids),
+    }
+    ui_settings.save()
+    return ui_settings
+```
+
+这说明：即使是 v9 API，`show_on_dashboard` / `show_in_sidebar` 也是**写入请求用户的 UiSettings**，而不是 SavedView 对象本身。
 
 ---
 
-## 4. 筛选条件保存与加载
+## 4. 前端权限与列表入口：完整决策链
 
-### 4.1 保存流程（前端 → 后端）
+### 4.1 SavedView 管理页（SavedViewsComponent）
 
-#### 4.1.1 前端触发
+定义于 [saved-views.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L240-L249)：
 
-在 [document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts#L398-L428) 中：
+```typescript
+public canEditSavedView(view: SavedView): boolean {
+  // 控制 name/page_size/display_mode/display_fields 表单字段是否可编辑
+  return this.permissionsService.currentUserHasObjectPermissions(
+    PermissionAction.Change,
+    view
+  )
+}
+
+public canDeleteSavedView(view: SavedView): boolean {
+  // 控制删除按钮是否显示：只有 owner（或无 owner、或 superuser）能删
+  return this.permissionsService.currentUserOwnsObject(view)
+}
+```
+
+注意：**所有人都能切换 `show_on_dashboard` / `show_in_sidebar` 的复选框**（代码中这两个控件始终 `disabled: false`），因为这只影响用户自己的 UiSettings。
+
+### 4.2 文档列表页保存按钮
+
+在 [document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts) 中，保存当前视图修改的按钮可见性由 `canEditSavedView(activeSavedView)` 控制。
+
+### 4.3 新建 SavedView 时的 owner 归属
+
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L435-L450) 的 `OwnedObjectSerializer.create`：
+
+```python
+def create(self, validated_data):
+    request = self.context.get("request")
+    if (
+        "owner" not in validated_data
+        or (request is not None and "owner" not in request.data)
+    ) and self.user:
+        validated_data["owner"] = self.user  # 默认归属当前用户
+    ...
+```
+
+### 4.4 编辑 SavedView 时的 owner / 权限变更限制
+
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L452-L480)：
+
+```python
+def update(self, instance, validated_data):
+    user = getattr(self, "user", None)
+    is_superuser = user.is_superuser if user is not None else False
+    is_owner = instance.owner == user if user is not None else False
+    is_unowned = instance.owner is None
+
+    if (
+        ("owner" in validated_data and validated_data["owner"] != instance.owner)
+        or "set_permissions" in validated_data
+    ) and not (is_superuser or is_owner or is_unowned):
+        raise serializers.ValidationError(
+            {"error": "Only superusers, owners or unowned objects can change permissions"}
+        )
+```
+
+只有 superuser、对象 owner、或对象无 owner 时，才能修改 `owner` 字段或设置 `set_permissions`。
+
+---
+
+## 5. 筛选条件保存与加载
+
+### 5.1 保存流程（前端 → 后端）
+
+在 [document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts#L398-L428)：
 
 ```typescript
 saveViewConfig() {
   let savedView: SavedView = {
     id: this.list.activeSavedViewId,
-    filter_rules: this.list.filterRules,        // 当前筛选规则
-    sort_field: this.list.sortField,            // 当前排序字段
-    sort_reverse: this.list.sortReverse,        // 当前排序方向
-    display_mode: this.list.displayMode,        // 当前显示模式
-    display_fields: this.activeDisplayFields,   // 当前显示列
+    filter_rules: this.list.filterRules,
+    sort_field: this.list.sortField,
+    sort_reverse: this.list.sortReverse,
+    display_mode: this.list.displayMode,
+    display_fields: this.activeDisplayFields,
   }
   this.savedViewService.patch(savedView).subscribe(...)
 }
 ```
 
-新建视图使用 `saveViewConfigAs()`，通过 `SaveViewConfigDialogComponent` 对话框输入名称和权限。
-
-#### 4.1.2 序列化与存储
-
-在 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1480-L1532) 的 `SavedViewSerializer` 中：
+后端 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1480-L1512)：
 
 ```python
 def update(self, instance, validated_data):
-    rules_data = validated_data.pop("filter_rules")
+    if "filter_rules" in validated_data:
+        rules_data = validated_data.pop("filter_rules")
+    else:
+        rules_data = None
     instance = super().update(instance, validated_data)
     if rules_data is not None:
-        # 先删除旧规则，再批量创建新规则
         SavedViewFilterRule.objects.filter(saved_view=instance).delete()
         for rule_data in rules_data:
             SavedViewFilterRule.objects.create(saved_view=instance, **rule_data)
     return instance
 ```
 
-**注意**：filter_rules 的更新是"全量替换"策略，不是增量更新。
+**策略**：filter_rules 采用"先删后建"的全量替换。
 
-### 4.2 加载流程（后端 → 前端）
-
-#### 4.2.1 路由匹配
-
-前端通过两条路由加载 SavedView：
+### 5.2 加载流程（后端 → 前端）
 
 **路由 1**：`/view/:id` — 专用视图页
 
 在 [document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts#L274-L303)：
 
 ```typescript
-this.route.paramMap.pipe(
-  filter((params) => params.has('id')),
-  switchMap((params) => this.savedViewService.getCached(+params.get('id')))
-).subscribe(({ view }) => {
+this.route.paramMap.pipe(...).subscribe(({ view }) => {
   this.activeSavedView = view
-  this.unmodifiedSavedView = view  // 保存原始副本用于修改检测
+  this.unmodifiedSavedView = view  // 快照，用于 dirty tracking
   this.list.activateSavedViewWithQueryParams(view, queryParams)
-  this.list.reload(() => {
-    this.savedViewService.setDocumentCount(view, this.list.collectionSize)
-  })
+  this.list.reload(...)
 })
 ```
 
-**路由 2**：`/documents?view=:id` — 普通文档列表页通过 query 参数加载
+**路由 2**：`/documents?view=:id` — 普通文档列表页
 
-见 [document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts#L305-L321) 中的 `loadViewConfig` 方法。
+见同文件的 `loadViewConfig` 方法。
 
-#### 4.2.2 状态激活
-
-在 [document-list-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/document-list-view.service.ts#L238-L274) 中：
+状态激活在 [document-list-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/document-list-view.service.ts#L238-L274)：
 
 ```typescript
 activateSavedView(view: SavedView) {
   this._activeSavedViewId = view.id
-  this.loadSavedView(view)
-}
-
-loadSavedView(view: SavedView) {
-  // 将 SavedView 的配置同步到当前列表状态
-  this.activeListViewState.filterRules = cloneFilterRules(view.filter_rules)
-  this.activeListViewState.sortField = view.sort_field
-  this.activeListViewState.sortReverse = view.sort_reverse
-  this.activeListViewState.title = view.name
-  this.activeListViewState.displayMode = view.display_mode
-  this.activeListViewState.pageSize = view.page_size
-  this.activeListViewState.displayFields = view.display_fields
-  // 跳转到 /view/:id 路由
+  this.loadSavedView(view)  // 写入 filterRules/sortField/sortReverse/displayMode 等
   this.router.navigate(['view', view.id])
 }
 ```
 
 ---
 
-## 5. 前端列表状态管理
+## 6. 前端列表状态管理
 
-### 5.1 ListViewState 数据结构
+### 6.1 ListViewState 数据结构
 
-定义于 [document-list-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/document-list-view.service.ts#L45-L102)
+定义于 [document-list-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/document-list-view.service.ts#L45-L102)：
 
 ```typescript
 export interface ListViewState {
-  title?: string              // 标题（SavedView 名称或 "Documents"）
-  documents?: Document[]      // 当前页文档
-  currentPage: number         // 当前页码
-  collectionSize?: number     // 匹配的文档总数
-  sortField: string           // 排序字段
-  sortReverse: boolean        // 是否倒序
-  filterRules: FilterRule[]   // 筛选规则数组
-  selected?: Set<number>      // 选中的文档ID
-  allSelected?: boolean       // 是否全选
-  pageSize?: number           // 每页条数
-  displayMode?: DisplayMode   // 显示模式
-  displayFields?: DisplayField[]  // 显示列
+  title?: string
+  documents?: Document[]
+  currentPage: number
+  collectionSize?: number
+  sortField: string
+  sortReverse: boolean
+  filterRules: FilterRule[]
+  selected?: Set<number>
+  allSelected?: boolean
+  pageSize?: number
+  displayMode?: DisplayMode
+  displayFields?: DisplayField[]
 }
 ```
 
-### 5.2 多视图状态隔离
-
-`DocumentListViewService` 使用 `Map<number, ListViewState>` 维护多个独立的视图状态：
+### 6.2 多视图状态隔离
 
 ```typescript
 private listViewStates: Map<number, ListViewState> = new Map()
-private _activeSavedViewId: number = null  // null 表示默认/临时视图
-
-private get activeListViewState() {
-  if (!this.listViewStates.has(this._activeSavedViewId)) {
-    this.listViewStates.set(this._activeSavedViewId, this.defaultListViewState())
-  }
-  return this.listViewStates.get(this._activeSavedViewId)
-}
+private _activeSavedViewId: number = null  // null = 默认/临时视图
 ```
 
-- key 为 `null`：默认文档列表（无 SavedView 上下文）
-- key 为 SavedView ID：对应已保存视图的独立状态
+- key = `null`：默认文档列表，持久化到 `localStorage`
+- key = SavedView ID：对应 SavedView 的独立状态（页码、选中项等），切换时保留
 
-这种设计使用户在切换不同 SavedView 时，各自的页码、选中状态等得以保留。
+### 6.3 Dirty Tracking
 
-### 5.3 默认视图的本地持久化
-
-非 SavedView 上下文（`_activeSavedViewId == null`）的列表状态会保存到 `localStorage`：
-
-```typescript
-private saveDocumentListView() {
-  if (this._activeSavedViewId == null) {
-    let savedState = {
-      collectionSize, currentPage, filterRules, sortField,
-      sortReverse, displayMode, displayFields
-    }
-    localStorage.setItem(DOCUMENT_LIST_SERVICE.CURRENT_VIEW_CONFIG, JSON.stringify(savedState))
-  }
-}
-```
-
-服务构造时自动从 localStorage 恢复。
-
-### 5.4 修改检测（Dirty Tracking）
-
-在 [document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts#L158-L190) 中，通过对比 `unmodifiedSavedView`（加载时的快照）与当前列表状态来判断是否已修改：
+在 [document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts#L158-L190)：
 
 ```typescript
 get savedViewIsModified(): boolean {
@@ -292,19 +624,18 @@ get savedViewIsModified(): boolean {
     this.unmodifiedSavedView.page_size !== this.list.pageSize ||
     this.unmodifiedSavedView.display_mode !== this.list.displayMode ||
     // display_fields 对比
-    // filter_rules 对比（使用 filterRulesDiffer 工具函数）
     filterRulesDiffer(this.unmodifiedSavedView.filter_rules, this.list.filterRules)
   )
 }
 ```
 
-修改后标题会显示 `*` 后缀，提示用户保存。
+修改后标题显示 `*` 后缀。
 
 ---
 
-## 6. 筛选规则与 URL 参数的双向映射
+## 7. 筛选规则与 URL 参数的双向映射
 
-### 6.1 FilterRule → Query Params
+### 7.1 FilterRule → Query Params
 
 在 [query-params.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/utils/query-params.ts#L151-L188)：
 
@@ -313,32 +644,23 @@ export function queryParamsFromFilterRules(filterRules: FilterRule[]): Params {
   let params = {}
   for (let rule of filterRules) {
     let ruleType = FILTER_RULE_TYPES.find((t) => t.id == rule.rule_type)
-    // 根据 ruleType 的 filtervar 字段映射到 URL 参数名
-    // 例：rule_type=6 (has tag) → filtervar='tags__id__all'
     params[ruleType.filtervar] = rule.value
   }
   return params
 }
 ```
 
-每个 `FilterRuleType` 定义了 `filtervar`（后端查询参数名）、`multi`（是否多值，逗号分隔）、`datatype` 等属性。
-
-### 6.2 Query Params → FilterRule
-
-反向转换见 [query-params.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/utils/query-params.ts#L103-L149) 的 `filterRulesFromQueryParams`。
-
-### 6.3 列表状态 → URL 同步
+### 7.2 URL 同步策略
 
 在 `DocumentListViewService.reload()` 中：
-
-- **非 SavedView 模式**：导航到 `/documents`，将完整列表状态（筛选、排序、分页）写入 query params
-- **SavedView 模式**：仅将分页参数 merge 到当前 URL（筛选/排序由 SavedView 定义，不写入 URL 以保持 URL 简洁）
+- **非 SavedView 模式**（`_activeSavedViewId == null`）：导航到 `/documents`，完整同步筛选/排序/分页到 query params
+- **SavedView 模式**：仅同步分页参数，筛选/排序由 SavedView ID 隐含
 
 ---
 
-## 7. 前端列表刷新机制
+## 8. 前端列表刷新机制
 
-### 7.1 核心 reload 方法
+### 8.1 核心 reload 方法
 
 在 [document-list-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/document-list-view.service.ts#L304-L387)：
 
@@ -351,22 +673,11 @@ reload(onFinish?, updateQueryParams: boolean = true) {
     activeListViewState.sortReverse,
     activeListViewState.filterRules,
     { truncate_content: true, include_selection_data: true }
-  ).subscribe({
-    next: (result) => {
-      activeListViewState.collectionSize = result.count
-      activeListViewState.documents = result.results
-      this.selectionData = result.selection_data
-      // 同步 URL 参数...
-    },
-    error: (error) => {
-      // 404: 当前页不存在 → 回到第1页重试
-      // 自定义字段已删除 → 重置排序字段为 'created'
-    }
-  })
+  ).subscribe(...)
 }
 ```
 
-### 7.2 触发刷新的场景
+### 8.2 触发场景
 
 | 操作 | 触发位置 |
 |------|---------|
@@ -378,23 +689,13 @@ reload(onFinish?, updateQueryParams: boolean = true) {
 | 文档消费完成（WebSocket） | `onDocumentConsumptionFinished` → `reload` |
 | 文档删除（WebSocket） | `onDocumentDeleted` → `reload` |
 
-### 7.3 include_selection_data 的作用
+### 8.3 include_selection_data
 
-当请求参数 `include_selection_data=true` 时，后端 `DocumentViewSet.list` 方法（[views.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/views.py#L1185-L1202)）会额外计算当前筛选结果下的聚合数据：
-
-```python
-def list(self, request, *args, **kwargs):
-    queryset = self.filter_queryset(self.get_queryset())
-    selection_data = self._get_selection_data_for_queryset(queryset)
-    # 返回各分类（tags/correspondents/document_types/storage_paths/custom_fields）
-    # 在当前筛选结果中的文档计数
-```
-
-这些数据用于筛选器 UI 中显示每个选项旁边的匹配数量。
+当 `include_selection_data=true` 时，后端 `DocumentViewSet.list`（[views.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/views.py#L1185-L1202)）额外计算当前筛选结果下 tags/correspondents/document_types/storage_paths/custom_fields 的匹配文档计数，供筛选器 UI 显示。
 
 ---
 
-## 8. 列表状态与 Saved Views 的完整交互流程
+## 9. 完整交互流程
 
 ```
 用户访问 /view/42
@@ -402,32 +703,29 @@ def list(self, request, *args, **kwargs):
        ▼
 route.paramMap 触发 ──► savedViewService.getCached(42)
        │
+       ├─► 后端：ObjectOwnedOrGrantedPermissionsFilter 过滤
+       │     （若用户无权看该视图 → 404）
+       │
        ▼
 activateSavedViewWithQueryParams(view, queryParams)
        │
        ├─► _activeSavedViewId = 42
-       ├─► 从 listViewStates Map 获取该视图的状态（或创建默认）
-       ├─► 将 view.filter_rules/sort_field/sort_reverse/display_mode 等写入状态
-       └─► currentPage = queryParams 中的 page（如存在）
+       ├─► 从 listViewStates Map 获取状态（或创建默认）
+       ├─► 将 view.filter_rules/sort_field/sort_reverse/display_mode 写入
+       └─► currentPage = queryParams.page（如存在）
        │
        ▼
 reload()
        │
-       ├─► documentService.listFiltered(page, pageSize, sortField, sortReverse, filterRules)
-       │     │
-       │     └─► 将 FilterRule[] 转为 URL query params
-       │         （filterRules → queryParamsFromFilterRules）
+       ├─► documentService.listFiltered(...)
+       │     └─► FilterRule[] → queryParamsFromFilterRules → HTTP 请求
        │
-       ├─► 后端 DocumentFilterSet 应用所有过滤条件
-       │     │
-       │     ├─► ObjectOwnedOrGrantedPermissionsFilter 确保只返回用户可见文档
-       │     └─► DocumentsOrderingFilter 处理排序（含自定义字段）
+       ├─► 后端 DocumentFilterSet + DocumentsOrderingFilter 处理
+       │     └─► ObjectOwnedOrGrantedPermissionsFilter 过滤文档
        │
        ├─► 返回分页结果 + selection_data
-       │
        ├─► 更新 activeListViewState.documents / collectionSize
-       │
-       └─► URL 同步（SavedView 模式下仅同步 page 参数）
+       └─► URL 同步（SavedView 模式仅 page）
        │
        ▼
 用户修改筛选条件（FilterEditorComponent）
@@ -436,42 +734,53 @@ reload()
 onFilterRulesChange → list.setFilterRules(newRules)
        │
        ├─► 更新 activeListViewState.filterRules
-       ├─► 若当前是全文搜索且排序字段为 'score'，重置为 'created'
-       ├─► reload()  （带新筛选条件请求后端）
-       ├─► reduceSelectionToFilter()  （清除不再匹配的选中项）
-       └─► saveDocumentListView()  （非 SavedView 时写入 localStorage）
+       ├─► reload()
+       ├─► reduceSelectionToFilter()
+       └─► 非 SavedView 时 saveDocumentListView()（localStorage）
        │
        ▼
-savedViewIsModified 计算变为 true（标题显示 *）
+savedViewIsModified = true（标题显示 *）
        │
        ▼
 用户点击"保存视图"
        │
+       ├─► 前置检查：canEditSavedView(view)
+       │     （需 currentUserHasObjectPermissions(Change, view)）
+       │
        ▼
 saveViewConfig()
        │
-       ├─► 构建 SavedView 对象（当前 filterRules, sortField, displayMode 等）
+       ├─► 构建 SavedView 对象
        ├─► savedViewService.patch(savedView)
        │     │
-       │     └─► 后端 SavedViewSerializer.update
+       │     └─► SavedViewSerializer.update
+       │           ├─► PaperlessObjectPermissions 校验 PUT 权限
        │           ├─► 更新 SavedView 基本字段
-       │           └─► 删除旧 SavedViewFilterRule，创建新规则
+       │           └─► 全量替换 SavedViewFilterRule
        │
-       └─► 更新 unmodifiedSavedView（重置 dirty 状态）
+       └─► 更新 unmodifiedSavedView（重置 dirty）
 ```
 
 ---
 
-## 9. 关键设计点总结
+## 10. 关键设计点总结
 
-1. **状态隔离**：每个 SavedView 拥有独立的 `ListViewState`，切换时互不干扰。默认视图（null key）的状态持久化到 localStorage。
+1. **四层 Scope 解耦**：
+   - 对象权限（owner + guardian）：决定能否看到 SavedView 对象本身、能否编辑、能否删除
+   - `user_can_change` 字段：后端序列化时动态计算的简化布尔标记，供前端快速判断
+   - Dashboard/Sidebar 可见性设置：用户个人 UiSettings，与 SavedView 对象完全解耦
+   - 旧版兼容层（API v9）：在序列化层模拟 `show_on_dashboard` / `show_in_sidebar` 字段，实际读写用户 UiSettings
 
-2. **Dirty Tracking**：通过保存加载时的 `unmodifiedSavedView` 快照，实现修改检测，引导用户保存。
+2. **full_perms 请求参数二选一**：`full_perms=true` 返回完整权限列表（view/change users/groups），默认返回简化的 `user_can_change` + `is_shared_by_requester`。
 
-3. **全量替换 FilterRule**：后端保存 filter_rules 时采用"先删后建"的全量替换策略，简化了前端逻辑。
+3. **权限限制分层**：删除仅 owner 能做；修改 owner/set_permissions 仅限 superuser、owner 或无主对象。
 
-4. **权限分层**：SavedView 对象的可见性由 `owner` + django-guardian 对象权限控制；而 Dashboard/Sidebar 的显示偏好则存储在用户个人的 `UiSettings` 中，两者完全解耦。
+4. **状态隔离**：每个 SavedView 拥有独立的 `ListViewState`（Map key 为 SavedView ID），默认视图（null key）持久化到 localStorage。
 
-5. **URL 同步策略差异**：非 SavedView 模式完整同步到 URL；SavedView 模式仅同步分页参数，保持 URL 简洁，筛选/排序由 SavedView ID 隐含。
+5. **Dirty Tracking**：通过 `unmodifiedSavedView` 快照对比检测修改。
 
-6. **WebSocket 驱动刷新**：文档消费完成或删除时，通过 WebSocket 实时推送触发列表 reload，保证数据新鲜度。
+6. **全量替换 FilterRule**："先删后建"简化前后端逻辑。
+
+7. **URL 同步策略差异**：非 SavedView 模式完整同步，SavedView 模式仅同步分页。
+
+8. **WebSocket 驱动刷新**：文档消费完成或删除时实时 reload。
