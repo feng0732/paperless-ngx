@@ -1,6 +1,6 @@
 # Paperless-ngx Trash & Archive 生命周期代码分析
 
-本文档基于对 `src/documents/` 模块源代码的逐行核对，系统梳理 Trash（回收站）和 Archive（归档）相关的完整生命周期处理路径。
+本文档基于对 `src/documents/` 模块源代码的逐行核对，系统梳理 Trash（回收站）和 Archive（归档）相关的完整生命周期处理路径。所有代码引用均采用仓库相对路径格式。
 
 ---
 
@@ -10,7 +10,7 @@ Paperless-ngx 使用 `django-softdelete` 库实现软删除（回收站）机制
 
 ### 1.1 模型层设计
 
-[Document](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L157) 继承自 `SoftDeleteModel`，这是整个回收站机制的基石：
+[Document](src/documents/models.py#L157) 继承自 `SoftDeleteModel`，这是整个回收站机制的基石：
 
 ```python
 # src/documents/models.py L157
@@ -34,13 +34,13 @@ class Document(SoftDeleteModel, ModelWithOwner):
 
 以下模型也继承 `SoftDeleteModel`，支持软删除/恢复：
 
-- [Note](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L828) — 文档备注
-- [ShareLink](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L868) — 分享链接
-- [CustomFieldInstance](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L1093) — 自定义字段实例
+- [Note](src/documents/models.py#L828) — 文档备注
+- [ShareLink](src/documents/models.py#L868) — 分享链接
+- [CustomFieldInstance](src/documents/models.py#L1093) — 自定义字段实例
 
 ### 1.3 Document.delete() 方法重写
 
-[Document.delete()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L503-L514) 被重写，确保删除根文档时其所有版本文档也一并进入回收站：
+[Document.delete()](src/documents/models.py#L503-L514) 被重写，确保删除根文档时其所有版本文档也一并进入回收站：
 
 ```python
 # src/documents/models.py L503-L514
@@ -51,9 +51,9 @@ def delete(self, *args, **kwargs):
     return super().delete(*args, **kwargs)
 ```
 
-**关键**：只在当前文档是根文档（`root_document_id is None`）时才显式级联软删除版本。这补充了 `root_document` 外键上的 `on_delete=models.CASCADE`（[models.py L312-L319](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L312-L319)），因为 Django 的 CASCADE 只在真正硬删除时触发。
+**关键**：只在当前文档是根文档（`root_document_id is None`）时才显式级联软删除版本。这补充了 `root_document` 外键上的 `on_delete=models.CASCADE`（[src/documents/models.py L312-L319](src/documents/models.py#L312-L319)），因为 Django 的 CASCADE 只在真正硬删除时触发。
 
-单元测试验证见 [test_document_model.py L105-L125](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/tests/test_document_model.py#L105-L125)。
+单元测试验证见 [src/documents/tests/test_document_model.py L105-L125](src/documents/tests/test_document_model.py#L105-L125)。
 
 ---
 
@@ -69,7 +69,7 @@ def delete(self, *args, **kwargs):
 │  - Note / ShareLink / CustomFieldInstance    │
 │    由 django-softdelete 级联软删除            │
 │  - 从 Tantivy 全文搜索索引移除                │
-│  - 从 LLM 向量索引异步移除（若开启）          │
+│  - 从 LLM 向量索引异步移除（若 llm_index_enabled）│
 │  - 发送 WebSocket 通知（仅批量删除）          │
 │  - ⚠️ 磁盘文件（原文件/归档/缩略图）保持不变   │
 └─────────────────────────────────────────────┘
@@ -98,7 +98,7 @@ def delete(self, *args, **kwargs):
 #### 路径一：单文档 REST DELETE
 
 - **API**：`DELETE /api/documents/<id>/`
-- **视图**：[DocumentViewSet.destroy()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/views.py#L1204-L1218)
+- **视图**：[DocumentViewSet.destroy()](src/documents/views.py#L1204-L1218)
 
 ```python
 # src/documents/views.py L1204-L1218
@@ -114,8 +114,8 @@ def destroy(self, request, *args, **kwargs):
 #### 路径二：批量删除（异步 Celery 任务）
 
 - **API**：`POST /api/documents/delete/`
-- **视图**：[DeleteDocumentsView](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/views.py#L2987-L2997)
-- **异步执行器**：[bulk_edit.delete()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/bulk_edit.py#L359-L392)
+- **视图**：[DeleteDocumentsView](src/documents/views.py#L2987-L2997)
+- **异步执行器**：[bulk_edit.delete()](src/documents/bulk_edit.py#L359-L392)
 
 ```python
 # src/documents/views.py L2987-L2997
@@ -158,12 +158,16 @@ def delete(doc_ids: list[int]) -> Literal["OK"]:
 
 #### 路径三：工作流自动删除（Move to trash）
 
-- **动作类型常量**：`WorkflowAction.WorkflowActionType.MOVE_TO_TRASH = 6`（[models.py L1578-L1581](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L1578-L1581)）
-- **执行器**：[execute_move_to_trash_action()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/workflows/actions.py#L348-L375)
+- **动作类型常量**：`WorkflowAction.WorkflowActionType.MOVE_TO_TRASH = 6`（[src/documents/models.py L1578-L1581](src/documents/models.py#L1578-L1581)）
+- **执行器**：[execute_move_to_trash_action()](src/documents/workflows/actions.py#L348-L375)
 
 ```python
 # src/documents/workflows/actions.py L348-L375
-def execute_move_to_trash_action(action, document, logging_group):
+def execute_move_to_trash_action(
+    action: WorkflowAction,
+    document: Document | ConsumableDocument,
+    logging_group: uuid.UUID | None,
+) -> None:
     if isinstance(document, Document):
         document.delete()  # ① 已入库文档：走正常软删除
     else:
@@ -175,7 +179,7 @@ def execute_move_to_trash_action(action, document, logging_group):
         )
 ```
 
-**工作流短路逻辑**：在 `run_workflows` 循环中，每次动作后检查 `document.is_deleted`，若为真则 `break` 跳过后续动作（[signals/handlers.py L907-L913](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/signals/handlers.py#L907-L913)）：
+**工作流短路逻辑**：在 `run_workflows` 循环中，每次动作后检查 `document.is_deleted`，若为真则 `break` 跳过后续动作（[src/documents/signals/handlers.py L907-L913](src/documents/signals/handlers.py#L907-L913)）：
 
 ```python
 # src/documents/signals/handlers.py L907-L913
@@ -192,7 +196,7 @@ if document.is_deleted:
 **磁盘文件不会被删除**。软删除只做以下数据库和索引层面的操作：
 1. 给 Document（以及级联软删除的 Note/ShareLink/CustomFieldInstance）写 `deleted_at` 时间戳
 2. 从 Tantivy 全文搜索索引移除（单删和批删都显式调用）
-3. 触发 `post_delete` 信号 → 若启用 LLM 索引则异步移除（详见第 6.3 节）
+3. 触发 `post_delete` 信号 → 若 `AIConfig.llm_index_enabled` 为真则异步从 LLM 索引移除（详见第 6.3 节）
 4. 批量删除额外发送 WebSocket 通知
 
 ---
@@ -202,8 +206,8 @@ if document.is_deleted:
 ### 4.1 API 端点
 
 - **URL**：`/api/trash/`
-- **路由注册**：[urls.py L257-L259](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/paperless/urls.py#L257-L259)
-- **视图类**：[TrashView](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/views.py#L5083-L5123)
+- **路由注册**：[src/paperless/urls.py L257-L259](src/paperless/urls.py#L257-L259)
+- **视图类**：[TrashView](src/documents/views.py#L5083-L5123)
 
 ### 4.2 GET — 列出回收站内容
 
@@ -214,7 +218,7 @@ queryset = Document.deleted_objects.all()  # 仅已软删除的文档
 
 ### 4.3 POST — 恢复或清空
 
-请求体使用 [TrashSerializer](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/serialisers.py#L3391-L3411)：
+请求体使用 [TrashSerializer](src/documents/serialisers.py#L3391-L3411)：
 
 | 字段 | 必填 | 说明 |
 |------|------|------|
@@ -224,20 +228,22 @@ queryset = Document.deleted_objects.all()  # 仅已软删除的文档
 ```python
 # src/documents/serialisers.py L3391-L3411
 class TrashSerializer(SerializerWithPerms):
-    documents = serializers.ListField(required=False, ...)
-    action = serializers.ChoiceField(choices=["restore", "empty"], ...)
+    documents = serializers.ListField(required=False, write_only=True, ...)
+    action = serializers.ChoiceField(choices=["restore", "empty"], write_only=True, ...)
 
     def validate_documents(self, documents):
         # 校验：所有 ID 都必须属于已软删除文档
         count = Document.deleted_objects.filter(id__in=documents).count()
         if not count == len(documents):
-            raise serializers.ValidationError(...)
+            raise serializers.ValidationError(
+                "Some documents in the list have not yet been deleted.",
+            )
         return documents
 ```
 
 #### 恢复文档（action=restore）
 
-[views.py L5116-L5118](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/views.py#L5116-L5118)：
+[src/documents/views.py L5116-L5118](src/documents/views.py#L5116-L5118)：
 
 ```python
 if action == "restore":
@@ -247,11 +253,17 @@ if action == "restore":
 
 `restore(strict=False)` 由 django-softdelete 提供，会清除 `deleted_at`，并级联恢复同样被软删除的关联对象（Note/ShareLink/CustomFieldInstance）。
 
-**⚠️ 恢复后不会自动触发 Tantivy 搜索索引重建**。`restore()` 本身只是 ORM 层的 `deleted_at = NULL` 更新，代码中没有任何地方在 restore 后调用 `get_backend().add_or_update()`。
+**⚠️ 恢复后不会自动触发 Tantivy 搜索索引和 LLM 向量索引重建**。代码证据：
+- 搜索索引 `add_to_index` 仅连接在 `document_consumption_finished` 信号上（[src/documents/apps.py L29](src/documents/apps.py#L29)），restore 不触发该信号
+- LLM 索引 `add_or_update_document_in_llm_index` 同样仅连接在 `document_consumption_finished` 上（[src/documents/apps.py L31](src/documents/apps.py#L31)）
+- `document_updated` 信号也没有连接任何索引更新函数（[src/documents/apps.py L32-L33](src/documents/apps.py#L32-L33)）
+- TrashView 恢复代码中也没有显式调用 `get_backend().add_or_update()`
+
+因此恢复后文档不会立刻出现在搜索结果中，需要等待后续触发索引重建的事件（如修改文档）或手动重建。
 
 #### 清空回收站（action=empty）
 
-[views.py L5119-L5122](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/views.py#L5119-L5122)：
+[src/documents/views.py L5119-L5122](src/documents/views.py#L5119-L5122)：
 
 ```python
 elif action == "empty":
@@ -272,7 +284,7 @@ elif action == "empty":
 | 手动清空全部 | `POST /api/trash/` `action=empty`（不提供 documents） | 所有回收站文档 ID |
 | **定时任务自动清理** | Celery Beat 每天 01:00 调 `documents.tasks.empty_trash` | `None`（走过期逻辑） |
 
-定时任务配置在 [custom.py L124-L134](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/paperless/settings/custom.py#L124-L134)：
+定时任务配置在 [src/paperless/settings/custom.py L124-L134](src/paperless/settings/custom.py#L124-L134)：
 
 ```python
 # src/paperless/settings/custom.py L124-L134
@@ -287,7 +299,7 @@ elif action == "empty":
 
 ### 5.2 empty_trash 核心实现
 
-[tasks.py L398-L432](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/tasks.py#L398-L432)：
+[src/documents/tasks.py L398-L432](src/documents/tasks.py#L398-L432)：
 
 ```python
 @shared_task
@@ -344,7 +356,7 @@ def cleanup_document_deletion(sender, instance, **kwargs) -> None:
 
 ### 6.1 cleanup_document_deletion：磁盘文件清理
 
-[signals/handlers.py L342-L402](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/signals/handlers.py#L342-L402)
+[src/documents/signals/handlers.py L342-L402](src/documents/signals/handlers.py#L342-L402)
 
 ```python
 def cleanup_document_deletion(sender, instance, **kwargs) -> None:
@@ -404,16 +416,16 @@ def cleanup_document_deletion(sender, instance, **kwargs) -> None:
 | `doc.archive_path`（PDF/A 归档） | `unlink()` 直接删除 | `unlink()` 直接删除 |
 | `doc.thumbnail_path`（缩略图） | `unlink()` 直接删除 | `unlink()` 直接删除 |
 
-递归清理空目录的实现在 [file_handling.py L15-L41](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/file_handling.py#L15-L41)，仅在 `ORIGINALS_DIR` 和 `ARCHIVE_DIR` 两个根目录内生效，不会越界删除。
+递归清理空目录的实现在 [src/documents/file_handling.py L15-L41](src/documents/file_handling.py#L15-L41)，仅在 `ORIGINALS_DIR` 和 `ARCHIVE_DIR` 两个根目录内生效，不会越界删除。
 
 ### 6.2 Tantivy 全文搜索索引
 
 搜索后端使用 Tantivy。删除操作只在**软删除时**显式移除，不在 empty_trash 中重复执行：
 
-- 单删：[DocumentViewSet.destroy()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/views.py#L1207) → `get_backend().remove(pk)`
-- 批删：[bulk_edit.delete()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/bulk_edit.py#L377-L381) → 批量 `batch.remove(id)`
+- 单删：[DocumentViewSet.destroy()](src/documents/views.py#L1207) → `get_backend().remove(pk)`
+- 批删：[bulk_edit.delete()](src/documents/bulk_edit.py#L377-L381) → 批量 `batch.remove(id)`
 
-后端实现在 [search/_backend.py L501-L513](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/search/_backend.py#L501-L513)：
+后端实现在 [src/documents/search/_backend.py L501-L513](src/documents/search/_backend.py#L501-L513)：
 
 ```python
 def remove(self, doc_id: int) -> None:
@@ -422,27 +434,36 @@ def remove(self, doc_id: int) -> None:
         batch.remove(doc_id)
 ```
 
-**恢复文档后**：代码中没有任何地方在 `restore()` 后调用 `get_backend().add_or_update()`，因此恢复后文档不会立刻出现在搜索结果中，需要等待后续触发索引重建的事件（如修改文档）或手动重建索引。
+索引添加只在文档消费完成时触发，信号连接定义在 [src/documents/apps.py L29](src/documents/apps.py#L29)：
+```python
+document_consumption_finished.connect(add_to_index)
+```
+
+`add_to_index` 的实现见 [src/documents/signals/handlers.py L794-L800](src/documents/signals/handlers.py#L794-L800)。
+
+**恢复文档后**：代码中没有任何地方在 `restore()` 后调用 `get_backend().add_or_update()`，因此恢复后文档不会立刻出现在搜索结果中。
 
 ### 6.3 LLM 向量索引
 
-LLM 索引的删除信号**始终注册**，不受 `empty_trash` 控制：
+LLM 索引的删除信号**始终注册**，不受 `empty_trash` 控制，但有启用前提条件：
 
-[signals/handlers.py L1342-L1355](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/signals/handlers.py#L1342-L1355)：
+[src/documents/signals/handlers.py L1342-L1355](src/documents/signals/handlers.py#L1342-L1355)：
 
 ```python
 @receiver(models.signals.post_delete, sender=Document)
 def delete_document_from_llm_index(sender, instance, **kwargs) -> None:
     ai_config = AIConfig()
-    if ai_config.llm_index_enabled:  # 仅当启用时才执行
+    if ai_config.llm_index_enabled:  # ⭐ 仅当启用时才执行
         from documents.tasks import remove_document_from_llm_index
         remove_document_from_llm_index.apply_async(kwargs={"document": instance})
 ```
 
+异步任务 `remove_document_from_llm_index` 定义在 [src/documents/tasks.py L652-L653](src/documents/tasks.py#L652-L653)，直接调用 `llm_index_remove_document(document)`。
+
 **注意**：
-- 无论软删除还是硬删除，只要 `post_delete` 触发就会执行异步移除
-- 前提是 `AIConfig.llm_index_enabled` 为真
+- 无论软删除还是硬删除，只要触发了 `post_delete` 且 `AIConfig.llm_index_enabled` 为真，就会执行异步移除
 - 和 Tantivy 索引一样，`restore()` 后也不会自动重新加入 LLM 索引
+- LLM 索引的添加同样只在 `document_consumption_finished` 信号触发（[src/documents/apps.py L31](src/documents/apps.py#L31)），处理函数见 [src/documents/signals/handlers.py L1331-L1339](src/documents/signals/handlers.py#L1331-L1339)
 
 ---
 
@@ -450,37 +471,48 @@ def delete_document_from_llm_index(sender, instance, **kwargs) -> None:
 
 ### 7.1 外键与 M2M 关系全景图
 
-以下模型关系定义在 [models.py](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py) 中：
+以下模型关系定义在 [src/documents/models.py](src/documents/models.py) 中：
 
 | 关联对象 | 字段定义位置 | 关系类型 | `on_delete` | 软删除影响 | 硬删除影响 |
 |---------|------------|---------|------------|----------|----------|
-| Correspondent | [L160-L167](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L160-L167) | ForeignKey | `SET_NULL` | 不变（只是 Document 软删） | Document 外键置 NULL，往来人本身保留 |
-| StoragePath | [L169-L176](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L169-L176) | ForeignKey | `SET_NULL` | 不变 | Document 外键置 NULL，存储路径保留 |
-| DocumentType | [L180-L187](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L180-L187) | ForeignKey | `SET_NULL` | 不变 | Document 外键置 NULL，文档类型保留 |
-| Tag | [L209-L214](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L209-L214) | ManyToMany | 中间表 | 中间表记录不变 | 中间表记录级联删除，Tag 本身保留 |
-| Note | [L841-L848](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L841-L848) | ForeignKey | `CASCADE` | django-softdelete 级联软删除 Note | Django ORM CASCADE 硬删除 Note |
-| ShareLink | [L896-L902](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L896-L902) | ForeignKey | `CASCADE` | 级联软删除 ShareLink | 级联硬删除 ShareLink |
-| CustomFieldInstance | [L1119-L1135](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L1119-L1135) | ForeignKey | `CASCADE` | 级联软删除 | 级联硬删除 |
-| Version Document | [L312-L319](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L312-L319) | ForeignKey (`root_document`) | `CASCADE` | Document.delete() 显式级联软删除 | Django ORM CASCADE 硬删除 |
-| ShareLinkBundle | [L1004-L1008](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L1004-L1008) | ManyToMany | 中间表 | 中间表不变 | 中间表记录级联删除，Bundle 本身保留 |
+| Correspondent | [L160-L167](src/documents/models.py#L160-L167) | ForeignKey | `SET_NULL` | 不变（只是 Document 软删） | Document 外键置 NULL，往来人本身保留 |
+| StoragePath | [L169-L176](src/documents/models.py#L169-L176) | ForeignKey | `SET_NULL` | 不变 | Document 外键置 NULL，存储路径保留 |
+| DocumentType | [L180-L187](src/documents/models.py#L180-L187) | ForeignKey | `SET_NULL` | 不变 | Document 外键置 NULL，文档类型保留 |
+| Tag | [L209-L214](src/documents/models.py#L209-L214) | ManyToMany | 中间表 | 中间表记录不变 | 中间表记录级联删除，Tag 本身保留 |
+| Note | [L841-L848](src/documents/models.py#L841-L848) | ForeignKey | `CASCADE` | django-softdelete 级联软删除 Note | Django ORM CASCADE 硬删除 Note |
+| ShareLink | [L896-L902](src/documents/models.py#L896-L902) | ForeignKey | `CASCADE` | 级联软删除 ShareLink | 级联硬删除 ShareLink |
+| CustomFieldInstance | [L1119-L1135](src/documents/models.py#L1119-L1135) | ForeignKey | `CASCADE` | 级联软删除 | 级联硬删除 |
+| Version Document | [L312-L319](src/documents/models.py#L312-L319) | ForeignKey (`root_document`) | `CASCADE` | Document.delete() 显式级联软删除 | Django ORM CASCADE 硬删除 |
+| ShareLinkBundle | [L1004-L1008](src/documents/models.py#L1004-L1008) | ManyToMany | 中间表 | 中间表不变 | 中间表记录级联删除，Bundle 本身保留 |
 
-### 7.2 级联软删除的实现机制
+### 7.2 级联软删除的实现机制与证据
 
 Note / ShareLink / CustomFieldInstance 均继承 `SoftDeleteModel`，且外键声明为 `on_delete=models.CASCADE`。
 
-- **软删除时**：`django-softdelete` 库内部通过收集所有指向被删对象的、关联模型也继承了 `SoftDeleteModel` 的 ForeignKey 关系，逐个调用关联对象的 `delete()`（也是软删除）。这就是为什么 Document 软删除后，Note/ShareLink/CustomFieldInstance 也会被打上 `deleted_at`。
+- **软删除时**：`django-softdelete` 库内部收集所有指向被删对象的、关联模型也继承了 `SoftDeleteModel` 的 ForeignKey 关系，逐个调用关联对象的 `delete()`（也是软删除）。这就是 Document 软删除后，Note/ShareLink/CustomFieldInstance 也会被打上 `deleted_at` 的原因。
 - **硬删除时**（empty_trash）：走标准 Django ORM 的 `CASCADE`，直接从数据库级联 DELETE。
 - **恢复时**：`doc.restore(strict=False)` 同样会级联恢复所有关联软删除的 Note/ShareLink/CustomFieldInstance。
+
+**代码证据**：测试用例 [test_export_import_soft_deleted_document](src/documents/tests/test_management_exporter.py#L978-L1022) 在 L995 调用 `self.d1.delete()` 软删除文档后，在 L1016-L1022 验证 Note 和 CustomFieldInstance 的 `deleted_at` 均不为 None：
+
+```python
+# src/documents/tests/test_management_exporter.py L1012-L1022
+reimported_note = Note.global_objects.get(pk=self.note.pk)
+self.assertIsNotNone(reimported_note.deleted_at)  # Note 也被软删除
+
+reimported_cfi = CustomFieldInstance.global_objects.get(pk=self.cfi1.pk)
+self.assertIsNotNone(reimported_cfi.deleted_at)   # CustomFieldInstance 也被软删除
+```
 
 ### 7.3 其他关联影响汇总
 
 | 系统 | 触发时机 | 行为 | 代码位置 |
 |-----|---------|------|---------|
-| Tantivy 搜索索引 | 软删除时（单删/批删） | `get_backend().remove()` / `batch.remove()` | [views.py L1207](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/views.py#L1207)、[bulk_edit.py L377-L381](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/bulk_edit.py#L377-L381) |
-| LLM 向量索引 | 软删除和硬删除（post_delete 信号） | 异步 `remove_document_from_llm_index`（仅启用时） | [handlers.py L1342-L1355](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/signals/handlers.py#L1342-L1355) |
-| 审计日志 LogEntry | hard_delete（empty_trash 内） | `LogEntry.objects.filter(...).delete()` | [tasks.py L420-L425](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/tasks.py#L420-L425) |
-| 磁盘文件 | hard_delete（empty_trash 内） | 删除/移动原文件、归档、缩略图，清理空目录 | [handlers.py L342-L402](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/signals/handlers.py#L342-L402) |
-| WebSocket 通知 | 批量软删除 | `send_documents_deleted(delete_ids)` | [bulk_edit.py L383-L384](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/bulk_edit.py#L383-L384) |
+| Tantivy 搜索索引 | 软删除时（单删/批删） | `get_backend().remove()` / `batch.remove()` | [src/documents/views.py L1207](src/documents/views.py#L1207)、[src/documents/bulk_edit.py L377-L381](src/documents/bulk_edit.py#L377-L381) |
+| LLM 向量索引 | 软删除和硬删除（post_delete 信号） | 异步 `remove_document_from_llm_index`（仅 `llm_index_enabled` 为真时） | [src/documents/signals/handlers.py L1342-L1355](src/documents/signals/handlers.py#L1342-L1355) |
+| 审计日志 LogEntry | hard_delete（empty_trash 内） | `LogEntry.objects.filter(...).delete()` | [src/documents/tasks.py L420-L425](src/documents/tasks.py#L420-L425) |
+| 磁盘文件 | hard_delete（empty_trash 内） | 删除/移动原文件、归档、缩略图，清理空目录 | [src/documents/signals/handlers.py L342-L402](src/documents/signals/handlers.py#L342-L402) |
+| WebSocket 通知 | 批量软删除 | `send_documents_deleted(delete_ids)` | [src/documents/bulk_edit.py L383-L384](src/documents/bulk_edit.py#L383-L384) |
 
 ---
 
@@ -500,8 +532,8 @@ Paperless-ngx 中「archive」一词有两种完全不同的含义，切勿混�
 - 表示文档在物理档案盒中的编号，`Document.archive_serial_number` 字段（PositiveIntegerField，唯一约束）
 - 只在合并/分割/替换文档的流程中涉及「释放」和「恢复」，与 Trash 生命周期无直接关系
 - 相关函数：
-  - [release_archive_serial_numbers()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/bulk_edit.py#L65-L78)：清空待替换文档的 ASN，返回 `{doc_id: old_asn}` 备份
-  - [restore_archive_serial_numbers()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/bulk_edit.py#L81-L88)：用备份恢复 ASN（替换失败回滚时使用）
+  - [release_archive_serial_numbers()](src/documents/bulk_edit.py#L65-L78)：清空待替换文档的 ASN，返回 `{doc_id: old_asn}` 备份
+  - [restore_archive_serial_numbers()](src/documents/bulk_edit.py#L81-L88)：用备份恢复 ASN（替换失败回滚时使用）
 
 ---
 
@@ -523,22 +555,34 @@ Paperless-ngx 中「archive」一词有两种完全不同的含义，切勿混�
 ## 10. 常见疑问解答（基于代码证据）
 
 **Q：软删除后文件还在磁盘上吗？**
-A：在。软删除仅设置 `deleted_at` 时间戳和更新搜索/LLM 索引，完全不触碰磁盘文件。只有 `empty_trash` 执行硬删除时才会在 `post_delete` 信号中调用 `cleanup_document_deletion` 清理文件。单元测试 [test_document_soft_delete](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/tests/test_document_model.py#L65-L103) 显式 mock `Path.unlink` 验证软删除不会调用 unlink。
+A：在。软删除仅设置 `deleted_at` 时间戳和更新搜索/LLM 索引，完全不触碰磁盘文件。只有 `empty_trash` 执行硬删除时才会在 `post_delete` 信号中调用 `cleanup_document_deletion` 清理文件。单元测试 [test_document_soft_delete](src/documents/tests/test_document_model.py#L65-L103) 显式 mock `Path.unlink` 验证软删除不会调用 unlink。
 
 **Q：为什么 `cleanup_document_deletion` 不直接在 apps.py ready() 中注册到 post_delete？**
-A：因为 `django-softdelete` 的软删除内部也会触发 Django 的 `post_delete` 信号（用于实现级联软删除）。如果默认注册，软删除时文件就会被误删，回收站功能就失去了意义。所以采用「在 `empty_trash` 内临时连接、try/finally 确保断开」的技巧。
+A：因为 `django-softdelete` 的软删除内部也会触发 Django 的 `post_delete` 信号（用于实现级联软删除）。如果默认注册，软删除时文件就会被误删，回收站功能就失去了意义。所以采用「在 `empty_trash` 内临时连接、try/finally 确保断开」的技巧。函数上方的注释 `# see empty_trash in documents/tasks.py for signal handling` 也明确了这一约定。
 
 **Q：恢复文档后，搜索能立刻搜到吗？LLM 问答能用到吗？**
-A：不能。`restore()` 只清除 `deleted_at` 字段，代码中没有任何地方在 restore 后调用 `get_backend().add_or_update()` 或重新加入 LLM 索引。需要靠后续触发索引重建的事件（如编辑保存文档）或手动调用索引管理命令。
+A：不能。代码证据：
+1. Tantivy 索引 `add_to_index` 只在 `document_consumption_finished` 信号连接（[src/documents/apps.py L29](src/documents/apps.py#L29)），restore 不触发该信号
+2. LLM 索引 `add_or_update_document_in_llm_index` 同样只在 `document_consumption_finished` 连接（[src/documents/apps.py L31](src/documents/apps.py#L31)）
+3. `document_updated` 信号没有连接任何索引更新函数（[src/documents/apps.py L32-L33](src/documents/apps.py#L32-L33)）
+4. [TrashView.post()](src/documents/views.py#L5116-L5118) 的 restore 分支中没有任何显式索引调用
+
+需要靠后续触发索引重建的事件（如编辑保存文档）或手动调用索引管理命令。
 
 **Q：删除根文档时，版本文档怎么办？**
-A：会被一并软删除。[Document.delete()](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/models.py#L503-L514) 在检测到 `root_document_id is None`（即当前是根文档）时，显式 `Document.objects.filter(root_document=self).delete()` 软删除所有版本。硬删除时则由 `root_document` 外键的 `on_delete=models.CASCADE` 自动级联。
+A：会被一并软删除。[Document.delete()](src/documents/models.py#L503-L514) 在检测到 `root_document_id is None`（即当前是根文档）时，显式 `Document.objects.filter(root_document=self).delete()` 软删除所有版本。硬删除时则由 `root_document` 外键的 `on_delete=models.CASCADE` 自动级联。测试见 [test_delete_root_deletes_versions](src/documents/tests/test_document_model.py#L105-L125)。
 
 **Q：工作流中执行 move_to_trash 之后的动作还会执行吗？**
-A：不会。[run_workflows](file:///d:/fz/0601/solo-dogfeeding/code/62-paperless-ngx/src/documents/signals/handlers.py#L907-L913) 循环在每个动作后检查 `document.is_deleted`，若为真则 `break` 跳出，后续动作全部跳过。
+A：不会。[run_workflows](src/documents/signals/handlers.py#L907-L913) 循环在每个动作后检查 `document.is_deleted`，若为真则 `break` 跳出，后续动作全部跳过。
 
 **Q：Note / ShareLink / CustomFieldInstance 在文档软删除时会怎样？**
-A：会被 `django-softdelete` 级联软删除（同样打上 `deleted_at`）。因为它们都继承了 `SoftDeleteModel`，且外键 `on_delete=CASCADE`。恢复文档时也会被级联恢复。硬删除时则由 Django ORM CASCADE 真正从数据库删除。
+A：会被 `django-softdelete` 级联软删除（同样打上 `deleted_at`）。因为它们都继承了 `SoftDeleteModel`，且外键 `on_delete=CASCADE`。恢复文档时也会被级联恢复。硬删除时则由 Django ORM CASCADE 真正从数据库删除。单元测试 [test_export_import_soft_deleted_document](src/documents/tests/test_management_exporter.py#L978-L1022) 显式验证了软删除后 Note 和 CustomFieldInstance 的 `deleted_at` 均被设置。
 
 **Q：配置了 EMPTY_TRASH_DIR 后，所有文件都会移动到那里吗？**
-A：不是。只有 `source_path`（原文件）会被 `shutil.move` 到 `EMPTY_TRASH_DIR`（文件名冲突时自动追加 `_01`、`_02`…）。`archive_path`（PDF/A）和 `thumbnail_path`（缩略图）始终直接 `unlink()` 删除。
+A：不是。只有 `source_path`（原文件）会被 `shutil.move` 到 `EMPTY_TRASH_DIR`（文件名冲突时自动追加 `_01`、`_02`…）。`archive_path`（PDF/A）和 `thumbnail_path`（缩略图）始终直接 `unlink()` 删除。代码见 [src/documents/signals/handlers.py L344-L379](src/documents/signals/handlers.py#L344-L379)。
+
+**Q：回收站的 API 路由是什么？DELETE 文档和 POST /api/trash/ 有什么区别？**
+A：回收站 API 是 `POST /api/trash/`，路由定义在 [src/paperless/urls.py L257-L259](src/paperless/urls.py#L257-L259)，视图类为 [TrashView](src/documents/views.py#L5083-L5123)。区别：
+- `DELETE /api/documents/<id>/` → 软删除，文档进入回收站，磁盘文件保留
+- `POST /api/trash/` body `{"action":"restore"}` → 从回收站恢复
+- `POST /api/trash/` body `{"action":"empty"}` → 永久删除，清理磁盘文件
