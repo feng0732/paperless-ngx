@@ -634,11 +634,11 @@ export class PermissionsFormComponent ... {
 - `set_permissions.view.users` / `set_permissions.view.groups`
 - `set_permissions.change.users` / `set_permissions.change.groups`
 
-### 4.6 PermissionsDialogComponent —— 独立权限对话框（支持 merge）
-
-用于 SavedView 管理页、Tag 批量编辑等"单独改权限"场景，比 EditDialog 多一个 `merge` 开关。
+### 4.6 PermissionsDialogComponent —— 独立权限对话框（带 merge 开关，但并非所有调用方都消费）
 
 位置：`src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts#L26-L104`
+
+PermissionsDialogComponent 自身表单里包含 `merge` 开关（默认 true），confirm 时发射 `{ permissions, merge }`。**但 merge 参数只在「批量权限编辑」链路中被真正消费**，单对象权限编辑的调用方会忽略它。
 
 ```typescript
 export class PermissionsDialogComponent {
@@ -656,7 +656,7 @@ export class PermissionsDialogComponent {
 
   public form = new FormGroup({
     permissions_form: new FormControl(),
-    merge: new FormControl(true),  // ← 独有：是否合并而非覆盖
+    merge: new FormControl(true),  // ← 是否合并而非覆盖（仅批量编辑生效）
   })
 
   get permissions() {
@@ -672,13 +672,23 @@ export class PermissionsDialogComponent {
   confirm() {
     this.confirmClicked.emit({
       permissions: this.permissions,
-      merge: this.form.get('merge').value,
+      merge: this.form.get('merge').value,  // ← 发射 merge，但调用方未必使用
     })
   }
 }
 ```
 
-后端 `merge` 参数的消费位置：`src/documents/permissions.py#L93-L163` 中的 `set_permissions_for_object(permissions, object, *, merge=False)`：
+**merge 参数消费链路全景：**
+
+| 调用方 | 是否消费 merge | 原因 |
+|--------|:---:|------|
+| SavedViewsComponent.editPermissions() | ❌ 忽略 | 单对象 PATCH，`({ permissions })` 解构时丢弃 merge，后端单对象 PATCH 接口也无 merge 参数 |
+| MailComponent.editPermissions() | ❌ 忽略 | 虽然解构了 `({ permissions, merge })`，但后续代码完全未使用 merge 变量，仍走单对象 patch() |
+| ManagementListComponent.setPermissions() | ✅ 消费 | 调用 `service.bulk_edit_objects(..., permissions, merge, ...)`，merge 传入批量接口 |
+| SaveViewConfigDialog（新建 SavedView） | — 不涉及 | 内嵌 permissions_form，无 merge 开关 |
+| EditDialogComponent（通用编辑） | — 不涉及 | 内嵌 permissions_form，无 merge 开关 |
+
+后端 `merge` 参数的消费位置：`src/documents/permissions.py#L93-L163` 中的 `set_permissions_for_object(permissions, object, *, merge=False)`，该函数仅被 `BulkEditObjectsView` 和批量编辑链路调用：
 
 ```python
 def set_permissions_for_object(permissions, object, *, merge: bool = False) -> None:
@@ -933,13 +943,15 @@ public editPermissions(savedView: SavedView): void {
     const dialog = modal.componentInstance as PermissionsDialogComponent
     dialog.object = savedView   // ← object setter 里做 permissions → set_permissions 桥接
 
-    modal.componentInstance.confirmClicked.subscribe(({ permissions, merge }) => {
+    // 关键：只解构 permissions，完全忽略 merge 参数
+    // PermissionsDialog 发射 { permissions, merge }，但 SavedView 单对象 PATCH 不支持 merge
+    modal.componentInstance.confirmClicked.subscribe(({ permissions }) => {
         modal.componentInstance.buttonsEnabled = false
         const view = {
             id: savedView.id,
             owner: permissions.owner,
         }
-        view['set_permissions'] = permissions.set_permissions
+        view['set_permissions'] = permissions.set_permissions  // 总是全量覆盖，不支持合并
         this.savedViewService.patch(view as SavedView).subscribe({
             next: () => { this.toastService.showInfo(...); modal.close(); this.reloadViews() },
             ...
@@ -947,6 +959,8 @@ public editPermissions(savedView: SavedView): void {
     })
 }
 ```
+
+> **merge 对 SavedView 无效**：SavedView 管理页的权限编辑走单对象 PATCH 接口，而后端 `SavedViewSerializer.update()` → `OwnedObjectSerializer.update()` → `_set_permissions()` 调用 `set_permissions_for_object()` 时**不传递 merge 参数**（默认 merge=False），因此 SavedView 的权限编辑总是**全量覆盖**，对话框中的 merge 开关对 SavedView 没有任何实际效果。merge 参数仅对 ManagementListComponent（Tag/Correspondent/DocumentType/StoragePath）的批量权限编辑链路有效。
 
 **权限可见性控制：**
 
@@ -1072,9 +1086,30 @@ this.activeSavedViewCanChange = this.permissionsService.currentUserHasObjectPerm
 | B. SaveViewConfigDialog | 新建保存视图 | ✅ | 新建不涉及 GET，直接 POST | DocumentListComponent.saveViewConfigAs() 里 `permissions_form` → `owner` + `['set_permissions']` |
 | C. saveViewConfig() | 覆盖保存已有视图 | ❌ | 不涉及权限字段 | 直接 PATCH，不含任何权限相关字段 |
 
-### 5.7 批量权限编辑：bulk_edit_objects
+### 5.7 批量权限编辑：bulk_edit_objects（merge 参数唯一有效的链路）
 
-SavedView 目前未纳入批量编辑（`object_type` 只支持 tags/correspondents/document_types/storage_paths），但 PermissionsDialogComponent 中的 `merge` 参数正是为此设计。
+SavedView **目前未纳入批量编辑**（`object_type` 只支持 tags/correspondents/document_types/storage_paths），因此 PermissionsDialogComponent 中的 `merge` 开关对 SavedView 完全无效。merge 参数仅在以下批量编辑链路中被真正消费：
+
+```
+ManagementListComponent.setPermissions() （Tag/Correspondent/DocumentType/StoragePath 管理页）
+    ↓ PermissionsDialog confirmClicked.emit({ permissions, merge })
+    ↓ ManagementList 解构并消费 merge
+    ↓ AbstractNameFilterService.bulk_edit_objects(..., permissions, merge, ...)
+    ↓ POST /api/{resource}/bulk_edit_objects/
+    ↓ BulkEditObjectsView
+    ↓ set_permissions_for_object(permissions=..., object=obj, merge=merge)
+```
+
+而 SavedView 管理页的 editPermissions() 是单对象 PATCH 链路，merge 参数在回调解构时就被丢弃：
+
+```
+SavedViewsComponent.editPermissions()
+    ↓ PermissionsDialog confirmClicked.emit({ permissions, merge })
+    ↓ subscribe(({ permissions }) => { ... })  // ← merge 在此处被解构丢弃
+    ↓ SavedViewService.patch(view)  // 单对象 PATCH，无 merge 参数
+    ↓ SavedViewSerializer.update() → OwnedObjectSerializer.update()
+    ↓ _set_permissions() → set_permissions_for_object(permissions, object)  // 默认 merge=False
+```
 
 **后端 BulkEditObjectsSerializer：**
 
@@ -1176,16 +1211,21 @@ GET /api/saved_views/?full_perms=true
 2. 用户点击"编辑权限" → 打开 `PermissionsDialogComponent`
 3. `dialog.object = savedView` 触发 setter，把 `savedView.permissions` → `form.permissions_form.set_permissions`
 
-### Step 4：用户提交 PATCH
+### Step 4：用户提交 PATCH（merge 参数在此被忽略）
 
 ```typescript
-const view = {
-    id: savedView.id,
-    owner: permissions.owner,            // 可能为 null
-}
-view['set_permissions'] = permissions.set_permissions  // e.g. {view:..., change:...}
-this.savedViewService.patch(view as SavedView)
+// SavedViewsComponent.editPermissions() 的回调：只解构 permissions，完全丢弃 merge
+modal.componentInstance.confirmClicked.subscribe(({ permissions }) => {
+    const view = {
+        id: savedView.id,
+        owner: permissions.owner,            // 可能为 null
+    }
+    view['set_permissions'] = permissions.set_permissions  // e.g. {view:..., change:...}
+    this.savedViewService.patch(view as SavedView)
+})
 ```
+
+> **merge 被丢弃的位置**：PermissionsDialogComponent.confirm() 实际发射 `{ permissions, merge }`，但 SavedViewsComponent 的 subscribe 回调只解构了 `{ permissions }`，merge 对象在此处即被丢弃，根本不会传到后端。
 
 发出请求：
 ```
@@ -1202,6 +1242,8 @@ Content-Type: application/json
 }
 ```
 
+注意：请求 body 中**没有** `merge` 字段，因为 SavedViewService.patch() 走单对象 PATCH 接口，而 `merge` 字段只在 `bulk_edit_objects/` 批量接口的请求体中定义。
+
 ### Step 5：后端处理写入 + 前端 reload 获取完整权限
 
 后端处理写入：
@@ -1210,6 +1252,7 @@ Content-Type: application/json
 3. `validate_set_permissions()` 校验所有 user_id/group_id 存在
 4. `OwnedObjectSerializer.update()` 校验当前用户是 owner / superuser（否则 PermissionDenied）
 5. `_set_permissions()` → `set_permissions_for_object()` 通过 django-guardian 更新权限表
+   - **注意**：`_set_permissions()` 调用时**不传 merge 参数**，使用函数默认值 `merge=False`，因此 SavedView 单对象权限编辑总是**全量覆盖**而非合并
    - change 权限会自动附带 view 权限
 6. **PATCH 响应**：因为 full_perms=false，响应中**不包含完整 `permissions` 矩阵**，只有 `user_can_change`、`is_shared_by_requester` 等轻量字段
 
