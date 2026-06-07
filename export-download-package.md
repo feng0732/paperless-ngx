@@ -323,9 +323,10 @@ class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
 def rebuild(self, request, pk=None):
     # ⚠️ 先通过 self.get_object() 触发 DRF 的两层权限校验：
     #   1) check_permissions  → PaperlessObjectPermissions.has_permission
-    #                         → 必须有全局 documents.change_sharelinkbundle 权限
+    #                         → 必须有全局 documents.add_sharelinkbundle 权限
+    #                         → （POST 方法被 perms_map 映射到 add，即使是 detail 路由的自定义 action）
     #   2) check_object_permissions → PaperlessObjectPermissions.has_object_permission
-    #                         → 必须是 bundle.owner 或有 guardian 对象级 change 授权
+    #                         → 必须是 bundle.owner 或 bundle 无主或有 guardian 对象级授权
     bundle = self.get_object()
     if bundle.status == ShareLinkBundle.Status.PROCESSING:
         return Response({"detail": _("Bundle is already being processed.")}, status=400)
@@ -350,10 +351,16 @@ def rebuild(self, request, pk=None):
 ```
 
 **Rebuild 与 Create 的权限差异**：
-| 校验点 | Create | Rebuild |
-|--------|--------|---------|
-| 全局 add/change_sharelinkbundle 权限 | ✅ PaperlessObjectPermissions | ✅ PaperlessObjectPermissions（change） |
-| bundle 对象级 owner / guardian 授权 | ✅ PaperlessObjectPermissions | ✅ PaperlessObjectPermissions |
+
+⚠️ **关键前提**：`PaperlessObjectPermissions.perms_map` 完全按 HTTP 方法映射权限，不区分 list/detail 路由，也不区分标准 create 还是自定义 action。
+- `POST` → `documents.add_sharelinkbundle`（即使是 detail 路由上的 POST）
+- `PUT/PATCH` → `documents.change_sharelinkbundle`
+- `DELETE` → `documents.delete_sharelinkbundle`
+
+| 校验点 | Create（POST /api/share_link_bundles/） | Rebuild（POST /api/share_link_bundles/{id}/rebuild/） |
+|--------|------------------------------------------|------------------------------------------------------|
+| 全局权限（PaperlessObjectPermissions.has_permission） | ✅ `add_sharelinkbundle`（POST → add） | ✅ `add_sharelinkbundle`（POST → add，**不是 change**） |
+| bundle 对象级（PaperlessObjectPermissions.has_object_permission） | 不触发（list 路由） | ✅ owner / 无主 / guardian 对象级授权 |
 | bundle.documents 逐文档 view_document | ✅ 逐条 has_perms_owner_aware | ❌ **完全不复验** |
 | documents 是否仍然存在 | ✅ 通过 Document.objects.filter 隐式校验 | ❌ 不复验 |
 
@@ -574,7 +581,7 @@ class PaperlessObjectPermissions(DjangoObjectPermissions):
 | **批量下载 — ID 选择（all=false）** | 无 | — | ❌ 无 | ❌ 无 | 直接透传前端传入的 ID，完全不做权限过滤 |
 | **批量下载 — 逐文档最终校验** | `BulkDownloadView.post` 手写 for 循环 [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L3732-L3734) | `change_document` | ❌ **无全局基线** | ✅ 每条 `has_perms_owner_aware` | ⚠️ 比单下载更严格但**缺少全局 change_document 检查** |
 | **分享链接打包 — Create** | `ShareLinkBundleViewSet.create` 两处 [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4308-L4337) | 体系 B + 体系 A 组合 | ✅ `add_sharelinkbundle`（体系 B） | ✅ 每条 `view_document`（体系 A） | 先全局+对象级 bundle 权限，再逐文档 view_document |
-| **分享链接打包 — Rebuild** | `ShareLinkBundleViewSet.rebuild` → `self.get_object()` [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4374-L4405) | 体系 B 仅 bundle 对象 | ✅ `change_sharelinkbundle`（体系 B） | ❌ **不复验文档** | 只校验 bundle 对象权限，文档权限完全信任创建时结果 |
+| **分享链接打包 — Rebuild** | `ShareLinkBundleViewSet.rebuild` → `self.get_object()` [views.py](file:///d:/fz/0601/solo-dogfeeding/code/65-paperless-ngx/src/documents/views.py#L4374-L4405) | 体系 B 仅 bundle 对象 | ✅ `add_sharelinkbundle`（体系 B，POST → add，**不是 change**） | ❌ **不复验文档** | 只校验 bundle 对象权限，文档权限完全信任创建时结果 |
 | **分享链接打包 — Celery 执行** | 无 | — | — | — | 完全信任创建/rebuild 阶段的校验结果 |
 | **分享链接打包 — Bundle 列表/详情** | `PaperlessObjectPermissions` + `ObjectOwnedOrGrantedPermissionsFilter` | 体系 B | ✅ `view_sharelinkbundle` | — | 控制谁能查看/修改/删除 bundle 记录本身 |
 | **分享链接公开下载（SharedLinkView）** | 无 | — | — | — | `authentication_classes=[]`, `permission_classes=[]`；只校验 slug + expiration |
@@ -650,20 +657,24 @@ def _has_document_permissions(self, *, user, documents, method, parameters):
   │
   ├─ DRF dispatch: check_permissions()
   │   └─ PaperlessObjectPermissions.has_permission()   ← 体系 B
-  │       └─ 必须有全局 add_sharelinkbundle / change_sharelinkbundle
+  │       └─ 必须有全局 add_sharelinkbundle
+  │          （POST 方法 → perms_map 映射到 add，create 和 rebuild 都是 POST）
   │
   ├─ DRF dispatch: check_object_permissions()（仅 detail 路由：rebuild/update/delete）
   │   └─ PaperlessObjectPermissions.has_object_permission()  ← 体系 B
   │       ├─ bundle.owner == user → ✅
   │       ├─ bundle.owner is None → ✅
-  │       └─ guardian 对象级 change_sharelinkbundle → ✅
+  │       └─ guardian 对象级授权（POST 对应 add_sharelinkbundle 对象级权限）→ ✅
   │
   └─ View 内部业务逻辑校验
       ├─ Create: 逐文档 has_perms_owner_aware("view_document")  ← 体系 A
       └─ Rebuild: ❌ 不复验文档
 ```
 
-- **全局权限基线**：✅ 体系 B 的 `has_permission` 检查全局 `add_sharelinkbundle` / `change_sharelinkbundle`
+- **全局权限基线**：✅ 体系 B 的 `has_permission` 检查全局 `add_sharelinkbundle`
+  - Create 和 Rebuild 都是 POST 方法 → perms_map 映射到 `add_sharelinkbundle`
+  - 若使用 PUT/PATCH 更新 bundle，则映射到 `change_sharelinkbundle`
+  - DELETE 删除 bundle 映射到 `delete_sharelinkbundle`
 - **逐文档校验**：✅ Create 时用体系 A 的 `has_perms_owner_aware("view_document")`；❌ Rebuild 时不复验
 - **Bundle 对象级**：✅ 体系 B 的 `has_object_permission`（owner / 无主 / guardian）
 - **适用操作**：分享链接 / 分享包 CRUD
@@ -672,8 +683,8 @@ def _has_document_permissions(self, *, user, documents, method, parameters):
 
 | 维度 | BulkDownloadView | DocumentOperationPermissionMixin | ShareLinkBundleViewSet |
 |------|------------------|----------------------------------|------------------------|
-| 全局 change_document / 对应权限 | ❌ 无 | ✅ 必须有 | ✅ 体系 B 全局 add/change_sharelinkbundle |
-| 逐文档 has_perms_owner_aware | ✅ change_document | ✅ change_document | ✅ Create: view_document；❌ Rebuild: 无 |
+| 全局权限基线 | ❌ 无 | ✅ `documents.change_document` 必须有 | ✅ 体系 B：POST→`add_sharelinkbundle`，PUT/PATCH→`change_sharelinkbundle`，DELETE→`delete_sharelinkbundle` |
+| 逐文档 has_perms_owner_aware | ✅ `change_document` | ✅ `change_document` | ✅ Create: `view_document`；❌ Rebuild: 无 |
 | 全部文档所有者要求 | ❌ 无 | ✅ 破坏性操作要求 | ❌ 无（bundle.owner 只校验 bundle 对象） |
 | 全局 add_document / delete_document | ❌ 无 | ✅ 对应操作要求 | ❌ 无 |
 | superuser 直通 | ✅ 通过体系 A 隐式 | ✅ 显式 early return | ✅ 通过体系 B 隐式 |
@@ -797,13 +808,14 @@ ShareLinkBundleViewSet.rebuild
   │  permission_classes: (IsAuthenticated, PaperlessObjectPermissions)
   │
   │  体系 B —— 全局层：
-  │  check_permissions() → user.has_perm("documents.change_sharelinkbundle")
+  │  check_permissions() → user.has_perm("documents.add_sharelinkbundle")
+  │                        （POST → perms_map 映射到 add，不是 change）
   │
   │  体系 B —— 对象层（由 self.get_object() 触发）：
   │  check_object_permissions(bundle)
   │    ├─ bundle.owner == request.user → ✅
   │    ├─ bundle.owner is None → ✅
-  │    └─ guardian 对象级 change_sharelinkbundle → ✅
+  │    └─ guardian 对象级 add_sharelinkbundle 授权 → ✅
   │
   │  业务层 —— ⚠️ 不复验文档：
   │  1. if bundle.status == PROCESSING → 400
