@@ -20,9 +20,14 @@ Paperless-ngx 的设置系统由四个主层级 + 一个前端兜底机制构成
 
 > **重要例外**：
 > 1. 某些系统级字段（`app_title`、`ai_enabled`、`trash_delay` 等）由后端在 API 返回时**强制注入**，会覆盖用户 UiSettings（L4）中的同名键。见第三章。
-> 2. `app_title`、`app_logo` 字段的 L1 前端 SETTINGS 默认值 `''` 实际**永远不会生效**——因为后端始终返回这两个键（值为 null 时前端直接返回 null，不回退到 L1）。两者的兜底机制不同：
->    - **`app_title`**：前端 `initializeSettings()` 中通过 `environment.appTitle = 'Paperless-ngx'` 兜底（仅当值非空时才覆盖）
->    - **`app_logo`**：`LogoComponent` 判断值非空时显示 `<img>`，值为 null 时直接渲染**内置 SVG Logo**，不存在 environment 兜底变量
+> 2. `app_title`、`app_logo` 字段的 L1 前端 SETTINGS 默认值 `''` 实际**永远不会生效**——因为后端始终返回这两个键（值为 null 时前端直接返回 null，不回退到 L1）。两者的兜底机制不同，且存在**两条独立的渲染路径**：
+>    - **前端 Angular 渲染路径**（登录后页面）：
+>      - `app_title`：前端 `initializeSettings()` 中通过 `environment.appTitle = 'Paperless-ngx'` 兜底
+>      - `app_logo`：`LogoComponent` 判断值非空时显示 `<img>`，值为 null 时直接渲染组件内置 SVG Logo
+>    - **服务端 Django SSR 路径**（登录页/注册页等）：
+>      - `app_title`、`app_logo` 由 `context_processors.py` 注入模板变量
+>      - L3 app_logo 会先拼接 `BASE_URL` 再返回给模板
+>      - 两者都为空时，`base.html` 渲染 `svg_logo.html` 内联 SVG
 
 ---
 
@@ -32,8 +37,11 @@ Paperless-ngx 的设置系统由四个主层级 + 一个前端兜底机制构成
 
 主要文件：
 - [src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts) — SETTINGS 数组
-- [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) — `appTitle` 兜底值（仅 app_title）
-- [src-ui/src/app/components/common/logo/logo.component.ts](src-ui/src/app/components/common/logo/logo.component.ts) — LogoComponent 内置 SVG 兜底（仅 app_logo）
+- [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) — `appTitle` 兜底值（仅 Angular 前端 app_title）
+- [src-ui/src/app/components/common/logo/logo.component.ts](src-ui/src/app/components/common/logo/logo.component.ts) — LogoComponent 内置 SVG 兜底（仅 Angular 前端 app_logo）
+- [src/documents/context_processors.py](src/documents/context_processors.py) — SSR 模板变量注入（Django 登录页/注册页）
+- [src/documents/templates/paperless-ngx/base.html](src/documents/templates/paperless-ngx/base.html) — SSR 模板渲染分支（APP_LOGO/APP_TITLE 都为空时渲染 svg_logo）
+- [src/documents/templates/paperless-ngx/snippets/svg_logo.html](src/documents/templates/paperless-ngx/snippets/svg_logo.html) — SSR 内置 SVG Logo
 
 每个设置项通过 `SETTINGS` 数组定义，包含 `key`、`type`、`default`：
 
@@ -57,7 +65,7 @@ export const SETTINGS: UiSetting[] = [
   {
     key: SETTINGS_KEYS.APP_LOGO,
     type: 'string',
-    default: '',   // ⚠️ 该默认值永远不会生效（后端始终返回 app_logo 键，值为 null 时直接返回 null）
+    default: '',   // 注意：该默认值永远不会生效（后端始终返回 app_logo 键，值为 null 时直接返回 null）
   },
   // ... 约 40 个设置项
 ]
@@ -65,12 +73,21 @@ export const SETTINGS: UiSetting[] = [
 
 **`app_title` 与 `app_logo` 的兜底机制差异（重要）：**
 
-两个字段在 SETTINGS 中虽然定义了 `default: ''`，但由于后端 `UiSettingsView.get()` 始终向响应中注入这两个键（即使值为 `null`），前端 `get()` 方法只会在 `value === undefined` 时才回退到默认值，而 `null` 直接返回 `null`，因此这两个字段的 SETTINGS 默认值**永远不会被触发**。两者的兜底机制完全不同：
+两个字段在 SETTINGS 中虽然定义了 `default: ''`，但由于后端 `UiSettingsView.get()` 始终向响应中注入这两个键（即使值为 `null`），前端 `get()` 方法只会在 `value === undefined` 时才回退到默认值，而 `null` 直接返回 `null`，因此这两个字段的 SETTINGS 默认值**永远不会被触发**。两个字段存在**两条独立的渲染路径**，兜底机制完全不同：
+
+**Angular 前端渲染路径（登录后页面）：**
 
 | 字段 | SettingsService.get() 返回 | 前端兜底位置 | 兜底值 |
 |------|--------------------------|------------|--------|
 | `app_title` | `null` | `settings.service.ts` 的 `initializeSettings()` | `environment.appTitle = 'Paperless-ngx'` |
-| `app_logo` | `null` | `LogoComponent.customLogo` getter | 值为 null/falsy 时渲染**内置 SVG Logo**（无字符串兜底） |
+| `app_logo` | `null` | `LogoComponent.customLogo` getter | 值为 null/falsy 时渲染**组件内置 SVG Logo**（无字符串兜底） |
+
+**Django SSR 渲染路径（登录页/注册页等）：**
+
+| 字段 | context_processors 注入值 | 模板渲染逻辑 | 兜底值 |
+|------|--------------------------|------------|--------|
+| `app_title` | L3 非空 → L3，否则回退 L2（L2 默认 None） | `base.html`：有值显示文字，两者都为空则渲染 svg | 与 app_logo 同时为空时，渲染 `svg_logo.html` 完整 SVG |
+| `app_logo` | L3 非空 → `BASE_URL + L3路径`；否则回退 L2（默认 None） | `base.html`：有值显示 `<img>`，否则判断 app_title | 与 app_title 同时为空时，渲染 `svg_logo.html` 完整 SVG |
 
 ### 2.2 L2：Django 环境变量与代码默认值
 
@@ -509,22 +526,149 @@ ui_settings["trash_delay"] = settings.EMPTY_TRASH_DELAY
 **最终优先级：L2 环境变量 > 用户 UiSettings**
 完全不使用 L3，也不看用户设置的值。
 
-### 3.3 Django 模板 Context Processor 中的合并
+### 3.3 Django SSR（服务端渲染）完整路径：登录页/注册页
 
-文件：[src/documents/context_processors.py](src/documents/context_processors.py)
+登录页、注册页等页面不走 Angular 前端，而是由 Django 模板直接渲染。这条路径与 3.2.3 的 Angular 前端路径**完全独立**。
 
-服务端渲染登录页等模板时也使用了 L3 > L2 的合并：
+涉及文件：
+- [src/documents/context_processors.py](src/documents/context_processors.py) — 向模板注入 `APP_TITLE` 和 `APP_LOGO`
+- [src/documents/templates/paperless-ngx/base.html](src/documents/templates/paperless-ngx/base.html) — 渲染分支判断
+- [src/documents/templates/paperless-ngx/snippets/svg_logo.html](src/documents/templates/paperless-ngx/snippets/svg_logo.html) — 内置 SVG Logo
+- [src/documents/templates/account/login.html](src/documents/templates/account/login.html) — 继承 `base.html` 的登录页
+
+---
+
+#### 3.3.1 context_processors.py：注入模板变量
 
 ```python
+# documents/context_processors.py
 def settings(request):
     general_config = GeneralConfig()
+
+    # app_title 合并：L3 DB 非空 → L3；否则回退 L2（django_settings.APP_TITLE）
     app_title = (
         django_settings.APP_TITLE
         if general_config.app_title is None or len(general_config.app_title) == 0
         else general_config.app_title
     )
-    # 与 UiSettingsView 中的逻辑一致
+
+    # app_logo 合并：注意与 Angular 前端路径的差异
+    app_logo = (
+        django_settings.APP_LOGO                                # L3 为空时回退到 L2
+        if general_config.app_logo is None or len(general_config.app_logo) == 0
+        else django_settings.BASE_URL + general_config.app_logo.lstrip("/")  # L3 有值时拼接 BASE_URL
+    )
+
+    return {
+        "APP_TITLE": app_title,   # 可能是字符串或 None
+        "APP_LOGO": app_logo,     # 可能是字符串或 None
+        # ... 其他变量
+    }
 ```
+
+**关键点 1：L3 logo 为什么要先拼接 BASE_URL？**
+
+`ApplicationConfiguration.app_logo` 是 Django `FileField`，其 `.url` 属性返回的是媒体文件的相对路径（如 `/logo/custom.png`），而不是完整 URL。
+
+`BASE_URL` 来自 [src/paperless/settings/custom.py](src/paperless/settings/custom.py) 的 `parse_hosting_settings()`：
+```python
+def parse_hosting_settings():
+    script_name = os.getenv("PAPERLESS_FORCE_SCRIPT_NAME")
+    base_url = (script_name or "") + "/"   # 默认值："/"；设置了 PAPERLESS_FORCE_SCRIPT_NAME 时为 "/前缀/"
+    # ...
+    return script_name, base_url, ...
+```
+
+拼接逻辑 `BASE_URL + general_config.app_logo.lstrip("/")` 的目的：
+- 当 Paperless-ngx 部署在子路径下（如 `https://example.com/paperless/`）时，`BASE_URL = "/paperless/"`
+- FileField 返回 `/logo/custom.png`，经 `lstrip("/")` 变为 `logo/custom.png`
+- 拼接结果：`"/paperless/" + "logo/custom.png"` = `"/paperless/logo/custom.png"`
+- 这样浏览器才能正确请求到子路径下的 logo 文件
+- 与 Angular 前端 `LogoComponent` 中的 `environment.apiBaseUrl.replace(/\/api\/$/, ...)` 拼接逻辑**目标一致**，只是在服务端完成
+
+**关键点 2：与 UiSettingsView.get() 的异同**
+
+| 对比维度 | `context_processors.py`（SSR） | `UiSettingsView.get()`（Angular API） |
+|---------|-------------------------------|-------------------------------------|
+| app_title 合并 | L3 非空 → L3，否则 L2 | 完全一致 |
+| app_logo 合并 | L3 非空 → **BASE_URL + L3**，否则 L2 | L3 非空 → **L3（不含 BASE_URL）**，否则 L2 |
+| 返回 null/None | 返回 `None` 给模板 | 返回 `null` 给 JSON API |
+| logo URL 拼接位置 | **服务端 context_processor** | **前端 LogoComponent getter** |
+
+这是两条路径的**核心差异**：SSR 路径在服务端就完成了 BASE_URL 拼接，Angular 路径把原始相对路径传给前端，由前端在 getter 中拼接 `apiBaseUrl`。
+
+---
+
+#### 3.3.2 base.html 模板：三种渲染分支
+
+`base.html` 是登录页、注册页等 SSR 页面的共同模板，通过模板继承使用（如 `login.html` 通过 `{% extends "paperless-ngx/base.html" %}` 继承）。
+
+logo/标题区域的完整渲染逻辑：
+
+```html
+<!-- base.html -->
+{% if not APP_LOGO and not APP_TITLE %}
+
+    <!-- 分支 A：两者都为空 → 渲染完整 SVG Logo -->
+    {% include "paperless-ngx/snippets/svg_logo.html"
+        with extra_attrs="width='300' class='logo mb-4'" %}
+
+{% else %}
+
+    {% if APP_LOGO %}
+        <!-- 分支 B：有 APP_LOGO → 显示 <img> + byline -->
+        <img src="{{APP_LOGO}}" width="300" class="logo mb-1" />
+        <div class="d-flex flex-column align-items-end mb-4">
+            <span class="byline text-uppercase font-monospace">by Paperless-ngx</span>
+        </div>
+    {% else %}
+        <!-- 分支 C：无 APP_LOGO 但有 APP_TITLE → 叶子 SVG + 文字标题 + byline -->
+        <h1 class="font-weight-normal text-primary mb-1 d-flex justify-content-center align-items-start">
+            {% include "paperless-ngx/snippets/svg_leaf.html"
+                with extra_attrs="width='30' class='mt-2'" %}
+            <div class="d-flex flex-column align-items-end mb-4">
+                <span class="ms-2">{{ APP_TITLE }}</span>
+                <span class="byline text-uppercase font-monospace">by Paperless-ngx</span>
+            </div>
+        </h1>
+    {% endif %}
+
+{% endif %}
+```
+
+**三种渲染分支说明：**
+
+| 分支 | APP_LOGO | APP_TITLE | 渲染内容 |
+|------|----------|-----------|---------|
+| **A** | 空/None/falsy | 空/None/falsy | `svg_logo.html` — 完整 Paperless-ngx 品牌 SVG（含叶子图标 + 文字） |
+| **B** | 有值 | 任意 | `<img src="{{APP_LOGO}}">` + "by Paperless-ngx" byline |
+| **C** | 空/None/falsy | 有值 | `svg_leaf.html`（小叶子图标 30px） + `{{ APP_TITLE }}` 文字 + byline |
+
+**分支 A 详解（两者都为空时渲染 svg_logo）：**
+
+当 L3 DB 和 L2 环境变量都未设置 `app_title` 和 `app_logo` 时：
+- `context_processors.py` 中 `app_title = django_settings.APP_TITLE = None`
+- `context_processors.py` 中 `app_logo = django_settings.APP_LOGO = None`
+- 模板变量 `APP_TITLE` 和 `APP_LOGO` 均为 `None`（Django 模板中被视为 falsy）
+- 条件 `{% if not APP_LOGO and not APP_TITLE %}` 成立
+- 渲染 `svg_logo.html` 的完整内联 SVG（包含 `<path>` 定义的叶子图标和 "Paperless-ngx" 文字矢量图形）
+- 这是 SSR 路径的兜底机制，**与 Angular 前端 LogoComponent 的内置 SVG 兜底目标一致，但实现完全独立**
+
+---
+
+#### 3.3.3 SSR 路径 vs Angular 前端路径对比总结
+
+| 对比维度 | Django SSR 路径（登录页等） | Angular 前端路径（登录后页面） |
+|---------|---------------------------|-------------------------------|
+| **触发场景** | 未登录时访问 `/accounts/login/` 等 | 登录后所有 Angular 路由页面 |
+| **app_title 取值** | `context_processors.py` 注入 | `UiSettingsView.get()` API 返回 |
+| **app_logo 取值** | `context_processors.py` 注入（L3 已拼 BASE_URL） | `UiSettingsView.get()` API 返回（L3 不拼 BASE_URL） |
+| **logo BASE_URL 拼接** | 服务端 `django_settings.BASE_URL` | 前端 `environment.apiBaseUrl` |
+| **app_title 兜底** | 与 logo 同时为空时走 svg_logo 分支 | `environment.appTitle = 'Paperless-ngx'` |
+| **app_logo 兜底** | 与 title 同时为空时渲染 `svg_logo.html` | `LogoComponent` 渲染组件内置 SVG |
+| **仅 logo 空，title 非空** | 分支 C：叶子 SVG + 文字标题 | 标题用 environment.appTitle，logo 走组件内置 SVG |
+| **仅 title 空，logo 非空** | 分支 B：`<img>` + byline | 正常显示 `<img>`，title 用 environment.appTitle |
+| **两者都为空** | 分支 A：渲染完整 svg_logo.html | title 用 `'Paperless-ngx'`，logo 用组件内置 SVG |
 
 ---
 
@@ -693,6 +837,53 @@ this.configService.saveConfig(...).subscribe(() => {
 > 两者共同点：`SettingsService.get()` 都返回 `null`，SETTINGS 中的 `default: ''` 永远不会被触发。
 > 两者不同点：兜底机制完全独立——`app_title` 用 `environment.appTitle` 字符串兜底，`app_logo` 用组件内置 SVG 兜底，两者互不相关。
 
+---
+
+**Django SSR（登录页）路径（与 Angular 前端路径完全独立）：**
+
+```
+用户请求 /accounts/login/
+       |
+       v
+  context_processors.settings() 被调用
+       |
+       +-- general_config = GeneralConfig()   <-- 读取 L3 DB
+       |
+       +-- 计算 app_title：
+       |     L3 非空？ --> L3 值
+       |     L3 为空？ --> django_settings.APP_TITLE (L2，默认 None)
+       |
+       +-- 计算 app_logo：
+       |     L3 非空？ --> BASE_URL + general_config.app_logo.lstrip("/")
+       |                      (服务端拼接 BASE_URL)
+       |     L3 为空？ --> django_settings.APP_LOGO (L2，默认 None)
+       |
+       v
+  模板变量 APP_TITLE / APP_LOGO 注入 base.html
+       |
+       +-- not APP_LOGO and not APP_TITLE  ?
+       |       |
+       |       +-- Yes (都为空) --> 分支 A：include svg_logo.html
+       |       |                      渲染完整 Paperless-ngx SVG
+       |       |
+       |       +-- No --> 继续判断
+       |                |
+       |                +-- APP_LOGO 有值 ?
+       |                         |
+       |                         +-- Yes --> 分支 B：<img src="{{APP_LOGO}}">
+       |                         |             + byline "by Paperless-ngx"
+       |                         |
+       |                         +-- No  --> 分支 C：include svg_leaf.html (30px)
+       |                                       + <span>{{APP_TITLE}}</span>
+       |                                       + byline
+       v
+  Django 模板渲染完成，返回 HTML 给浏览器
+```
+
+> SSR 路径的核心差异：logo URL 的 BASE_URL 拼接在**服务端 Python**中完成，而 Angular 路径在**前端 TypeScript getter**中完成。两条路径目标一致，都是确保子路径部署下 logo 正确加载。
+
+---
+
 **后端注入值的内部优先级（以 ai_enabled 为例）：**
 ```
 ai_enabled 最终值
@@ -713,6 +904,7 @@ ai_enabled 最终值
 | 文件 | 作用 |
 |------|------|
 | [src/paperless/settings/__init__.py](src/paperless/settings/__init__.py) | L2 Django settings，从环境变量读取 |
+| [src/paperless/settings/custom.py](src/paperless/settings/custom.py) | `parse_hosting_settings()` — BASE_URL 计算 |
 | [src/paperless/settings/parsers.py](src/paperless/settings/parsers.py) | `get_bool_from_env` 等解析函数 |
 | [src/paperless/models.py](src/paperless/models.py) | L3 ApplicationConfiguration 单例模型 |
 | [src/paperless/config.py](src/paperless/config.py) | L3 > L2 合并逻辑（OcrConfig 等） |
@@ -720,10 +912,15 @@ ai_enabled 最终值
 | [src/documents/models.py](src/documents/models.py) | L4 UiSettings 用户偏好模型 |
 | [src/documents/views.py](src/documents/views.py) | L4 + 系统注入合并 API (`UiSettingsView`) |
 | [src/documents/serialisers.py](src/documents/serialisers.py) | L4 UiSettingsViewSerializer |
-| [src/documents/context_processors.py](src/documents/context_processors.py) | SSR 模板中的 L3>L2 合并 |
+| [src/documents/context_processors.py](src/documents/context_processors.py) | SSR 模板变量注入：APP_TITLE/APP_LOGO 合并，L3 logo 拼接 BASE_URL |
+| [src/documents/templates/paperless-ngx/base.html](src/documents/templates/paperless-ngx/base.html) | SSR 模板：APP_LOGO/APP_TITLE 三种渲染分支判断 |
+| [src/documents/templates/paperless-ngx/snippets/svg_logo.html](src/documents/templates/paperless-ngx/snippets/svg_logo.html) | SSR 兜底：完整 Paperless-ngx SVG Logo |
+| [src/documents/templates/paperless-ngx/snippets/svg_leaf.html](src/documents/templates/paperless-ngx/snippets/svg_leaf.html) | SSR 兜底：小叶子图标（有 title 无 logo 时） |
+| [src/documents/templates/account/login.html](src/documents/templates/account/login.html) | 登录页模板（继承 base.html） |
 | [src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts) | L1 前端 SETTINGS 默认值定义 |
-| [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) | 前端兜底默认值（仅 `appTitle: 'Paperless-ngx'`，不含 app_logo） |
-| [src-ui/src/app/components/common/logo/logo.component.ts](src-ui/src/app/components/common/logo/logo.component.ts) | LogoComponent：app_logo 为 null 时渲染内置 SVG |
+| [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) | Angular 前端兜底（仅 `appTitle: 'Paperless-ngx'`，不含 app_logo） |
+| [src-ui/src/app/components/common/logo/logo.component.ts](src-ui/src/app/components/common/logo/logo.component.ts) | Angular LogoComponent：app_logo 为 null 时渲染组件内置 SVG |
+| [src-ui/src/app/components/common/logo/logo.component.html](src-ui/src/app/components/common/logo/logo.component.html) | Angular LogoComponent 模板：@if (customLogo) @else 分支 |
 | [src-ui/src/app/services/settings.service.ts](src-ui/src/app/services/settings.service.ts) | 前端设置加载、合并、持久化 |
 | [src-ui/src/app/services/config.service.ts](src-ui/src/app/services/config.service.ts) | L3 全局配置 CRUD |
 | [src-ui/src/app/data/paperless-config.ts](src-ui/src/app/data/paperless-config.ts) | L3 配置选项元数据（PaperlessConfigOptions） |
@@ -734,6 +931,8 @@ ai_enabled 最终值
 
 ### 场景 1：用户从未设置任何偏好，L3/L2 均未配置 app_title 和 app_logo
 
+**Angular 前端路径（登录后页面）：**
+
 | 字段 | 值来源 | 最终值 |
 |------|--------|--------|
 | `documentListSize` | L1 前端默认 | 50 |
@@ -742,8 +941,16 @@ ai_enabled 最终值
 | `app_title`（SettingsService.get() 返回） | 后端 API 返回 JSON `null`，前端不回退到 `''` | `null` |
 | `app_title`（页面实际显示） | `environment.appTitle` 默认值（前端字符串兜底） | `'Paperless-ngx'` |
 | `app_logo`（SettingsService.get() 返回） | 后端 API 返回 JSON `null`，前端不回退到 `''` | `null` |
-| `app_logo`（页面实际显示） | `LogoComponent` 值为 null/falsy（无 environment 兜底） | 渲染**内置 SVG Logo** |
+| `app_logo`（页面实际显示） | `LogoComponent` 值为 null/falsy（无 environment 兜底） | 渲染**组件内置 SVG Logo** |
 | `trash_delay` | L2 `PAPERLESS_EMPTY_TRASH_DELAY`（默认 30） | 30 |
+
+**Django SSR 路径（登录页）：**
+
+| 字段 | 值来源 | 最终值 |
+|------|--------|--------|
+| `APP_TITLE`（模板变量） | `context_processors.py`：L3 None，L2 None | `None` |
+| `APP_LOGO`（模板变量） | `context_processors.py`：L3 None，L2 None | `None` |
+| 页面实际渲染 | `base.html`：`not APP_LOGO and not APP_TITLE` 成立 → 分支 A | 渲染 **`svg_logo.html` 完整 SVG** |
 
 ### 场景 1b：`null` vs `undefined` 边界（SettingsService.get() 行为差异）
 
@@ -795,3 +1002,35 @@ ai_enabled 最终值
 | `barcodes_enabled`（`or`） | `False` | `True` | `True` | ❌ 错误回退 |
 | `barcodes_enabled`（`or`） | `None` | `True` | `True` | ✅ 正常回退 |
 | `barcodes_enabled`（`or`） | `True` | `False` | `True` | ✅ DB 优先 |
+
+### 场景 8：SSR（登录页）vs Angular（登录后）两条渲染路径对比
+
+#### 8a：管理员在 L3 DB 设置了 `app_title = "My Docs"` 和 logo 文件
+
+| 渲染路径 | app_title 显示 | app_logo 显示 |
+|---------|---------------|--------------|
+| **Django SSR 登录页** | 分支 B：logo `<img>` + byline（title 被忽略，分支 B 不显示 title 文字） | `BASE_URL + "/logo/custom.png"` → `<img>` 正确显示 |
+| **Angular 登录后页面** | `environment.appTitle = "My Docs"` → 正确显示 | `apiBaseUrl.replace(/\/api\/$/, "/logo/custom.png")` → `<img>` 正确显示 |
+
+#### 8b：仅设置了 L3 `app_title = "My Docs"`，logo 未设置
+
+| 渲染路径 | app_title 显示 | app_logo 显示 |
+|---------|---------------|--------------|
+| **Django SSR 登录页** | 分支 C：`svg_leaf.html` 30px 叶子图标 + "My Docs" 文字 + byline | 不显示自定义 logo，显示小叶子 SVG |
+| **Angular 登录后页面** | `environment.appTitle = "My Docs"` → 正确显示 | `LogoComponent.customLogo` 返回 null → 渲染组件内置 SVG Logo |
+
+#### 8c：仅设置了 L3 logo 文件，title 未设置
+
+| 渲染路径 | app_title 显示 | app_logo 显示 |
+|---------|---------------|--------------|
+| **Django SSR 登录页** | 分支 B：不显示 title 文字，仅 byline "by Paperless-ngx" | `BASE_URL + "/logo/custom.png"` → `<img>` 正确显示 |
+| **Angular 登录后页面** | `environment.appTitle` 保持 `'Paperless-ngx'`（默认值未被覆盖） | `apiBaseUrl` 拼接后 → `<img>` 正确显示 |
+
+#### 8d：部署在子路径 `PAPERLESS_FORCE_SCRIPT_NAME="/paperless"`，L3 有 logo
+
+| 渲染路径 | logo URL 拼接 | 结果 |
+|---------|-------------|------|
+| **Django SSR** | 服务端：`"/paperless/" + "logo/custom.png"` | `"/paperless/logo/custom.png"` ✅ |
+| **Angular 前端** | 前端：`environment.apiBaseUrl.replace(/\/api\/$/, "/logo/custom.png")` | 假设 `apiBaseUrl = "/paperless/api/"` → `"/paperless/logo/custom.png"` ✅ |
+
+> 两条路径的 BASE_URL/apiBaseUrl 拼接逻辑**目标完全一致**，都确保子路径部署下 logo 能正确加载，只是拼接位置不同（SSR 在服务端 Python 代码中，Angular 在前端 TypeScript getter 中）。
