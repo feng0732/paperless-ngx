@@ -1,21 +1,25 @@
 # OCR 语言与解析策略代码分析
 
+> 本文档所有路径均为仓库相对路径，即相对于项目根目录 `68-paperless-ngx/`。
+
+---
+
 ## 1. 整体架构概览
 
 Paperless-ngx 的文档解析流程分为以下几个核心层次：
 
 ```
-文档消费入口 (consumer.py)
+文档消费入口 (documents/consumer.py)
     ↓
 MIME 类型检测
     ↓
-解析器注册表 (registry.py) → 根据 MIME 类型 + 评分选择最佳解析器
+解析器注册表 (paperless/parsers/registry.py) → 根据 MIME 类型 + 评分选择最佳解析器
     ↓
 具体解析器执行
-    ├── TextDocumentParser   (纯文本 txt/csv)
-    ├── TikaDocumentParser   (Office 文档 docx/xlsx/pptx 等)
-    ├── MailDocumentParser   (邮件 .eml)
-    ├── RemoteDocumentParser (云端 OCR，如 Azure AI)
+    ├── TextDocumentParser       (纯文本 txt/csv)
+    ├── TikaDocumentParser       (Office 文档 docx/xlsx/pptx 等)
+    ├── MailDocumentParser       (邮件 .eml)
+    ├── RemoteDocumentParser     (云端 OCR，如 Azure AI)
     └── RasterisedDocumentParser (Tesseract OCR，核心)
     ↓
 文本提取 / 归档 PDF 生成 / 缩略图
@@ -25,13 +29,13 @@ MIME 类型检测
 
 ---
 
-## 2. OCR 语言配置
+## 2. OCR 语言配置全链路
 
-### 2.1 配置来源与优先级
+### 2.1 配置来源与优先级（数据库 → 环境变量）
 
-OCR 语言配置采用 **数据库优先，环境变量兜底** 的双层机制。
+OCR 语言采用 **数据库优先，环境变量兜底** 的双层机制。
 
-**环境变量定义**（[settings/__init__.py:884](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/settings/__init__.py#L884-L884)）：
+**第一层：环境变量默认值**（`src/paperless/settings/__init__.py:884`）：
 
 ```python
 OCR_LANGUAGE = os.getenv("PAPERLESS_OCR_LANGUAGE", "eng")
@@ -39,76 +43,260 @@ OCR_LANGUAGE = os.getenv("PAPERLESS_OCR_LANGUAGE", "eng")
 
 默认值为 `"eng"`（英语）。
 
-**运行时加载**（[config.py:47-75](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/config.py#L47-L75)）：
+**第二层：数据库存储的后台配置**（`src/paperless/models.py:114-119`）：
+
+```python
+class ApplicationConfiguration(AbstractSingletonModel):
+    language = models.CharField(
+        verbose_name=_("Do OCR using these languages"),
+        null=True,
+        blank=True,
+        max_length=32,
+    )
+```
+
+`ApplicationConfiguration` 是单例模型（全局仅有一条记录），允许管理员在后台页面设置语言，`null=True, blank=True` 表示可以为空（为空时使用环境变量兜底）。
+
+**第三层：运行时合并**（`src/paperless/config.py:47-75`）：
 
 ```python
 @dataclasses.dataclass
 class OcrConfig(OutputTypeConfig):
     language: str = dataclasses.field(init=False)
     mode: ModeChoices = dataclasses.field(init=False)
-    # ... 其他字段
 
     def __post_init__(self) -> None:
         super().__post_init__()
         app_config = self._get_config_instance()
+        # 数据库优先，为空则回退到环境变量
         self.language = app_config.language or settings.OCR_LANGUAGE
         self.mode = app_config.mode or ModeChoices(settings.OCR_MODE)
 ```
 
-配置加载顺序：
-1. 先读取数据库 `ApplicationConfiguration` 单例中的 `language` 字段
-2. 若为空，则回退到 `settings.OCR_LANGUAGE`（来自环境变量 `PAPERLESS_OCR_LANGUAGE`）
+**配置加载优先级总结**：
+1. 读取数据库 `ApplicationConfiguration` 单例的 `language` 字段
+2. 若为空（`None` 或空字符串），回退到 `settings.OCR_LANGUAGE`（即环境变量 `PAPERLESS_OCR_LANGUAGE`）
+3. 环境变量也未设置时，使用硬编码默认值 `"eng"`
+
+**配置合法性检查**（`src/paperless/checks.py:357-386`）：
+
+系统启动时运行 `check_default_language_available()` 诊断检查：
+- 若 `OCR_LANGUAGE` 为空，发出 Warning 提示 Tesseract 将回退到英语
+- 调用 `tesseract --list-langs` 获取已安装语言包
+- 逐一校验 `OCR_LANGUAGE` 中用 `+` 分隔的每个语言是否都已安装
+- 缺失则报 Error，提示修复 `PAPERLESS_OCR_LANGUAGE`
 
 ### 2.2 语言代码格式
 
 采用 **Tesseract ISO 639-2 三字母代码**，支持：
 - 单语言：`eng`、`deu`、`chi_sim`
 - 多语言（`+` 连接）：`eng+fra+deu`
-- 带书写脚本变体：`aze_Cyrl`（阿塞拜疆语-西里尔字母）
+- 带书写脚本变体（`_` 分隔）：`aze_Cyrl`（阿塞拜疆语-西里尔字母）
 
 ### 2.3 语言配置在 OCR 参数中的传递
 
-在 Tesseract 解析器构造 OCRmyPDF 参数时，语言被直接传入（[tesseract.py:266-286](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tesseract.py#L266-L286)）：
+Tesseract 解析器构造 OCRmyPDF 参数时，语言被直接传入（`src/paperless/parsers/tesseract.py:266-286`）：
 
 ```python
 def construct_ocrmypdf_parameters(self, ...):
     ocrmypdf_args = {
-        "language": self.settings.language,  # ← 语言配置在此传递
+        "language": self.settings.language,  # ← 语言配置在此传递给 OCRmyPDF
         "output_type": self.settings.output_type,
         "use_threads": True,
         # ...
     }
 ```
 
-### 2.4 语言配置的下游影响
+---
 
-OCR 语言不仅用于 Tesseract，还会被推导为其他组件的语言设置：
+## 3. 语言配置的下游推导
 
-| 下游组件 | 推导函数 | 位置 |
-|---------|---------|------|
-| 日期解析 (dateparser) | `ocr_to_dateparser_languages()` | [utils.py:118-169](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/utils.py#L118-L169) |
-| NLTK 分词 | `_get_nltk_language_setting()` | [settings/__init__.py:1067](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/settings/__init__.py#L1067-L1067) |
-| 搜索语言 | `_get_search_language_setting()` | [settings/__init__.py:1108](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/settings/__init__.py#L1108-L1108) |
+OCR 语言不仅用于 Tesseract，还被分别推导为 **dateparser 语言**、**NLTK 分词语言**和 **搜索（Tantivy）语言**。三者取值来源各不相同。
 
-**Tesseract → dateparser 语言转换**示例（[utils.py:118-169](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/utils.py#L118-L169)）：
+### 3.1 dateparser 语言处理（两层 fallback）
+
+dateparser 的语言配置采用 **显式环境变量优先，OCR 语言自动推导兜底** 的策略。
+
+**第一层：显式环境变量**（`src/paperless/settings/__init__.py:961-967`）：
+
+```python
+DATE_PARSER_LANGUAGES = (
+    parse_dateparser_languages(
+        os.getenv("PAPERLESS_DATE_PARSER_LANGUAGES"),
+    )
+    if os.getenv("PAPERLESS_DATE_PARSER_LANGUAGES")
+    else None
+)
+```
+
+若设置了 `PAPERLESS_DATE_PARSER_LANGUAGES`，则通过 `parse_dateparser_languages()` 解析：
+
+```python
+# src/paperless/settings/custom.py:331-343
+def parse_dateparser_languages(languages: str | None) -> list[str]:
+    language_list = languages.split("+") if languages else []
+    # 中文特殊处理：zh-Hant / zh-Hans 已知在 dateparser 中有 bug
+    for index, language in enumerate(language_list):
+        if language.startswith("zh-") and "zh" not in language_list:
+            logger.warning(
+                f"Chinese locale detected: {language}. dateparser might fail to parse"
+                f' some dates with this locale, so Chinese ("zh") will be used as a fallback.',
+            )
+            language_list.append("zh")
+    return list(LocaleDataLoader().get_locale_map(locales=language_list))
+```
+
+**第二层：OCR 语言自动推导**（`src/documents/plugins/date_parsing/__init__.py:64-93`）：
+
+在 `get_date_parser()` 工厂函数中：
+
+```python
+ocr_config = OcrConfig()
+languages = settings.DATE_PARSER_LANGUAGES or ocr_to_dateparser_languages(
+    ocr_config.language,
+)
+```
+
+当 `settings.DATE_PARSER_LANGUAGES` 为 `None`（即未显式设置环境变量）时，调用 `ocr_to_dateparser_languages()` 从 OCR 语言动态推导（`src/paperless/utils.py:118-169`）：
 
 ```python
 def ocr_to_dateparser_languages(ocr_languages: str) -> list[str]:
-    # 输入: "eng+fra+aze_Cyrl"
+    loader = LocaleDataLoader()
+    result = []
     for ocr_language in ocr_languages.split("+"):
+        # 如 "aze_Cyrl" → 拆分为 ocr_lang_part="aze", script=["Cyrl"]
         ocr_lang_part, *script = ocr_language.split("_")
-        # "aze" → "az", "Cyrl" → 尝试 "az-Cyrl"，失败则回退 "az"
+        ocr_script_part = script[0] if script else None
+
+        # 1. 通过 OCR_TO_DATEPARSER_LANGUAGES 映射表转码（ISO 639-2 → locale）
+        #    如 "aze" → "az", "eng" → "en", "chi" → "zh"
         language_part = OCR_TO_DATEPARSER_LANGUAGES.get(ocr_lang_part)
-        # ... 验证 dateparser 是否支持该 locale
+        if language_part is None:
+            continue  # 映射表中不存在则跳过
+
+        loader.get_locale_map(locales=[language_part])  # 验证基础语言
+
+        # 2. 若有脚本变体，尝试组合 locale（如 "az" + "Cyrl" → "az-Cyrl"）
+        if ocr_script_part:
+            dateparser_language = f"{language_part}-{ocr_script_part.title()}"
+            try:
+                loader.get_locale_map(locales=[dateparser_language])
+            except Exception:
+                # 变体不被支持时回退到基础语言
+                dateparser_language = language_part
+        else:
+            dateparser_language = language_part
+
+        if dateparser_language not in result:
+            result.append(dateparser_language)
+    return result
 ```
+
+`OCR_TO_DATEPARSER_LANGUAGES` 映射表定义在 `src/paperless/utils.py:7-115`，包含约 90 种语言的 ISO 639-2 → dateparser locale 映射。
+
+**推导失败 fallback**：
+- 某语言在映射表中不存在 → 跳过，记录 debug 日志
+- 脚本变体（如 Cyrl）dateparser 不支持 → 回退到基础语言，记录 info 日志
+- 整个推导过程抛异常 → 返回空列表 `[]`，记录 warning 日志
+- 最终结果为空 → 记录 info 日志，dateparser 使用自身默认的多语言模式
+
+### 3.2 NLTK 语言的取值来源
+
+NLTK 语言 **仅来源于 OCR_LANGUAGE 的第一个主语言**，不支持显式独立配置。
+
+推导逻辑在 `_get_nltk_language_setting()`（`src/paperless/settings/__init__.py:1026-1058`）：
+
+```python
+def _get_nltk_language_setting(ocr_lang: str) -> str | None:
+    # 只取第一个主语言（"+" 之前的部分）
+    ocr_lang = ocr_lang.split("+", maxsplit=1)[0]
+
+    iso_code_to_nltk = {
+        "dan": "danish",
+        "nld": "dutch",
+        "eng": "english",
+        "fin": "finnish",
+        "fra": "french",
+        "deu": "german",
+        "ita": "italian",
+        "nor": "norwegian",
+        "por": "portuguese",
+        "rus": "russian",
+        "spa": "spanish",
+        "swe": "swedish",
+    }
+    return iso_code_to_nltk.get(ocr_lang)  # 不在表中返回 None
+```
+
+在模块加载时调用（`src/paperless/settings/__init__.py:1106`）：
+
+```python
+NLTK_LANGUAGE: str | None = _get_nltk_language_setting(OCR_LANGUAGE)
+```
+
+**关键点**：
+- 仅支持 13 种欧洲语言的 Snowball 词干还原器 / Punkt 分词器 / 停用词的交集
+- 只考虑多语言配置中的 **第一个** 主语言（例如 `eng+fra` 只取 `eng`）
+- 未命中映射表时 `NLTK_LANGUAGE = None`，表示不启用语言相关的 NLP 处理
+- 推导发生在 Django settings 加载阶段（**启动时一次**），不读取数据库的 `ApplicationConfiguration.language`
+
+### 3.3 搜索语言（Tantivy stemmer）的取值来源
+
+搜索语言采用 **显式环境变量优先，OCR 主语言推导兜底** 的策略。
+
+推导逻辑在 `_get_search_language_setting()`（`src/paperless/settings/__init__.py:1061-1101`）：
+
+```python
+def _get_search_language_setting(ocr_lang: str) -> str | None:
+    # 第一层：显式设置 PAPERLESS_SEARCH_LANGUAGE
+    explicit = os.environ.get("PAPERLESS_SEARCH_LANGUAGE")
+    if explicit is not None:
+        from documents.search._tokenizer import SUPPORTED_LANGUAGES
+        return get_choice_from_env("PAPERLESS_SEARCH_LANGUAGE", SUPPORTED_LANGUAGES)
+
+    # 第二层：从 OCR 主语言推导（ISO 639-2/T → ISO 639-1 两字母）
+    primary = ocr_lang.split("+", maxsplit=1)[0].lower()
+    _ocr_to_search: dict[str, str] = {
+        "ara": "ar", "dan": "da", "nld": "nl", "eng": "en",
+        "fin": "fi", "fra": "fr", "deu": "de", "ell": "el",
+        "hun": "hu", "ita": "it", "nor": "no", "por": "pt",
+        "ron": "ro", "rus": "ru", "spa": "es", "swe": "sv",
+        "tam": "ta", "tur": "tr",
+    }
+    return _ocr_to_search.get(primary)
+```
+
+在模块加载时调用（`src/paperless/settings/__init__.py:1108`）：
+
+```python
+SEARCH_LANGUAGE: str | None = _get_search_language_setting(OCR_LANGUAGE)
+```
+
+**关键点**：
+- 支持 19 种 Tantivy 内置词干还原器语言
+- 只考虑 OCR 多语言配置中的 **第一个** 主语言
+- 显式设置 `PAPERLESS_SEARCH_LANGUAGE` 时，会校验是否在 `SUPPORTED_LANGUAGES` 中
+- 未命中返回 `None`，表示搜索不分词干
+- 推导发生在 Django settings 加载阶段（**启动时一次**），不读取数据库配置
+
+### 3.4 语言配置链路汇总
+
+| 组件 | 第一优先级 | 第二优先级 | 推导时机 | 是否支持多语言 |
+|------|-----------|-----------|---------|---------------|
+| **Tesseract OCR** | 数据库 `ApplicationConfiguration.language` | `PAPERLESS_OCR_LANGUAGE`（默认 `eng`） | 运行时每次解析 | ✅ `eng+fra+deu` |
+| **dateparser** | `PAPERLESS_DATE_PARSER_LANGUAGES` | OCR 语言动态推导 `ocr_to_dateparser_languages()` | 运行时每次创建解析器 | ✅ 完整保留 |
+| **NLTK** | —（无独立配置） | OCR_LANGUAGE **第一个** 主语言 | Django 启动加载 settings 时 | ❌ 仅第一语言 |
+| **搜索 (Tantivy)** | `PAPERLESS_SEARCH_LANGUAGE` | OCR_LANGUAGE **第一个** 主语言 | Django 启动加载 settings 时 | ❌ 仅第一语言 |
+
+> **注意**：NLTK 和搜索语言在 Django 启动时从 `settings.OCR_LANGUAGE`（环境变量）推导一次，**不会** 读取数据库后台配置。若管理员仅在后台修改了 OCR 语言，NLTK 和搜索索引不会自动适配，需要重启服务或重新索引。
 
 ---
 
-## 3. 解析器选择策略
+## 4. 解析器选择策略
 
-### 3.1 解析器注册表
+### 4.1 解析器注册表
 
-所有解析器由 `ParserRegistry` 单例统一管理（[registry.py:71-99](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/registry.py#L71-L99)）：
+所有解析器由 `ParserRegistry` 单例统一管理（`src/paperless/parsers/registry.py:71-99`）：
 
 ```python
 def get_parser_registry() -> ParserRegistry:
@@ -118,40 +306,44 @@ def get_parser_registry() -> ParserRegistry:
             r.register_defaults()   # 注册内置解析器
             _registry = r
         if not _discovery_complete:
-            _registry.discover()    # 发现第三方插件解析器
+            _registry.discover()    # 发现第三方插件解析器（entrypoint）
             _discovery_complete = True
     return _registry
 ```
 
-### 3.2 内置解析器注册
+### 4.2 内置解析器注册与评分
 
-注册顺序（[registry.py:192-210](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/registry.py#L192-L210)）：
+注册顺序（`src/paperless/parsers/registry.py:192-210`）：
 
 ```python
 def register_defaults(self) -> None:
-    self.register_builtin(TextDocumentParser)      # 分数: 10
-    self.register_builtin(RemoteDocumentParser)    # 分数: 20 (若配置)
-    self.register_builtin(TikaDocumentParser)      # 分数: 10 (若启用)
-    self.register_builtin(MailDocumentParser)      # 分数: 10
-    self.register_builtin(RasterisedDocumentParser) # 分数: 10
+    self.register_builtin(TextDocumentParser)      # 评分: 10
+    self.register_builtin(RemoteDocumentParser)    # 评分: 20（若配置有效）
+    self.register_builtin(TikaDocumentParser)      # 评分: 10（若 TIKA_ENABLED）
+    self.register_builtin(MailDocumentParser)      # 评分: 10
+    self.register_builtin(RasterisedDocumentParser) # 评分: 10
 ```
 
-### 3.3 各解析器的 MIME 类型与评分
+各解析器详情：
 
-| 解析器 | MIME 类型 | 评分 | 启用条件 |
-|-------|----------|------|---------|
-| TextDocumentParser | text/plain, text/csv, application/csv | 10 | 始终启用 |
-| TikaDocumentParser | doc/docx/xls/xlsx/ppt/pptx/odt/ods/odp/rtf 等 | 10 | `settings.TIKA_ENABLED=True` |
-| MailDocumentParser | message/rfc822 (.eml) | 10 | 始终启用 |
-| RasterisedDocumentParser | application/pdf, image/jpeg/png/tiff/gif/bmp/webp/heic | 10 | 始终启用 |
-| RemoteDocumentParser | application/pdf, image/jpeg/png/tiff/gif/bmp/webp | 20 | 配置了有效的远程引擎 (如 Azure) |
+| 解析器类 | 支持的 MIME 类型 | 评分 | 启用条件 | 文件 |
+|---------|---------------|-----|---------|------|
+| `TextDocumentParser` | `text/plain`, `text/csv`, `application/csv` | 10 | 始终启用 | `src/paperless/parsers/text.py` |
+| `TikaDocumentParser` | `application/msword`, `application/vnd.openxmlformats-officedocument.*` 等 Office 格式 | 10 | `settings.TIKA_ENABLED=True` | `src/paperless/parsers/tika.py` |
+| `MailDocumentParser` | `message/rfc822` (.eml) | 10 | 始终启用 | `src/paperless/parsers/mail.py` |
+| `RasterisedDocumentParser` | `application/pdf`, `image/jpeg`, `image/png`, `image/tiff`, `image/gif`, `image/bmp`, `image/webp`, `image/heic` | 10 | 始终启用 | `src/paperless/parsers/tesseract.py` |
+| `RemoteDocumentParser` | `application/pdf`, `image/png`, `image/jpeg`, `image/tiff`, `image/bmp`, `image/gif`, `image/webp` | 20 | 配置了有效远程引擎（如 Azure AI） | `src/paperless/parsers/remote.py` |
 
-**评分逻辑示例**（[remote.py:112-149](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/remote.py#L112-L149)）：
+**Remote 解析器的评分逻辑**（`src/paperless/parsers/remote.py:112-149`）：
 
 ```python
 @classmethod
 def score(cls, mime_type, filename, path=None):
-    config = RemoteEngineConfig(...)
+    config = RemoteEngineConfig(
+        engine=settings.REMOTE_OCR_ENGINE,
+        api_key=settings.REMOTE_OCR_API_KEY,
+        endpoint=settings.REMOTE_OCR_ENDPOINT,
+    )
     if not config.engine_is_valid():
         return None   # 未配置时完全退出竞争
     if mime_type not in _SUPPORTED_MIME_TYPES:
@@ -159,9 +351,9 @@ def score(cls, mime_type, filename, path=None):
     return 20  # 高于 Tesseract 的 10，优先使用云端 OCR
 ```
 
-### 3.4 解析器选择算法
+### 4.3 解析器选择算法
 
-核心逻辑在 `get_parser_for_file()`（[registry.py:332-393](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/registry.py#L332-L393)）：
+核心逻辑在 `get_parser_for_file()`（`src/paperless/parsers/registry.py:332-393`）：
 
 ```python
 def get_parser_for_file(self, mime_type, filename, path=None):
@@ -182,20 +374,31 @@ def get_parser_for_file(self, mime_type, filename, path=None):
     return best_parser
 ```
 
-**选择规则总结**：
-1. **MIME 类型过滤**：必须出现在 `supported_mime_types()` 中
-2. **评分过滤**：`score()` 返回 `None` 表示该解析器主动放弃（如未启用 Tika）
-3. **高分优先**：分数最高者获胜
-4. **外部优先**：同分时，第三方插件解析器优先于内置
-5. **注册顺序兜底**：同类型解析器分数相同时，先注册的优先
+**选择规则**（按优先级）：
+1. **MIME 类型过滤**：必须出现在 `supported_mime_types()` 返回的字典中
+2. **评分过滤**：`score()` 返回 `None` 表示该解析器主动放弃（如 Tika 未启用、远程引擎未配置）
+3. **高分优先**：分数最高者获胜（Remote 的 20 分 > 其他内置的 10 分）
+4. **外部优先**：同分时，第三方插件解析器（entrypoint 加载）优先于内置
+5. **注册顺序兜底**：同类型、同分数时先注册的优先
 
-### 3.5 消费流程中的解析器调用
+### 4.4 消费流程中的解析器调用
 
-在 [consumer.py:425-524](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/documents/consumer.py#L425-L524) 中：
+在 `src/documents/consumer.py:425-524` 中：
 
 ```python
 # 1. MIME 类型检测
 mime_type = magic.from_file(self.working_copy, mime=True)
+
+# 1.5 PDF 修复 fallback：文件名是 .pdf 但 MIME 类型异常时，用 qpdf 尝试修复
+if (
+    Path(self.filename).suffix.lower() == ".pdf"
+    and mime_type in settings.CONSUMER_PDF_RECOVERABLE_MIME_TYPES
+):
+    try:
+        run_subprocess(["qpdf", "--replace-input", self.working_copy], logger=self.log)
+        mime_type = magic.from_file(self.working_copy, mime=True)  # 重新检测
+    except Exception as e:
+        self.log.error(f"Error attempting to clean PDF: {e}")
 
 # 2. 获取解析器类
 parser_class = get_parser_registry().get_parser_for_file(
@@ -208,91 +411,91 @@ with parser_class() as document_parser:
     produce_archive = should_produce_archive(document_parser, mime_type, ...)
     document_parser.parse(self.working_copy, mime_type, produce_archive=produce_archive)
     text = document_parser.get_text()
-    # ...
 ```
 
-**是否生成归档 PDF** 的决策在 `should_produce_archive()`（[consumer.py:124-189](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/documents/consumer.py#L124-L189)）：
+### 4.5 是否生成归档 PDF 的决策
+
+`should_produce_archive()`（`src/documents/consumer.py:124-189`）决策表：
 
 | 条件 | 结果 |
 |------|------|
-| `parser.requires_pdf_rendition=True`（如 Office/EML 浏览器无法显示） | ✅ 必须生成 |
-| `parser.can_produce_archive=False`（如纯文本） | ❌ 不生成 |
+| `parser.requires_pdf_rendition=True`（Office/EML 等浏览器无法原生显示的格式） | ✅ 必须生成 |
+| `parser.can_produce_archive=False`（如 TextDocumentParser） | ❌ 不生成 |
 | `ARCHIVE_FILE_GENERATION=always` | ✅ 总是生成 |
 | `ARCHIVE_FILE_GENERATION=never` | ❌ 从不生成 |
-| `ARCHIVE_FILE_GENERATION=auto` + 图片文档 | ✅ 生成 |
+| `ARCHIVE_FILE_GENERATION=auto` + 图片 MIME 类型 | ✅ 生成 |
 | `ARCHIVE_FILE_GENERATION=auto` + PDF 带结构标签（born-digital） | ❌ 不生成 |
 | `ARCHIVE_FILE_GENERATION=auto` + PDF 文本 > 50 字符（born-digital） | ❌ 不生成 |
 | `ARCHIVE_FILE_GENERATION=auto` + PDF 文本 ≤ 50 字符（扫描件） | ✅ 生成 |
 
 ---
 
-## 4. 文本提取流程（以 Tesseract 解析器为核心）
+## 5. 文本提取流程（Tesseract 解析器）
 
-### 4.1 OCR 模式（ModeChoices）
+### 5.1 OCR 模式（ModeChoices）
 
-在 [models.py:33-42](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/models.py#L33-L42) 定义了四种 OCR 模式：
+在 `src/paperless/models.py:33-42` 定义了四种模式：
 
 | 模式 | 含义 | 对应 OCRmyPDF 参数 |
 |-----|------|------------------|
 | `auto` | 自动检测：已有文本则跳过，否则做 OCR | 无特殊参数（默认行为） |
-| `force` | 强制对所有页面做 OCR，覆盖已有文本 | `--force-ocr` |
+| `force` | 强制对所有页面做 OCR，覆盖已有文本层 | `--force-ocr` |
 | `redo` | 重做 OCR，保留已有文本层 | `--redo-ocr` |
-| `off` | 完全不调用 OCR 引擎 | `--skip-text`（仅在需要归档时） |
+| `off` | 完全不调用 OCR 引擎 | `--skip-text`（仅需要归档时） |
 
-### 4.2 解析主流程
+同样采用数据库优先 + 环境变量兜底：`OcrConfig.mode = app_config.mode or ModeChoices(settings.OCR_MODE)`。
 
-`RasterisedDocumentParser.parse()` 是整个 OCR 解析的核心（[tesseract.py:494-658](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tesseract.py#L494-L658)），流程如下：
+### 5.2 解析主流程
+
+`RasterisedDocumentParser.parse()`（`src/paperless/parsers/tesseract.py:494-658`）是整个 OCR 解析的核心：
 
 ```
 开始
   │
-  ├─ 检测 PDF 是否已有文本
-  │   ├─ is_tagged_pdf() → 检查 PDF 结构标签
-  │   └─ extract_pdf_text() + len() > 50 → 已有文本层
+  ├─ 前置检测：PDF 是否已有文本
+  │   ├─ is_tagged_pdf() → 检查 PDF 是否带 /MarkInfo 结构标签
+  │   └─ extract_pdf_text() + len() > PDF_TEXT_MIN_LENGTH(50) → 已有文本层
   │
-  ├─ 分支 1: OCR_MODE=off
+  ├─ 分支 A: OCR_MODE=off（完全不做 OCR）
   │   ├─ 不需要归档 → text = 原文件文本, return
-  │   ├─ 图片输入 → img2pdf 转 PDF/A, 无 OCR
-  │   └─ PDF 输入 → Ghostscript 转 PDF/A, 无 OCR
+  │   ├─ 图片输入 → _convert_image_to_pdfa()（img2pdf + pikepdf，不调 Tesseract）
+  │   └─ PDF 输入 → _convert_pdf_to_pdfa()（Ghostscript，不调 Tesseract）
   │
-  ├─ 分支 2: OCR_MODE=auto + 已有文本 + 不需要归档
+  ├─ 分支 B: OCR_MODE=auto + 已有文本 + 不需要归档
   │   └─ 完全跳过 OCRmyPDF, text = 原文件文本
   │
-  └─ 分支 3: 其他情况（运行 OCRmyPDF）
-      ├─ auto + 已有文本 + 需要归档 → skip_text=True（仅转 PDF/A）
-      └─ 其余情况 → 完整 OCR
-          │
-          ├─ 构造参数 construct_ocrmypdf_parameters()
-          ├─ 调用 ocrmypdf.ocr(**args)
-          ├─ 提取文本 extract_text(sidecar_file, archive_pdf)
-          │   ├─ 优先读取 sidecar.txt（OCRmyPDF 输出）
-          │   └─ sidecar 不完整时 → pdftotext 提取 PDF 文本
-          └─ 文本后处理 post_process_text()
+  └─ 分支 C: 其他情况 → 运行 OCRmyPDF
+      ├─ auto + 已有文本 + 需要归档 → skip_text=True（仅做 PDF/A 转换，不 OCR）
+      └─ 其余情况 → 完整 OCR 流程
+          ├─ construct_ocrmypdf_parameters() 构造参数（含 language）
+          ├─ ocrmypdf.ocr(**args) 调用
+          ├─ extract_text(sidecar_file, archive_pdf) 提取文本
+          │   ├─ 优先读取 sidecar.txt（OCRmyPDF 输出的纯文本）
+          │   └─ sidecar 不完整时 → pdftotext 提取输出 PDF 文本
+          └─ post_process_text() 文本后处理
 ```
 
-### 4.3 文本提取的优先级
+### 5.3 文本提取优先级
 
-`extract_text()` 方法（[tesseract.py:236-264](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tesseract.py#L236-L264)）按以下优先级获取文本：
+`extract_text()`（`src/paperless/parsers/tesseract.py:236-264`）按以下优先级获取文本：
 
 ```python
 def extract_text(self, sidecar_file, pdf_file):
     # 1. 优先使用 OCRmyPDF 生成的 sidecar 文件
-    if sidecar_file.is_file() and self.settings.mode != ModeChoices.REDO:
+    #    REDO 模式下不使用 sidecar（因为 REDO 只做 OCR，sidecar 可能不完整）
+    if sidecar_file is not None and sidecar_file.is_file() and self.settings.mode != ModeChoices.REDO:
         text = read_file_handle_unicode_errors(sidecar_file)
+        # sidecar 中含 "[OCR skipped on page" 标记 → 某些页跳过了 OCR，文本不完整
         if "[OCR skipped on page" not in text:
-            return post_process_text(text)  # sidecar 完整
+            return post_process_text(text)
 
-    # 2. sidecar 不完整或 REDO 模式 → 从生成的 PDF 中提取
-    return post_process_text(extract_pdf_text(pdf_file))
+    # 2. sidecar 不完整或 REDO 模式 → 从生成的归档 PDF 中用 pdftotext 提取
+    return post_process_text(extract_pdf_text(Path(pdf_file)))
 ```
 
-**sidecar 文件特殊判断**：
-- 当 sidecar 中包含 `"[OCR skipped on page"` 标记时，说明某些页面跳过了 OCR，sidecar 文本不完整
-- 此时回退到对整个输出 PDF 运行 `pdftotext`
+### 5.4 PDF 文本提取实现
 
-### 4.4 PDF 文本提取实现
-
-底层通过 `pdftotext` 命令行工具提取（[utils.py:67-110](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/utils.py#L67-L110)）：
+底层通过 `pdftotext` 命令行工具（`src/paperless/parsers/utils.py:67-110`）：
 
 ```python
 def extract_pdf_text(path, log=None):
@@ -304,13 +507,13 @@ def extract_pdf_text(path, log=None):
     return text or None
 ```
 
-### 4.5 文本后处理
+### 5.5 文本后处理
 
-`post_process_text()`（[tesseract.py:661-672](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tesseract.py#L661-L672)）：
+`post_process_text()`（`src/paperless/parsers/tesseract.py:661-672`）：
 
 ```python
 def post_process_text(text):
-    collapsed_spaces = re.sub(r"([^\S\r\n]+)", " ", text)       # 压缩多余空格
+    collapsed_spaces = re.sub(r"([^\S\r\n]+)", " ", text)        # 压缩非换行空白
     no_leading_whitespace = re.sub(r"([\n\r]+)([^\S\n\r]+)", "\\1", collapsed_spaces)
     no_trailing_whitespace = re.sub(r"([^\S\n\r]+)$", "", no_leading_whitespace)
     return no_trailing_whitespace.strip().replace("\0", " ")      # 去除 NUL 字符（Postgres 兼容）
@@ -318,89 +521,78 @@ def post_process_text(text):
 
 ---
 
-## 5. 失败 Fallback 机制
+## 6. 失败 Fallback 策略
 
-### 5.1 Tesseract 解析器内部的分层 Fallback
+### 6.1 Tesseract 解析器内部的分层 Fallback
 
-在 `parse()` 方法中有多层异常处理（[tesseract.py:599-658](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tesseract.py#L599-L658)）：
+`parse()` 方法（`src/paperless/parsers/tesseract.py:599-658`）中的异常处理链：
 
 ```
 ocrmypdf.ocr() 调用
   │
-  ├─ DigitalSignatureError / EncryptedPdfError
-  │   └─ 若原文件有文本 → 使用原文件文本
+  ├─ DigitalSignatureError / EncryptedPdfError（加密/签名 PDF）
+  │   └─ 若原文件有文本 (original_has_text) → 使用原文件文本，不做 OCR
   │
-  ├─ SubprocessOutputError (Ghostscript 渲染失败)
-  │   └─ 提示用户设置 PAPERLESS_OCR_USER_ARGS={"continue_on_soft_render_error": true}
+  ├─ SubprocessOutputError（通常是 Ghostscript PDF/A 渲染失败）
+  │   └─ 记录 warning，提示设置 PAPERLESS_OCR_USER_ARGS
+  │      ={"continue_on_soft_render_error": true}，然后抛出 ParseError
   │
   ├─ NoTextFoundException / InputFileError / PriorOcrFoundError
-  │   └─ Fallback: safe_fallback=True → force_ocr=True 强制重试
-  │       ├─ 成功 → 使用强制 OCR 的结果
+  │   └─ Fallback 重试：safe_fallback=True → force_ocr=True
+  │       ├─ 强制对所有页面做 OCR，忽略已有文本层
+  │       ├─ 成功 → 使用强制 OCR 的文本和归档
   │       └─ 失败 → 抛出 ParseError
   │
   └─ 其他异常 → 抛出 ParseError
 
-最后兜底（所有路径执行完毕后）：
-  ├─ 若 text 为空但 original_has_text → 使用原文件文本
-  └─ 若 text 仍为空 → text = ""（警告日志）
+最终兜底（所有异常处理完毕后）：
+  ├─ 若 self.text 为空但 original_has_text → 回退使用原文件文本
+  └─ 若 self.text 仍为空 → self.text = ""，记录 warning 日志
 ```
 
-**强制 OCR Fallback 的关键代码**：
-
-```python
-except (NoTextFoundException, InputFileError, PriorOcrFoundError) as e:
-    # 构造 fallback 参数：safe_fallback=True → force_ocr=True
-    args = self.construct_ocrmypdf_parameters(
-        ..., safe_fallback=True,
-    )
-    # 再次调用 OCRmyPDF，强制对所有页面做 OCR
-    ocrmypdf.ocr(**args)
-```
-
-`safe_fallback` 参数在 `construct_ocrmypdf_parameters()` 中的处理（[tesseract.py:293-302](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tesseract.py#L293-L302)）：
+`safe_fallback` 触发强制 OCR 的关键代码（`src/paperless/parsers/tesseract.py:293-302`）：
 
 ```python
 if safe_fallback or self.settings.mode == ModeChoices.FORCE:
     ocrmypdf_args["force_ocr"] = True   # 强制 OCR，忽略已有文本层
 ```
 
-### 5.2 缩略图生成的 Fallback 链
+### 6.2 缩略图生成的三级 Fallback
 
-缩略图生成有三层 Fallback（[parsers.py:174-198](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/documents/parsers.py#L174-L198) 和 [parsers.py:130-171](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/documents/parsers.py#L130-L171)）：
+（`src/documents/parsers.py:174-198` 和 `src/documents/parsers.py:130-171`）：
 
 ```
 make_thumbnail_from_pdf()
   │
-  ├─ 尝试 ImageMagick convert
+  ├─ 第一层：ImageMagick convert（PDF 首页 → WebP）
   │   └─ 失败 → make_thumbnail_from_pdf_gs_fallback()
   │       │
-  │       ├─ 尝试 Ghostscript (gs) 提取第一页
-  │       │   └─ 再用 convert 转 WebP
+  │       ├─ 第二层：Ghostscript 提取首页为 PNG，再用 convert 转 WebP
   │       │
-  │       └─ 失败 → copy_file_with_basic_stats(get_default_thumbnail())
-  │           └─ 使用内置的默认 document.webp
+  │       └─ 失败 → 第三层：copy_file_with_basic_stats(get_default_thumbnail())
+  │           └─ 使用内置默认图 src/documents/resources/document.webp
   │
   └─ 成功 → 返回生成的 WebP
 ```
 
-### 5.3 Tika 解析器的 Fallback
+### 6.3 Tika 解析器的 Fallback
 
-Tika 解析器处理某些文件时 multipart 表单上传会 500 错误，有针对 TIKA-4110 的 workaround（[tika.py:246-261](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tika.py#L246-L261)）：
+针对 TIKA-4110 问题（某些文件 multipart 表单上传返回 500）的 Workaround（`src/paperless/parsers/tika.py:246-261`）：
 
 ```python
 try:
     parsed = self._tika_client.tika.as_text.from_file(document_path, mime_type)
 except httpx.HTTPStatusError as err:
-    # Workaround: TIKA-4110，改用 buffer 上传
     if err.response.status_code == httpx.codes.INTERNAL_SERVER_ERROR:
+        # 回退：改用 buffer 方式上传文件内容
         parsed = self._tika_client.tika.as_text.from_buffer(
             document_path.read_bytes(), mime_type,
         )
 ```
 
-### 5.4 文本读取的 Unicode Fallback
+### 6.4 文本读取的 Unicode Fallback
 
-所有文本读取都经过 `read_file_handle_unicode_errors()`（[utils.py:113-138](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/utils.py#L113-L138)）：
+所有文本读取都经过 `read_file_handle_unicode_errors()`（`src/paperless/parsers/utils.py:113-138`）：
 
 ```python
 def read_file_handle_unicode_errors(filepath, log=None):
@@ -409,35 +601,46 @@ def read_file_handle_unicode_errors(filepath, log=None):
     except UnicodeDecodeError as e:
         _log.warning("Unicode error during text reading, continuing: %s", e)
         return filepath.read_bytes().decode("utf-8", errors="replace")
-        # errors="replace" → 无效字节替换为 U+FFFD �，不抛出异常
+        # errors="replace" → 无效 UTF-8 字节替换为 U+FFFD 替换字符，不抛出异常
 ```
 
-### 5.5 跨解析器 Fallback 的缺失
+### 6.5 PDF 消费前的 MIME 类型修复 Fallback
+
+在 `src/documents/consumer.py:431-461`：
+- 当文件扩展名为 `.pdf` 但 `libmagic` 检测出异常 MIME 类型（如 `application/octet-stream`）
+- 尝试用 `qpdf --replace-input` 修复 PDF 结构
+- 修复后重新检测 MIME 类型
+- 修复失败记录错误日志，继续使用原始 MIME 类型（可能后续失败）
+
+### 6.6 跨解析器 Fallback 的缺失
 
 当前架构中 **不存在跨解析器的自动 fallback**：
-- 每个 MIME 类型只选择一个「最佳解析器」
-- 若该解析器抛出 `ParseError`，消费流程直接失败，不会尝试其他解析器
-- 例如：PDF 文档若选了 RemoteDocumentParser（Azure），Azure 失败时不会自动回退到 Tesseract
+- 每个 MIME 类型只选择一个「最佳解析器」（评分最高者）
+- 若该解析器抛出 `ParseError`，消费流程直接失败终止，不会尝试其他解析器
+- 示例：PDF 文档若配置了 RemoteDocumentParser（Azure AI 评分 20），Azure 调用失败时不会自动回退到 RasterisedDocumentParser（Tesseract 评分 10）
 
-如需实现跨解析器 fallback，需要修改 `ConsumerPlugin.run()` 中的异常处理逻辑。
+如需实现跨解析器 fallback，需要修改 `ConsumerPlugin.run()`（`src/documents/consumer.py:408`）中的异常处理逻辑，在解析失败时手动尝试次优解析器。
 
 ---
 
-## 6. 关键文件索引
+## 7. 关键文件索引
 
-| 文件 | 职责 |
-|------|------|
-| [paperless/settings/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/settings/__init__.py) | 环境变量配置入口，OCR_LANGUAGE、OCR_MODE 等默认值 |
-| [paperless/config.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/config.py) | OcrConfig 等运行时配置数据类，数据库+环境变量双层加载 |
-| [paperless/models.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/models.py) | ModeChoices、OutputTypeChoices、CleanChoices 等枚举 |
-| [paperless/parsers/registry.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/registry.py) | ParserRegistry，解析器注册与评分选择 |
-| [paperless/parsers/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/__init__.py) | ParserProtocol 协议定义 |
-| [paperless/parsers/tesseract.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tesseract.py) | RasterisedDocumentParser，Tesseract OCR 核心逻辑 |
-| [paperless/parsers/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/utils.py) | extract_pdf_text、is_tagged_pdf 等共享工具 |
-| [paperless/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/utils.py) | ocr_to_dateparser_languages 语言转换 |
-| [paperless/parsers/text.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/text.py) | TextDocumentParser 纯文本解析器 |
-| [paperless/parsers/tika.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/tika.py) | TikaDocumentParser Office 文档解析器 |
-| [paperless/parsers/mail.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/mail.py) | MailDocumentParser 邮件解析器 |
-| [paperless/parsers/remote.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/paperless/parsers/remote.py) | RemoteDocumentParser 云端 OCR 解析器 |
-| [documents/consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/documents/consumer.py) | 消费入口，should_produce_archive 决策 |
-| [documents/parsers.py](file:///d:/fz/0601/solo-dogfeeding/code/68-paperless-ngx/src/documents/parsers.py) | 旧版 DocumentParser 基类、缩略图生成 Fallback |
+| 文件路径 | 职责 |
+|---------|------|
+| `src/paperless/settings/__init__.py` | 环境变量配置入口：`OCR_LANGUAGE`、`OCR_MODE`、`NLTK_LANGUAGE`、`SEARCH_LANGUAGE`、`DATE_PARSER_LANGUAGES` |
+| `src/paperless/settings/custom.py` | `parse_dateparser_languages()` — 显式 dateparser 语言解析 |
+| `src/paperless/config.py` | `OcrConfig` 运行时配置数据类，实现数据库+环境变量双层加载 |
+| `src/paperless/models.py` | `ApplicationConfiguration` 后台配置模型、`ModeChoices`/`OutputTypeChoices` 等枚举 |
+| `src/paperless/checks.py` | `check_default_language_available()` — 启动时 OCR 语言诊断检查 |
+| `src/paperless/utils.py` | `OCR_TO_DATEPARSER_LANGUAGES` 映射表 + `ocr_to_dateparser_languages()` 推导函数 |
+| `src/paperless/parsers/__init__.py` | `ParserProtocol` 解析器接口协议定义 |
+| `src/paperless/parsers/registry.py` | `ParserRegistry` 解析器注册表，评分选择算法 |
+| `src/paperless/parsers/tesseract.py` | `RasterisedDocumentParser` — Tesseract OCR 核心，含 force_ocr fallback |
+| `src/paperless/parsers/utils.py` | `extract_pdf_text()`、`is_tagged_pdf()`、`read_file_handle_unicode_errors()` 等共享工具 |
+| `src/paperless/parsers/text.py` | `TextDocumentParser` — 纯文本解析器 |
+| `src/paperless/parsers/tika.py` | `TikaDocumentParser` — Office 文档解析器，含 TIKA-4110 fallback |
+| `src/paperless/parsers/mail.py` | `MailDocumentParser` — 邮件解析器 |
+| `src/paperless/parsers/remote.py` | `RemoteDocumentParser` — 云端 OCR（Azure AI）解析器 |
+| `src/documents/plugins/date_parsing/__init__.py` | `get_date_parser()` — dateparser 语言两层 fallback 决策点 |
+| `src/documents/consumer.py` | 消费入口：MIME 检测、解析器查找、`should_produce_archive()`、qpdf PDF 修复 |
+| `src/documents/parsers.py` | 旧版 `DocumentParser` 基类、缩略图生成三级 fallback 链 |
