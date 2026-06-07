@@ -418,16 +418,157 @@ tasks.bulk_update_documents(document_ids)
             └─ update_filename_and_move_files()             ★ 第 2 次重命名（兜底）
 ```
 
+#### 重命名次数精确判断条件
+
+批量编辑后的 `update_filename_and_move_files()` 实际被调用几次、是否执行真实文件移动，取决于四个层层递进的判断条件：
+
+```
+条件①：bulk_update_documents 循环中
+   ├─ document_updated.send()
+   │    └─ 是否存在至少 1 个 DOCUMENT_UPDATED Workflow 匹配文档？
+   │         ├─ 否 → 不调用 document.save() → 不触发 post_save → 不调用重命名
+   │         └─ 是 → run_workflows 内部的 document.save() → post_save → 第 1 次重命名调用
+   │              ↑ 注意：有 N 个 Workflow 匹配 → 会调用 N 次 document.save() → N 次重命名调用
+   │
+   └─ post_save.send(Document, instance=doc)  ← 无条件总是执行 → 最后 1 次重命名调用
+```
+
+---
+
+**条件 1：是否有 DOCUMENT_UPDATED Workflow 匹配文档**
+
+[handlers.py#L888-L915](src/documents/signals/handlers.py#L888-L915)：
+
+```python
+workflows = get_workflows_for_trigger(trigger_type)   # 所有 DOCUMENT_UPDATED 类型的 Workflow
+for workflow in workflows:
+    if matching.document_matches_workflow(document, workflow, trigger_type):
+        # ↑ 只有匹配的 Workflow 才进入以下代码块
+        ... 执行 action ...
+        if not use_overrides:
+            document.save(update_fields=[...])  # ← 每匹配 1 个 Workflow，save 1 次
+```
+
+**关键点**：`document.save()` 位于 `if matching.document_matches_workflow(...)` 分支**内部**，且在 `for workflow in workflows` 循环内——匹配几个 Workflow 就 save 几次。
+
+---
+
+**条件 2：`update_filename_and_move_files()` 是否空跑（早退）**
+
+[handlers.py#L465-L474](src/documents/signals/handlers.py#L465-L474) 第一道门禁：
+```python
+if not instance.filename:
+    return    # filename 为空（消费中）→ 直接返回
+```
+
+批量编辑场景下 filename 肯定非空，所以这道门禁挡不住。关键是第二道门禁：
+
+[handlers.py#L573-L582](src/documents/signals/handlers.py#L573-L582)：
+
+```python
+if not move_original and not move_archive:
+    # 只 update modified / filename / archive_filename，不 shutil.move
+    Document.objects.filter(pk=instance.pk).update(**updates)
+    return   # ← 早退：没有任何文件需要移动
+```
+
+`move_original` 的计算 [handlers.py#L494-L529](src/documents/signals/handlers.py#L494-L529)：
+```python
+candidate_filename = generate_filename(instance)
+...
+move_original = (old_filename != instance.filename and not original_already_moved)
+```
+
+即：**只有当 `generate_filename()` 算出的新路径与 DB 中存储的旧路径不同时，才会真实移动文件**。
+
+---
+
+#### 四种典型场景的精确对比
+
+| # | 场景 | `update_filename_and_move_files` 调用次数 | 真实 `shutil.move` 次数 | 触发来源 |
+|---|------|------------------------------------------|------------------------|---------|
+| A | **无任何 DOCUMENT_UPDATED Workflow 匹配** | **1 次** | 0 或 1 | 仅 `bulk_update_documents` 末尾的 `post_save.send()` |
+| B | **有 1 个 Workflow 匹配，但只含 EMAIL/WEBHOOK/MOVE_TO_TRASH（无 ASSIGNMENT/REMOVAL）** | **2 次**（1+1） | 0 或 1（两次算出来路径一样，通常第 1 次真实移动，第 2 次早退） | Workflow 内部 `save()` 1 次 + 末尾 `post_save.send()` 1 次 |
+| C | **有 1 个 Workflow 匹配，含 ASSIGNMENT，但设置的 storage_path 与批量编辑刚设的相同** | **2 次**（1+1） | 0 或 1（两次路径完全一样，批量编辑已触发变化时第 1 次移动，否则都是早退） | 同上 |
+| D | **有 1 个 Workflow 匹配，含 ASSIGNMENT 且设置了**不同的** storage_path** | **2 次**（1+1） | 0 或 1 或 2（通常第 1 次按 Workflow 新值移动，第 2 次早退） | 同上 |
+| E | **有 N 个 Workflow 同时匹配** | **N+1 次** | ≤N+1（通常只有第 1 次真实移动，后续 N 次均早退） | N 次 Workflow 内部 `save()` + 1 次末尾 `post_save.send()` |
+
+> 注："0 或 1"取决于批量编辑前的 storage_path 是否与当前实际路径一致——如果文档本来就已经在该 StoragePath 对应的路径下，则 `generate_filename()` 算出新旧路径相同，**即使调用了也不会真实移动文件**。
+
+---
+
+**各场景代码路径详解**
+
+**场景 A：无 Workflow 匹配**
+
+```
+bulk_update_documents → for each doc:
+   clear_document_caches(doc.pk)
+   document_updated.send(doc)
+      └─ run_workflows_updated
+           └─ for workflow in workflows:
+                if document_matches_workflow(...):   ← 全部 False
+                    document.save(...)              ← 不执行
+   post_save.send(Document, instance=doc)           ← 唯一的 1 次触发
+      └─ update_filename_and_move_files() 调用 ×1
+```
+
+**场景 B：1 个 Workflow 匹配，但只含 EMAIL（不影响模板变量）**
+
+```
+bulk_update_documents → for each doc:
+   document_updated.send(doc)
+      └─ run_workflows_updated
+           └─ for workflow in workflows:
+                if document_matches_workflow(...) → True  ← 命中 1 个
+                    execute_email_action(...)     ← 发邮件，不改 document 字段
+                    document.save(update_fields=[title, correspondent, ...])
+                       ↓ 即使字段值没变，save() 仍触发 post_save
+                    post_save → update_filename_and_move_files() 调用 ×1  ★ 第 1 次
+                        ├─ candidate_filename = generate_filename(doc)
+                        ├─ 由于 Workflow 没改任何模板变量，新旧路径相同
+                        └─ move_original = False → 早退（只 update modified）
+   post_save.send(Document, instance=doc)
+      └─ update_filename_and_move_files() 调用 ×1  ★ 第 2 次（早退）
+```
+
+**场景 D：1 个 Workflow 匹配，且 ASSIGNMENT 改了 storage_path**
+
+```
+bulk_update_documents → for each doc:
+   document_updated.send(doc)
+      └─ run_workflows_updated
+           └─ for workflow in workflows:
+                if document_matches_workflow(...) → True
+                    apply_assignment_to_document()  ← doc.storage_path = Y（新值）
+                    document.save(update_fields=[..., "storage_path", ...])
+                        ↓ post_save 触发
+                    post_save → update_filename_and_move_files() 调用 ×1  ★ 第 1 次
+                        ├─ candidate_filename = generate_filename(doc)
+                        │     ← 使用新 storage_path Y 的模板，路径变了
+                        ├─ move_original = True
+                        └─ shutil.move(old_path, new_path)  ← ★ 真实移动
+   post_save.send(Document, instance=doc)
+      └─ update_filename_and_move_files() 调用 ×1  ★ 第 2 次
+           ├─ candidate_filename = generate_filename(doc)
+           │     ← storage_path 已经是 Y，路径与 DB 中存储的一致
+           └─ move_original = False → 早退
+```
+
+---
+
 #### 关键结论
 
-| 问题 | 结论 |
-|------|------|
-| 为什么重命名执行两次？ | 第一次在 Workflow 内部 save 时（应对 Workflow 对元数据的二次修改），第二次在 bulk_update_documents 末尾兜底（应对 Workflow 不存在或未修改的情况） |
+| 问题 | 精确结论 |
+|------|---------|
+| 重命名一定执行两次吗？ | **不一定**。若无 DOCUMENT_UPDATED Workflow 匹配，只执行 1 次；有 N 个 Workflow 匹配则执行 **N+1 次** |
+| Workflow 只发邮件不改元数据，会不会触发 save？ | **会**——`document.save()` 放在 `if document_matches_workflow(...)` 分支末尾，**不依赖 action 类型**，即使只有 EMAIL 也会 save |
+| 调用次数 ≠ 真实移动次数？ | **是的**。只要 `generate_filename()` 算出的新路径与 DB 中旧路径相同，就会在 [handlers.py#L573-L582](src/documents/signals/handlers.py#L573-L582) 早退，只 update `modified` 字段，不执行 `shutil.move` |
 | 为什么不直接在 bulk_edit 里 `doc.save()`？ | 为了**先跑 Workflow**：让 DOCUMENT_UPDATED 触发器的 Workflow 有机会进一步修改元数据，再统一做重命名 |
-| `document_updated` 和 `post_save` 谁先执行？ | `document_updated` 先（含 Workflow + WebSocket），全部完成后才发 `post_save` |
-| Workflow 能覆盖批量编辑的 StoragePath 吗？ | **可以**——如果 DOCUMENT_UPDATED Workflow 的 ASSIGNMENT 动作设置了 `assign_storage_path`，会覆盖批量编辑设置的值（Workflow 的 order 越靠后越晚生效） |
-| 两次重命名会不会冲突？ | 不会——都通过 `MEDIA_LOCK` 互斥，且第二次用 `document.refresh_from_db()` 从 DB 读到的是最新状态 |
-| 前端何时拿到通知？ | `document_updated` 的第 2 个接收者发 WebSocket，**在第一次重命名之后、第二次重命名之前**。但前端收到后刷新时第二次重命名通常已完成（同一进程顺序执行） |
+| `document_updated` 和 `post_save` 谁先执行？ | `document_updated` 先（含 Workflow + WebSocket），其内部 Workflow 的 save 可能触发若干次 post_save；全部完成后才执行 bulk_update_documents 末尾的 `post_save.send()` |
+| Workflow 能覆盖批量编辑的 StoragePath 吗？ | **可以**——如果 DOCUMENT_UPDATED Workflow 的 ASSIGNMENT 动作设置了 `assign_storage_path`，会覆盖批量编辑设置的值（多个 Workflow 匹配时 order 越靠后越晚生效） |
+| 多次调用会不会冲突？ | 不会——每次 `update_filename_and_move_files` 都通过 `MEDIA_LOCK` 互斥，且开头 `refresh_from_db()` 从 DB 读取最新状态 |
+| 前端何时拿到通知？ | `document_updated` 的第 2 个接收者 `send_websocket_document_updated` 在 Workflow 执行完毕后发 WebSocket，**此时可能已发生第 1 次真实文件移动**，但末尾兜底的第 N+1 次调用可能还未执行（通常很快完成） |
 
 ---
 
