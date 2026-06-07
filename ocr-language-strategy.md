@@ -155,9 +155,11 @@ dateparser 和 Tesseract **都能读取后台数据库配置**，但 dateparser 
 - Tesseract 没有独立的语言环境变量，只能走 OcrConfig 的「数据库 → OCR 环境变量」链路
 - dateparser 额外支持 `PAPERLESS_DATE_PARSER_LANGUAGES` 独立配置，设置后**完全绕过** OCR 语言配置（包括后台数据库）
 
-#### dateparser 的两层 fallback
+#### dateparser 的两层取值路径（校验边界不同）
 
-**第一层（最高优先级）：独立环境变量 `PAPERLESS_DATE_PARSER_LANGUAGES`**（`src/paperless/settings/__init__.py:961-967`）：
+dateparser 有两条完全独立的取值路径，**校验时机和失败行为截然不同**。
+
+**路径一（最高优先级）：独立环境变量 `PAPERLESS_DATE_PARSER_LANGUAGES` — Django 启动时解析，非法 locale 直接启动失败**（`src/paperless/settings/__init__.py:961-967`）：
 
 ```python
 DATE_PARSER_LANGUAGES = (
@@ -169,24 +171,29 @@ DATE_PARSER_LANGUAGES = (
 )
 ```
 
-若设置了 `PAPERLESS_DATE_PARSER_LANGUAGES`，则通过 `parse_dateparser_languages()` 解析：
+通过 `parse_dateparser_languages()` 解析（`src/paperless/settings/custom.py:331-343`）：
 
 ```python
-# src/paperless/settings/custom.py:331-343
 def parse_dateparser_languages(languages: str | None) -> list[str]:
     language_list = languages.split("+") if languages else []
-    # 中文特殊处理：zh-Hant / zh-Hans 已知在 dateparser 中有 bug
+    # 中文特殊处理：zh-Hans / zh-Hant 自动追加 "zh" fallback
     for index, language in enumerate(language_list):
         if language.startswith("zh-") and "zh" not in language_list:
             logger.warning(
-                f"Chinese locale detected: {language}. dateparser might fail to parse"
-                f' some dates with this locale, so Chinese ("zh") will be used as a fallback.',
+                f"Chinese locale detected: {language}. ... Chinese (\"zh\") will be used as a fallback.",
             )
             language_list.append("zh")
+    # ← 直接调用 get_locale_map，无 try/except，非法 locale 会抛出异常导致启动失败
     return list(LocaleDataLoader().get_locale_map(locales=language_list))
 ```
 
-**第二层（兜底）：通过 `OcrConfig()` 从 OCR 语言动态推导**（`src/documents/plugins/date_parsing/__init__.py:64-93`）：
+**路径一的校验边界**：
+- 解析时机：Django settings 加载阶段（进程启动时执行一次）
+- 校验方式：`LocaleDataLoader().get_locale_map()` 直接校验，**外层无异常捕获**
+- 失败行为：填入非法 locale（如 `invalid_lang`）会让 Django 进程直接启动失败，无法运行
+- 对中文 zh-Hans / zh-Hant 有特殊处理：自动追加 `"zh"` 作为 fallback 并记录 warning 日志
+
+**路径二（兜底）：从 OCR 语言动态推导 — 运行时容错，推导失败警告并回退为空列表**（`src/documents/plugins/date_parsing/__init__.py:64-93`）：
 
 在 `get_date_parser()` 工厂函数中，每次创建日期解析器时都会**实时**执行：
 
@@ -197,48 +204,51 @@ languages = settings.DATE_PARSER_LANGUAGES or ocr_to_dateparser_languages(
 )
 ```
 
-当 `settings.DATE_PARSER_LANGUAGES` 为 `None`（即未显式设置独立环境变量）时，调用 `ocr_to_dateparser_languages()` 从 OCR 语言动态推导（`src/paperless/utils.py:118-169`）：
+当 `settings.DATE_PARSER_LANGUAGES` 为 `None`（即未设置路径一的独立变量）时，调用 `ocr_to_dateparser_languages()` 动态推导（`src/paperless/utils.py:118-169`）：
 
 ```python
 def ocr_to_dateparser_languages(ocr_languages: str) -> list[str]:
     loader = LocaleDataLoader()
     result = []
-    for ocr_language in ocr_languages.split("+"):
-        # 如 "aze_Cyrl" → 拆分为 ocr_lang_part="aze", script=["Cyrl"]
-        ocr_lang_part, *script = ocr_language.split("_")
-        ocr_script_part = script[0] if script else None
-
-        # 1. 通过 OCR_TO_DATEPARSER_LANGUAGES 映射表转码（ISO 639-2 → locale）
-        #    如 "aze" → "az", "eng" → "en", "chi" → "zh"
-        language_part = OCR_TO_DATEPARSER_LANGUAGES.get(ocr_lang_part)
-        if language_part is None:
-            continue  # 映射表中不存在则跳过
-
-        loader.get_locale_map(locales=[language_part])  # 验证基础语言
-
-        # 2. 若有脚本变体，尝试组合 locale（如 "az" + "Cyrl" → "az-Cyrl"）
-        if ocr_script_part:
-            dateparser_language = f"{language_part}-{ocr_script_part.title()}"
-            try:
-                loader.get_locale_map(locales=[dateparser_language])
-            except Exception:
-                # 变体不被支持时回退到基础语言
-                dateparser_language = language_part
-        else:
-            dateparser_language = language_part
-
-        if dateparser_language not in result:
-            result.append(dateparser_language)
+    try:                                          # ← 最外层 try/except，确保整体不崩溃
+        for ocr_language in ocr_languages.split("+"):
+            ocr_lang_part, *script = ocr_language.split("_")
+            # 1. 映射表查不到 → debug 日志，静默跳过该语言
+            language_part = OCR_TO_DATEPARSER_LANGUAGES.get(ocr_lang_part)
+            if language_part is None:
+                logger.debug(f'Unable to map OCR language "{ocr_lang_part}" to dateparser locale.')
+                continue
+            # 2. 基础语言校验 → 外层 try 捕获，整体回退
+            loader.get_locale_map(locales=[language_part])
+            # 3. 脚本变体（如 aze_Cyrl → az-Cyrl）不支持 → info 日志，回退到基础语言
+            if ocr_script_part:
+                dateparser_language = f"{language_part}-{ocr_script_part.title()}"
+                try:
+                    loader.get_locale_map(locales=[dateparser_language])
+                except Exception:
+                    logger.info(f"Language variant '{dateparser_language}' not supported... falling back to base language '{language_part}'.")
+                    dateparser_language = language_part
+            if dateparser_language not in result:
+                result.append(dateparser_language)
+    except Exception as e:                        # ← 整体异常 → warning 日志 + 返回空列表
+        logger.warning(f"Error auto-configuring dateparser languages. Set PAPERLESS_DATE_PARSER_LANGUAGES to avoid this. Detail: {e}")
+        return []
+    if not result:                                # ← 最终结果为空 → info 日志，空列表交给 dateparser 默认多语言
+        logger.info("Unable to automatically determine dateparser languages from OCR_LANGUAGE, falling back to multi-language support.")
     return result
 ```
 
 `OCR_TO_DATEPARSER_LANGUAGES` 映射表定义在 `src/paperless/utils.py:7-115`，包含约 90 种语言的 ISO 639-2 → dateparser locale 映射。
 
-**推导失败 fallback**：
-- 某语言在映射表中不存在 → 跳过，记录 debug 日志
-- 脚本变体（如 Cyrl）dateparser 不支持 → 回退到基础语言，记录 info 日志
-- 整个推导过程抛异常 → 返回空列表 `[]`，记录 warning 日志
-- 最终结果为空 → 记录 info 日志，dateparser 使用自身默认的多语言模式
+**路径二的校验边界（多层容错）**：
+| 失败场景 | 日志级别 | 回退行为 |
+|---------|---------|---------|
+| 某 Tesseract 语言在 `OCR_TO_DATEPARSER_LANGUAGES` 映射表中查不到 | DEBUG | 静默跳过该语言 |
+| 脚本变体（如 `aze_Cyrl`）组合出的 locale dateparser 不支持 | INFO | 回退到基础语言（如 `az`） |
+| 整个推导过程抛出未预期异常 | WARNING | 返回空列表 `[]` |
+| 所有语言都推导不出来，最终结果为空 | INFO | 返回空列表，dateparser 启用自身默认多语言模式 |
+- 解析时机：每次创建日期解析器时（运行时，可感知后台配置变更）
+- 无论任何失败场景，**都不会让日期解析崩溃**，最坏情况是空列表交给 dateparser 默认多语言模式
 
 ### 3.2 NLTK 语言（完全不读取后台数据库配置）
 
@@ -337,16 +347,19 @@ SEARCH_LANGUAGE: str | None = _get_search_language_setting(OCR_LANGUAGE)
 
 | 组件 | 第一优先级 | 第二优先级 | 推导时机 | 是否读取后台配置 | 启动时是否被校验 | 非法配置暴露时机 |
 |------|-----------|-----------|---------|----------------|----------------|----------------|
-| **Tesseract OCR** | 数据库 `ApplicationConfiguration.language`（每次实时读） | `PAPERLESS_OCR_LANGUAGE`（默认 `eng`） | 运行时每次解析 new `OcrConfig()` | ✅ 实时生效 | ❌ 启动只校验环境变量 | 文档解析时（OCRmyPDF 报错） |
-| **dateparser** | `PAPERLESS_DATE_PARSER_LANGUAGES`（设了就完全绕过 OCR 配置） | 数据库 `ApplicationConfiguration.language` + `PAPERLESS_OCR_LANGUAGE`（通过 `OcrConfig` 实时读） | 运行时每次创建解析器 new `OcrConfig()` | ✅ 实时生效 | ❌ 无启动校验 | 日期解析时（locale 映射失败或解析异常） |
+| **Tesseract OCR** | 数据库 `ApplicationConfiguration.language`（每次实时读） | `PAPERLESS_OCR_LANGUAGE`（默认 `eng`） | 运行时每次解析 new `OcrConfig()` | ✅ 实时生效 | ❌ 启动只校验环境变量 | 文档解析时（OCRmyPDF 找不到训练数据抛 `ParseError`） |
+| **dateparser（路径一：独立变量）** | `PAPERLESS_DATE_PARSER_LANGUAGES`（设了就完全绕过 OCR 配置） | —（无第二优先级） | Django 启动加载 settings 时（仅一次） | ❌ 完全不读 | ✅ `get_locale_map()` 严格校验 | **Django 启动时**（非法 locale 直接导致进程启动失败） |
+| **dateparser（路径二：OCR 推导）** | — | 数据库 `ApplicationConfiguration.language` + `PAPERLESS_OCR_LANGUAGE`（通过 `OcrConfig` 实时读） | 运行时每次创建解析器 new `OcrConfig()` | ✅ 实时生效 | ❌ 无启动校验，运行时多层容错 | 每次日期解析调用时（warning/info 日志，回退为空列表不崩溃） |
 | **NLTK** | —（无独立配置） | `PAPERLESS_OCR_LANGUAGE` **第一个** 主语言（只读环境变量，不读数据库） | Django 启动加载 settings 时（仅一次，永久固化） | ❌ 完全不读 | ❌ 无启动校验 | 文档分类时（语言不在支持列表则为 None，无报错但不启用分词） |
 | **搜索 (Tantivy)** | `PAPERLESS_SEARCH_LANGUAGE`（只读环境变量） | `PAPERLESS_OCR_LANGUAGE` **第一个** 主语言（只读环境变量，不读数据库） | Django 启动加载 settings 时（仅一次，永久固化） | ❌ 完全不读 | ❌ 仅显式设 `PAPERLESS_SEARCH_LANGUAGE` 时校验 | 搜索索引构建时（语言不在列表则为 None，不分词干） |
 
 > **生效边界总结（取值 + 校验）**：
-> 1. **Tesseract 和 dateparser**：通过每次 new `OcrConfig()` 实时读取数据库，管理员在后台改 language **立即生效**，无需重启。但**启动时不会校验数据库里的语言是否合法**，填了未安装的语言包要等到实际解析文档时才会报错。
-> 2. **NLTK 和搜索语言**：在 Django 启动时直接从环境变量 `os.environ` 读取，**代码路径完全绕过 `OcrConfig`，因此数据库里的 `ApplicationConfiguration.language` 对这两个组件没有任何影响**。启动时也不会校验从 OCR 语言推导出来的值是否合法。
-> 3. **启动校验的盲区**：`check_default_language_available()` 只校验 `settings.OCR_LANGUAGE`（环境变量）。对于四个组件，只要语言最终取值和环境变量不一致（无论是通过后台配置还是通过独立变量），就完全脱离了启动校验的保护。
-> 4. 若仅在后台修改 OCR 语言：Tesseract OCR 和日期解析会使用新语言，但文档分类（NLTK）和搜索词干还原仍使用启动时的旧语言，直到修改环境变量并重启 Django 服务（搜索还需重建索引）。
+> 1. **Tesseract OCR**：每次解析通过 `OcrConfig()` 实时读取数据库，后台改语言立即生效。但启动校验只看环境变量，后台填了未安装的语言包要等到文档真正解析时才会报错。
+> 2. **dateparser 路径一（独立变量）**：是四个组件中唯一在启动时做严格校验的路径。`PAPERLESS_DATE_PARSER_LANGUAGES` 填了非法 locale 会让 Django 直接启动失败。
+> 3. **dateparser 路径二（OCR 推导）**：每次创建解析器通过 `OcrConfig()` 实时读取数据库，后台改语言立即生效。但代码做了多层 try/except 容错，任何异常都只打日志并回退为空列表，永远不会让日期解析崩溃。
+> 4. **NLTK 和搜索语言**：Django 启动时直接从环境变量读取，**代码路径完全绕过 `OcrConfig`，数据库里的 `ApplicationConfiguration.language` 对这两个组件没有任何影响**。启动时也几乎不校验，非法值只是静默为 None。
+> 5. **启动校验的盲区全景**：`check_default_language_available()` 只校验 `settings.OCR_LANGUAGE`（环境变量）。dateparser 路径一有独立的严格启动校验，但只覆盖它自己。Tesseract 后台配置、dateparser 路径二、NLTK、搜索语言的最终取值全部脱离了启动校验的保护。
+> 6. 若仅在后台修改 OCR 语言：Tesseract OCR 和日期解析（路径二）会使用新语言，但文档分类（NLTK）和搜索词干还原仍使用启动时的旧语言，直到修改环境变量并重启 Django 服务（搜索还需重建索引）。
 
 ---
 
