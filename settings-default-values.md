@@ -6,18 +6,21 @@
 
 ## 一、四层设置体系概览
 
-Paperless-ngx 的设置系统由四个层级构成，自底向上依次为：
+Paperless-ngx 的设置系统由四个主层级 + 一个前端兜底层级构成，自底向上依次为：
 
 | 层级 | 存储位置 | 作用域 | 典型字段 |
 |------|---------|--------|---------|
-| L1 代码硬编码默认值 | 前端 `ui-settings.ts` 的 `SETTINGS` 数组 | 所有用户 | `documentListSize` 默认 50、`darkModeUseSystem` 默认 true |
-| L2 Django 环境变量/配置文件 | 后端 `paperless/settings/__init__.py` | 全局系统级 | `PAPERLESS_OCR_LANGUAGE`、`PAPERLESS_EMPTY_TRASH_DELAY` |
-| L3 数据库全局配置 | `ApplicationConfiguration` 单例模型 | 管理员设置的全局值 | OCR 参数、Barcode 参数、AI 开关、App Logo/Title |
-| L4 数据库用户偏好 | `UiSettings` 模型（每用户一条） | 单个用户 | 语言、暗色模式、列表大小、通知偏好等 |
+| **L1** 前端 SETTINGS 硬编码默认值 | 前端 `ui-settings.ts` 的 `SETTINGS` 数组 | 所有用户 | `documentListSize` 默认 50、`darkModeUseSystem` 默认 true |
+| **L1b** 前端 environment 兜底值 | 前端 `environment.ts` | 所有用户 | `appTitle: 'Paperless-ngx'`（仅 app_title/app_logo 字段） |
+| **L2** Django 环境变量/配置文件 | 后端 `paperless/settings/__init__.py` | 全局系统级 | `PAPERLESS_OCR_LANGUAGE`、`PAPERLESS_EMPTY_TRASH_DELAY` |
+| **L3** 数据库全局配置 | `ApplicationConfiguration` 单例模型 | 管理员设置的全局值 | OCR 参数、Barcode 参数、AI 开关、App Logo/Title |
+| **L4** 数据库用户偏好 | `UiSettings` 模型（每用户一条） | 单个用户 | 语言、暗色模式、列表大小、通知偏好等 |
 
 **最终优先级（从高到低）：L4 用户偏好 > L3 全局配置 > L2 环境变量 > L1 前端硬编码默认值**
 
-> **重要例外**：某些系统级字段（`app_title`、`ai_enabled`、`trash_delay` 等）由后端在 API 返回时**强制注入**，会覆盖用户 UiSettings（L4）中的同名键。见第三章。
+> **重要例外**：
+> 1. 某些系统级字段（`app_title`、`ai_enabled`、`trash_delay` 等）由后端在 API 返回时**强制注入**，会覆盖用户 UiSettings（L4）中的同名键。见第三章。
+> 2. `app_title`、`app_logo` 字段的 L1 前端 SETTINGS 默认值 `''` 实际**永远不会生效**，因为后端始终返回这两个键（值为 null 时前端直接返回 null，不回退到 L1），最终兜底由 L1b `environment.appTitle = 'Paperless-ngx'` 完成。
 
 ---
 
@@ -25,7 +28,9 @@ Paperless-ngx 的设置系统由四个层级构成，自底向上依次为：
 
 ### 2.1 L1：前端硬编码默认值
 
-文件：[src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts)
+主要文件：
+- [src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts) — SETTINGS 数组
+- [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) — appTitle 兜底值
 
 每个设置项通过 `SETTINGS` 数组定义，包含 `key`、`type`、`default`：
 
@@ -41,9 +46,16 @@ export const SETTINGS: UiSetting[] = [
     type: 'boolean',
     default: true,
   },
+  {
+    key: SETTINGS_KEYS.APP_TITLE,
+    type: 'string',
+    default: '',   // ⚠️ 该默认值永远不会生效（后端始终返回 app_title 键，值为 null 时直接返回 null）
+  },
   // ... 约 40 个设置项
 ]
 ```
+
+**⚠️ 重要例外**：`app_title`、`app_logo` 字段在 SETTINGS 中虽然定义了 `default: ''`，但由于后端 `UiSettingsView.get()` 始终向响应中注入这两个键（即使值为 `null`），前端 `get()` 方法只会在 `value === undefined` 时才回退到默认值，而 `null` 直接返回 `null`，因此这两个字段的 SETTINGS 默认值**永远不会被触发**。前端实际兜底由 `environment.appTitle = 'Paperless-ngx'` 完成。
 
 ### 2.2 L2：Django 环境变量与代码默认值
 
@@ -279,7 +291,7 @@ def get(self, request, format=None):
 
 ##### (1) `app_title` —— 应用标题
 
-覆盖逻辑：
+后端覆盖逻辑：
 ```
 用户 UiSettings["app_title"]
     ↓ 被后端覆盖
@@ -296,12 +308,85 @@ self.app_title = app_config.app_title or None
 
 然后在 `UiSettingsView.get()` 中：
 ```python
-ui_settings["app_title"] = settings.APP_TITLE
+ui_settings["app_title"] = settings.APP_TITLE  # settings.APP_TITLE 默认值是 None
 if general_config.app_title is not None and len(general_config.app_title) > 0:
     ui_settings["app_title"] = general_config.app_title
 ```
 
-**最终优先级：L3 DB (非空) > L2 环境变量 > 用户 UiSettings**
+**后端最终优先级：L3 DB (非空) > L2 环境变量 > 用户 UiSettings**
+
+**后端返回值的三种可能：**
+
+| L3 DB | L2 环境变量 | 后端 API 返回值（JSON） |
+|--------|-------------|------------------------|
+| 非空字符串 `"My Paperless"` | 任意 | `"My Paperless"` |
+| `None` / `""` | `"Custom Title"` | `"Custom Title"` |
+| `None` / `""` | 未设置 | `null`（Python None 序列化为 JSON null） |
+
+**前端 `null` vs `undefined` 边界（关键！）：**
+
+前端 `SettingsService.get()` 对 `null` 和 `undefined` 的处理完全不同：
+
+```typescript
+// ui-settings.ts
+{
+  key: SETTINGS_KEYS.APP_TITLE,
+  type: 'string',
+  default: '',   // ← 前端硬编码默认值，仅在 undefined 时生效
+}
+
+// settings.service.ts
+get(key: string): any {
+  let value = this.getSettingRawValue(key)
+
+  if (value !== undefined) {
+    if (value === null) {
+      return null   // ← null 直接返回 null，不回退到默认值！
+    }
+    switch (setting.type) {
+      case 'string': return value
+      // ...
+    }
+  } else {
+    return setting.default  // ← 只有 undefined 才回退到 ''
+  }
+}
+```
+
+`getSettingRawValue()` 通过 `Object.prototype.hasOwnProperty.call()` 判断键是否存在。由于后端始终设置了 `ui_settings["app_title"]`（即使值是 None），JSON 序列化后 `app_title` 键始终存在，只是值可能是 `null`：
+
+```typescript
+// 后端返回 JSON（L3/L2 均未设置时
+{"settings": {"app_title": null, ...}}
+
+// assignSafeSettings 把 null 存入 this.settings
+this.settings['app_title'] = null
+
+// getSettingRawValue 返回 null（不是 undefined）
+// → get() 返回 null，而不是 ''
+```
+
+**前端最终显示逻辑**：
+
+前端实际使用 `app_title` 时做了额外的 null 防御：
+```typescript
+// settings.service.ts initializeSettings()
+if (this.get(SETTINGS_KEYS.APP_TITLE)?.length) {
+  environment.appTitle = this.get(SETTINGS_KEYS.APP_TITLE)
+}
+```
+- 当 `get()` 返回 `null` 时，`null?.length` 是 `undefined`（falsy），条件不成立
+- `environment.appTitle` 保持 `environment.ts` 中的默认值 `'Paperless-ngx'`
+- 前端 `ui-settings.ts` 中定义的 `default: ''` **永远不会被** `SettingsService.get()` 返回
+
+**app_title 完整路径总结：**
+
+| 层级 | 值 | 说明 |
+|------|-----|------|
+| L3 DB 非空 | 字符串 | 管理员设置的自定义标题 |
+| L2 环境变量非空 | 字符串 | 环境变量设置的自定义标题 |
+| L3/L2 均未设置 + 前端显示 | `'Paperless-ngx'` | 来自 `environment.appTitle` 默认值（前端兜底） |
+| L3/L2 均未设置 + SettingsService.get() 返回 | `null` | API 返回 JSON null，不触发前端 SETTINGS 默认值 `''` |
 
 ##### (2) `ai_enabled` —— AI 开关
 
@@ -387,7 +472,7 @@ get(key: string): any {
     }
 
     if (value !== undefined) {
-        // 类型转换：后端存的是字符串/原始值，前端按 setting.type 解析
+        // ⚠️ null 直接返回 null，不回退到默认值！
         if (value === null) return null
         switch (setting.type) {
             case 'boolean': return JSON.parse(value)
@@ -396,11 +481,21 @@ get(key: string): any {
             default:        return value
         }
     } else {
-        // 后端无值 → 使用前端硬编码默认值（L1）
+        // 只有 undefined（后端完全未返回该键）才使用前端硬编码默认值（L1）
         return setting.default
     }
 }
 ```
+
+**`null` vs `undefined` 关键边界：**
+
+| 条件 | `getSettingRawValue()` 返回 | `get()` 最终返回 | 说明 |
+|------|---------------------------|-----------------|------|
+| 后端返回 `{"key": null}` | `null`（键存在，值为 null） | `null` | 不触发前端默认值 |
+| 后端返回 JSON 中完全不含该键 | `undefined`（键不存在） | `SETTINGS[i].default` | 触发前端默认值 |
+| 后端返回 `{"key": "value"}` | `"value"` | `"value"`（经类型转换） | 正常返回 |
+
+受此影响的典型字段：`app_title`、`app_logo` —— 后端始终返回该键（值可能是 null），因此前端 SETTINGS 中定义的 `default: ''` 永远不会生效。
 
 ### 4.2 Settings 页面展示：settings.component.ts
 
@@ -445,27 +540,50 @@ this.configService.saveConfig(...).subscribe(() => {
 前端读取设置 SettingsService.get(key)
         │
         ▼
-  ┌──────────────────────────────┐
-  │ 1. 后端 UiSettings JSON 字段  │ ← L4 用户偏好（每用户）
-  │    值（可能被后续注入覆盖）    │
-  └──────────────┬───────────────┘
+  ┌───────────────────────────────────┐
+  │ 1. 后端 UiSettings JSON 字段值     │ ← L4 用户偏好（每用户）
+  │    （可能被后续注入覆盖）           │
+  └──────────────┬────────────────────┘
                  │
                  ▼
-  ┌──────────────────────────────┐
-  │ 2. 后端强制注入的系统值        │ ← 在 UiSettingsView.get() 中赋值
-  │    （覆盖步骤 1 的同名键）      │   包括：trash_delay, app_title,
-  │                                │   ai_enabled, auditlog_enabled 等
-  └──────────────┬───────────────┘
-                 │ 有值？
-                 ├─ 是 ──► 类型转换后返回
+  ┌───────────────────────────────────┐
+  │ 2. 后端强制注入的系统值             │ ← 在 UiSettingsView.get() 中赋值
+  │    （覆盖步骤 1 的同名键）           │   包括：trash_delay, app_title,
+  │                                     │   ai_enabled, auditlog_enabled 等
+  └──────────────┬────────────────────┘
                  │
-                 ▼ 否
-  ┌──────────────────────────────┐
-  │ 3. 前端 SETTINGS[i].default   │ ← L1 前端硬编码默认值
-  └──────────────┬───────────────┘
+                 ├─ 后端返回键存在且值非 null → 类型转换后返回
+                 │
+                 ├─ 后端返回键存在且值为 null → 直接返回 null ❗
+                 │    （不回退到前端默认值）  │
+                 │
+                 ▼ 后端完全不返回该键（undefined）
+  ┌───────────────────────────────────┐
+  │ 3. 前端 SETTINGS[i].default        │ ← L1 前端硬编码默认值
+  └──────────────┬────────────────────┘
                  │
                  ▼
               返回默认值
+```
+
+**`null` vs `undefined` 关键边界（以 app_title 为例）：**
+
+```
+后端返回 {"settings": {"app_title": null, ...}}
+        │
+        ▼
+  this.settings['app_title'] = null   ← assignSafeSettings 存入
+        │
+        ▼
+  getSettingRawValue() 返回 null      ← hasOwnProperty 判断键存在
+        │
+        ▼
+  get() 返回 null                     ← value === null，直接返回
+        │                             （不回退到 SETTINGS[i].default = ''）
+        ▼
+  initializeSettings() 中：
+  null?.length → undefined（falsy）
+  → environment.appTitle 保持 'Paperless-ngx'  ← L1b 兜底
 ```
 
 **后端注入值的内部优先级（以 ai_enabled 为例）：**
@@ -497,6 +615,7 @@ ai_enabled 最终值
 | [src/documents/serialisers.py](src/documents/serialisers.py) | L4 UiSettingsViewSerializer |
 | [src/documents/context_processors.py](src/documents/context_processors.py) | SSR 模板中的 L3>L2 合并 |
 | [src-ui/src/app/data/ui-settings.ts](src-ui/src/app/data/ui-settings.ts) | L1 前端 SETTINGS 默认值定义 |
+| [src-ui/src/environments/environment.ts](src-ui/src/environments/environment.ts) | 前端兜底默认值（`appTitle: 'Paperless-ngx'`） |
 | [src-ui/src/app/services/settings.service.ts](src-ui/src/app/services/settings.service.ts) | 前端设置加载、合并、持久化 |
 | [src-ui/src/app/services/config.service.ts](src-ui/src/app/services/config.service.ts) | L3 全局配置 CRUD |
 | [src-ui/src/app/data/paperless-config.ts](src-ui/src/app/data/paperless-config.ts) | L3 配置选项元数据（PaperlessConfigOptions） |
@@ -505,15 +624,25 @@ ai_enabled 最终值
 
 ## 七、典型场景示例
 
-### 场景 1：用户从未设置任何偏好
+### 场景 1：用户从未设置任何偏好，L3/L2 均未配置 app_title
 
 | 字段 | 值来源 | 最终值 |
 |------|--------|--------|
 | `documentListSize` | L1 前端默认 | 50 |
 | `darkModeUseSystem` | L1 前端默认 | true |
 | `ai_enabled` | L2 环境变量 `PAPERLESS_AI_ENABLED`（默认 NO） | false |
-| `app_title` | L2 `PAPERLESS_APP_TITLE`（默认 None） | `''` |
+| `app_title`（SettingsService.get() 返回） | 后端 API 返回 JSON `null`，前端不回退到 `''` | `null` |
+| `app_title`（页面实际显示） | `environment.appTitle` 默认值（前端兜底） | `'Paperless-ngx'` |
 | `trash_delay` | L2 `PAPERLESS_EMPTY_TRASH_DELAY`（默认 30） | 30 |
+
+### 场景 1b：`null` vs `undefined` 边界（SettingsService.get() 行为差异）
+
+| 后端返回 JSON | `this.settings` 中存储值 | `getSettingRawValue()` 返回 | `get()` 最终返回 | 是否触发前端 SETTINGS 默认值 |
+|--------------|------------------------|---------------------------|-----------------|--------------------------|
+| `{"app_title": null}` | `this.settings['app_title'] = null` | `null`（键存在） | `null` | ❌ 不触发（返回 null，不是 `''`） |
+| （后端根本不返回 `app_title` 键） | `this.settings` 无 `app_title` 键 | `undefined`（键不存在） | `''` | ✅ 触发 `SETTINGS[i].default` |
+
+> 实际情况中，后端 UiSettingsView.get() 始终设置 `ui_settings["app_title"]`，所以总是属于第一种情况，前端默认值 `''` **永远不会被触发**。
 
 ### 场景 2：管理员在 Config 页面设置了 `ai_enabled = true`
 
