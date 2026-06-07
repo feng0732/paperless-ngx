@@ -428,33 +428,39 @@ def error_callback(
 
 内部同样通过 `rule = MailRule.objects.get(pk=rule_id)` 取 `rule.folder` 写入 ProcessedMail。
 
-#### 单个 Chord 的执行模式：
+#### 单个 Chord 的执行模式（两条独立的 FAILED 路径）：
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
 │  header（并行）：所有 consume_file 任务                       │
 │    consume_file(附件1)  consume_file(附件2)  ...                  │
-└───────────────────────────┬────────────────────────────────────────┘
-                            │ 全部成功完成 → result = [ret1, ret2, ...]
-                            ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  body：apply_mail_action(result, rule_id, message_uid,             │
-│                           message_subject, message_date)            │
-│    1. rule = MailRule.objects.get(pk=rule_id)                       │
-│    2. 重新连接 IMAP，M.folder.set(rule.folder)                      │
-│    3. action.post_consume(M, message_uid, rule.action_parameter)    │
-│    4. ProcessedMail.objects.create(                                 │
-│          folder=rule.folder,  uid=message_uid, ...)                 │
-└────────────────────────────────────────────────────────────────────┘
-                            │ 任一 header 任务失败
-                            ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  error_callback(request, exc, tb, rule_id, message_uid, ...)       │
-│    1. rule = MailRule.objects.get(pk=rule_id)                       │
-│    2. ProcessedMail.objects.create(                                 │
-│          folder=rule.folder, status="FAILED", error=traceback)      │
-└────────────────────────────────────────────────────────────────────┘
+└────────────┬───────────────────────────────┬───────────────────────┘
+             │ 全部成功                       │ 任一 header 任务失败
+             ▼                               ▼
+┌──────────────────────────────────────┐   ┌────────────────────────────────────────────────┐
+│ body：apply_mail_action(result, ...) │   │ on_error：error_callback(request, exc, tb,    │
+│                                      │   │              rule_id, message_uid, ...)        │
+│ ① rule = MailRule.objects.get(pk)    │   │ ① rule = MailRule.objects.get(pk=rule_id)      │
+│ ② 重新连接 IMAP                      │   │ ② ProcessedMail.objects.create(                │
+│ ③ action.post_consume(...)  ← 这里    │   │       rule=rule,                              │
+│    可能失败（MOVE/DELETE 找不到 UID）  │   │       folder=rule.folder,                     │
+│    ↘ 失败进入内部 except              │   │       uid=message_uid,                        │
+│ ④ 成功 → ProcessedMail(SUCCESS)       │   │       status="FAILED",  ← 路径一：header 失败 │
+│    失败 → ProcessedMail(FAILED) ←路径二│   │       error=traceback.format_exc())           │
+│         （内部 except 捕获后写库        │   └────────────────────────────────────────────────┘
+│          并重新 raise）                │
+└──────────────────────────────────────┘
 ```
+
+**两条 FAILED 路径的区别**：
+
+| 对比项 | 路径一：header (consume_file) 失败 → error_callback | 路径二：body (apply_mail_action) 自身失败 → 内部 except |
+|---|---|---|
+| 触发时机 | 任一 `consume_file` 任务抛出异常，Chord 无法完成 | 所有 consume_file 都成功，apply_mail_action 执行 IMAP 动作或写库时出错 |
+| 执行代码 | `error_callback()` [mail.py#L307-L331](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L307-L331) | `apply_mail_action()` 最外层 `except Exception:` [mail.py#L293-L304](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/mail.py#L293-L304) |
+| 典型失败场景 | 文档解析/OCR 失败、Consumer 插件异常、数据库写入失败等 | IMAP 连接失败、登录失败、`MOVE` 目标文件夹不存在、`MOVE/DELETE` 找不到该 UID（双 Chord 场景下第二次执行）、DB 写库失败 |
+| ProcessedMail 记录 | `rule=rule, folder=rule.folder`，**不含 `owner=rule.owner`** | `owner=rule.owner, rule=rule, folder=rule.folder`，**包含 owner 字段** |
+| 写完后的行为 | 正常结束，不 re-raise | `raise` 重新抛出异常（Celery 会将该 body task 标记为失败） |
 
 ### 6.5 EVERYTHING 模式下的双 Chord 衔接
 
@@ -506,15 +512,23 @@ _handle_message()
 | **MARK_READ** | 幂等；两次 `\Seen` 标记无副作用 |
 | **FLAG** | 幂等；两次 `\Flagged` 标记无副作用 |
 | **TAG**（keyword / Gmail 标签 / Apple Mail 颜色） | 幂等；重复打标签无副作用 |
-| **MOVE** | 第一次移动成功，邮件 UID 离开原文件夹；第二次执行 `post_consume()` 时 IMAP 找不到该 UID，会抛异常并在 error_callback 中记录 `FAILED` |
-| **DELETE** | 类似 MOVE，第二次找不到邮件 UID |
+| **MOVE** | 第一次移动成功，邮件 UID 离开原文件夹；第二次执行 `post_consume()` 时 IMAP 找不到该 UID → 抛 `ImapToolsError` → 被 apply_mail_action 最外层 `except Exception` 捕获 → **路径二**：写入一条含 `owner=rule.owner` 的 `ProcessedMail(status="FAILED")`，然后 re-raise |
+| **DELETE** | 类似 MOVE，第二次找不到邮件 UID → 同上述**路径二**：apply_mail_action 自身 except 写入 FAILED |
 
 #### 双 Chord 对 ProcessedMail 记录的影响：
 
-`ProcessedMail` 模型（[models.py#L316-L375](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/models.py#L316-L375)）**没有**对 `(rule, folder, uid)` 做唯一约束。因此：
-- 当 Chord A 和 Chord B 的 body（`apply_mail_action`）都成功时，会产生 **两条** `ProcessedMail(status="SUCCESS")` 记录
-- 其中任一 chord 任一 header 任务失败时，会额外产生一条 `FAILED` 记录
-- 下次取信时，`_handle_mail_rule` 中 `ProcessedMail.objects.filter(rule=rule, uid=message.uid, folder=rule.folder).exists()` 只要存在任意一条就跳过该邮件
+`ProcessedMail` 模型（[models.py#L316-L375](file:///d:/fz/0601/solo-dogfeeding/code/58-paperless-ngx/src/paperless_mail/models.py#L316-L375)）**没有**对 `(rule, folder, uid)` 做唯一约束。每个 Chord 独立可能产生 1 条记录，单封邮件在 EVERYTHING 模式下最多可能出现以下记录组合：
+
+| 场景 | Chord A（.eml）产生的记录 | Chord B（附件）产生的记录 | 总记录数 |
+|---|---|---|---|
+| 全部成功 | 1 条 SUCCESS（含 owner） | 1 条 SUCCESS（含 owner） | 2 条 |
+| A 的 consume_file 失败，B 全部成功 | 1 条 FAILED（路径一，**不含 owner**，error_callback 写） | 1 条 SUCCESS（含 owner） | 2 条 |
+| A 全部成功，B 的 consume_file 有失败 | 1 条 SUCCESS（含 owner） | 1 条 FAILED（路径一，不含 owner） | 2 条 |
+| A、B 的 consume_file 都有失败 | 1 条 FAILED（不含 owner） | 1 条 FAILED（不含 owner） | 2 条 |
+| A 全部成功，B 的 apply_mail_action 自身失败（如 MOVE 二次执行找不到 UID） | 1 条 SUCCESS（含 owner） | 1 条 FAILED（路径二，**含 owner**，apply_mail_action except 写） | 2 条 |
+| A 的 apply_mail_action 自身失败，B 全部成功 | 1 条 FAILED（路径二，含 owner） | 1 条 SUCCESS（含 owner） | 2 条 |
+
+下次取信时，`_handle_mail_rule` 中 `ProcessedMail.objects.filter(rule=rule, uid=message.uid, folder=rule.folder).exists()` 只要存在任意一条就跳过该邮件。
 
 #### _process_attachments 中对重复 ProcessedMail 的保护：
 
@@ -537,22 +551,27 @@ def apply_mail_action(
 
 执行流程：
 ```
-1. rule = MailRule.objects.get(pk=rule_id)   # 用 rule_id 反查 rule，取 rule.folder
-2. account = MailAccount.objects.get(pk=rule.account.pk)
-3. 重新连接邮箱（与 handle_mail_account 相同逻辑）
-4. M.folder.set(rule.folder)                  # folder 来自 rule，非参数传入
-5. action.post_consume(M, message_uid, rule.action_parameter)  执行 IMAP 动作
-6. ProcessedMail.objects.create(
-       owner=rule.owner,
-       rule=rule,
-       folder=rule.folder,      # folder 来自 rule 对象
-       uid=message_uid,         # 来自参数 message_uid
-       subject=message_subject, # 来自参数 message_subject
-       received=message_date,   # 来自参数 message_date（自动补 timezone）
-       status="SUCCESS",
-   )
-7. 异常时：写入 status="FAILED" 且带上 traceback
+try:
+  1. rule = MailRule.objects.get(pk=rule_id)   # 用 rule_id 反查 rule，取 rule.folder
+  2. account = MailAccount.objects.get(pk=rule.account.pk)
+  3. 重新连接邮箱（与 handle_mail_account 相同逻辑）
+  4. M.folder.set(rule.folder)                  # folder 来自 rule，非参数传入
+  5. action.post_consume(M, message_uid, rule.action_parameter)  执行 IMAP 动作
+     → 内部 try/except errors.ImapToolsError: 记录日志后 re-raise
+  6. ProcessedMail.objects.create(
+         owner=rule.owner, rule=rule, folder=rule.folder,
+         uid=message_uid, subject=message_subject,
+         received=message_date,   status="SUCCESS")
+except Exception:  ← 第 1-6 步任一环节出现任何异常都在此捕获（路径二）
+  7. ProcessedMail.objects.create(
+         owner=rule.owner, rule=rule, folder=rule.folder,
+         uid=message_uid, subject=message_subject,
+         received=message_date, status="FAILED",
+         error=traceback.format_exc())
+  8. raise  ← 重新抛出异常（Celery 将此任务标记为 FAILED）
 ```
+
+> 注意：这里的 FAILED 路径只来自 apply_mail_action 自身执行出错（IMAP 连接/动作/写库的异常），与 consume_file 失败由 Chord 的 on_error → error_callback 处理（路径一），是两条独立的失败记录路径。
 
 ### 6.7 无合格附件时的处理
 
