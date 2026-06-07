@@ -112,21 +112,48 @@ document_consumption_finished = Signal()
 document_updated = Signal()
 ```
 
-在 `src/documents/apps.py` 的 `ready()` 中注册 receiver：
+在 `src/documents/apps.py` 的 `ready()` 中按以下顺序注册 receiver（顺序决定执行先后）：
 ```python
-document_consumption_finished.connect(add_to_index)
+document_consumption_finished.connect(add_inbox_tags)
+document_consumption_finished.connect(set_correspondent)
+document_consumption_finished.connect(set_document_type)
+document_consumption_finished.connect(set_tags)
+document_consumption_finished.connect(set_storage_path)
+document_consumption_finished.connect(add_to_index)         # ← 第 6 个执行
+document_consumption_finished.connect(run_workflows_added)
+document_consumption_finished.connect(add_or_update_document_in_llm_index)
 ```
 
-`DocumentConsumer` 在成功完成所有消费步骤（保存、缩略图、归档、覆盖应用等）之后发送：
-```python
-document_consumption_finished.send(
-    sender=self.__class__,
-    document=document,
-    logging_group=self.logging_group,
-    classifier=classifier,
-    original_file=...,
-)
-```
+> **关键时序事实**：`document_consumption_finished.send()` **发生在媒体文件复制、归档文件写入和最终 document.save() 之前**。整个消费流程包裹在单个 `transaction.atomic()` 中，精确顺序如下（`src/documents/consumer.py`）：
+>
+> ```
+> transaction.atomic()
+>   │
+>   ├─ ① Document.objects.create(...) / version.save()  ← 第一次 DB 保存
+>   │     此时已有字段：title / content / mime_type / checksum /
+>   │     created / modified / page_count / original_filename
+>   │     （filename、archive_filename、correspondent、tags 等仍为空）
+>   │
+>   ├─ ② document_consumption_finished.send()  ← Signal 在此发送！
+>   │     └─ receiver 链按注册顺序执行：
+>   │          add_inbox_tags → set_correspondent → set_document_type
+>   │          → set_tags → set_storage_path → add_to_index ← 此处写索引
+>   │          → run_workflows_added → add_or_update_document_in_llm_index
+>   │     注：前 5 个 receiver 会修改并保存 document（set_correspondent 等），
+>   │         所以 add_to_index 执行时 correspondent / tags / storage_path 已入库。
+>   │
+>   ├─ ③ FileLock(MEDIA_LOCK) 内的文件复制
+>   │     ├─ 生成唯一文件名 → 设置 document.filename
+>   │     ├─ 写入原始文件 → document.source_path
+>   │     ├─ 写入缩略图 → document.thumbnail_path
+>   │     └─ 写入归档 PDF（若有）→ 设置 archive_filename / archive_checksum
+>   │
+>   └─ ④ document.save()  ← 最终保存（只持久化 filename / archive_filename / archive_checksum）
+>          （不触发 add_to_index，因为它是消费完成 Signal 的 receiver，
+>           而非 Django ORM 的 post_save receiver）
+> ```
+>
+> **关于索引完整性的说明**：Tantivy Schema 中只有 `original_filename` 字段，没有 `filename` 和 `archive_filename`（见 2.2 节 Schema 表）。因此第 ④ 步的最终 save 不影响索引内容，索引在第 ② 步 receiver 链中写入即为完整数据。
 
 `add_to_index`（`src/documents/signals/handlers.py`）实现：
 ```python
@@ -579,26 +606,63 @@ def intersect_and_order(all_ids, filtered_qs, *, use_tantivy_sort):
 ```
 Celery task: documents.tasks.consume_file
   └─ DocumentConsumer.try_consume()
-       ├─ 根据 MIME 创建 DocumentParser 子类
-       ├─ document_parser.parse(working_copy, mime_type, ...)
-       │     └─ 设置 self.text = OCR 提取结果
-       ├─ text = document_parser.text
-       ├─ self._store(text, mime_type, date, page_count)
-       │     └─ Document.objects.create(..., content=text, ...)
-       ├─ ... 缩略图 / 归档文件 / 覆盖应用 ...
-       └─ document_consumption_finished.send(sender=..., document=..., ...)
-            └─ apps.py 中注册的 receiver 链
-                 ├─ set_correspondent / set_document_type / set_tags / ...
-                 ├─ add_to_index(sender, document)
-                 │    └─ get_backend().add_or_update(document,
-                 │              effective_content=document.get_effective_content())
-                 │         └─ WriteBatch
-                 │              ├─ filelock 获取 .tantivy.lock
-                 │              ├─ _build_tantivy_doc(document, effective_content)
-                 │              ├─ writer.delete_documents_by_query(id=pk)
-                 │              ├─ writer.add_document(doc)
-                 │              └─ writer.commit() + index.reload()
-                 └─ ...
+       ├─ document_parser.parse(working_copy, mime_type, produce_archive=...)
+       │     └─ 内部完成 OCR，提取文本 / 缩略图 / 归档 PDF / 页数
+       ├─ text = document_parser.get_text()
+       ├─ date = document_parser.get_date() (或回退到文件名解析)
+       ├─ thumbnail = document_parser.get_thumbnail(...)
+       ├─ archive_path = document_parser.get_archive_path()
+       ├─ page_count = document_parser.get_page_count(...)
+       │
+       └─ transaction.atomic()
+            │
+            ├─ ① 第一次 DB 保存
+            │    ├─ 新文档：self._store(text, mime_type, date, page_count)
+            │    │     └─ Document.objects.create(
+            │    │           title=..., content=text, mime_type=...,
+            │    │           checksum=..., created=..., page_count=...,
+            │    │           original_filename=self.filename
+            │    │        )
+            │    └─ 新版本：_create_version_from_root(root_doc, text, ...) + .save()
+            │
+            ├─ ② document_consumption_finished.send(sender=self.__class__,
+            │                                       document=document,
+            │                                       classifier=classifier, ...)
+            │    │  （注：此时媒体文件、归档文件尚未写入磁盘）
+            │    │
+            │    └─ apps.py 注册的 8 个 receiver 按序执行：
+            │         ├─ add_inbox_tags
+            │         ├─ set_correspondent(sender, document)  ← 修改 document.correspondent 并 save
+            │         ├─ set_document_type(sender, document)   ← 修改并 save
+            │         ├─ set_tags(sender, document)            ← 修改并 save
+            │         ├─ set_storage_path(sender, document)    ← 修改并 save
+            │         ├─ add_to_index(sender, document)        ← 索引写入在此处
+            │         │    └─ get_backend().add_or_update(document,
+            │         │              effective_content=document.get_effective_content())
+            │         │         └─ WriteBatch
+            │         │              ├─ filelock 获取 .tantivy.lock
+            │         │              ├─ _build_tantivy_doc(document, effective_content)
+            │         │              ├─ writer.delete_documents_by_query(id=pk)  ← upsert
+            │         │              ├─ writer.add_document(doc)
+            │         │              └─ writer.commit() + index.reload()
+            │         ├─ run_workflows_added
+            │         └─ add_or_update_document_in_llm_index
+            │
+            ├─ ③ FileLock(settings.MEDIA_LOCK) 媒体文件落盘
+            │    ├─ 生成唯一文件名 generated_filename → document.filename
+            │    ├─ 写入原始文件 → document.source_path
+            │    ├─ 写入缩略图 → document.thumbnail_path
+            │    └─ 归档 PDF 写入（若有）
+            │         ├─ 生成唯一归档名 → document.archive_filename
+            │         ├─ 写入 archive_path → document.archive_path
+            │         └─ document.archive_checksum = compute_checksum(...)
+            │
+            ├─ ④ document.save()  ← 仅持久化 filename / archive_filename / archive_checksum
+            │      （不触发 add_to_index，因为它是消费完成 Signal 的 receiver）
+            │
+            ├─ [若为新版本] document_updated.send(sender=..., document=root_document)
+            │
+            └─ 清理临时文件：unlink 原始文件 / working_copy / unmodified_original
 ```
 
 ### 搜索查询调用链
