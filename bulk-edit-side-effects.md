@@ -143,66 +143,181 @@ if affected_docs:
 
 [remove_tag](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L205-L223) 只有一次 `qs.delete()`（单条 DELETE SQL，原子）+ 一次 `apply_async`。
 
-### 3.4 modify_custom_fields：完全无事务——逐文档逐字段 update_or_create
+### 3.4 modify_custom_fields：最复杂的失败边界——逐文档逐字段 update_or_create + DOCUMENTLINK 对称反射
 
-[modify_custom_fields](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L287-L356) 是**最复杂**的事务/副作用边界，三层嵌套循环均无 transaction：
+[modify_custom_fields](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L287-L356) 是所有批量操作中**失败边界最复杂**的。在分析之前，先明确一个之前完全遗漏的事实：
 
-```python
-for field_id, value in add_custom_fields:             # 外层：每个自定义字段
-    for doc_id in affected_docs:                      # 中层：每个文档
-        CustomFieldInstance.objects.update_or_create(  # ① 每个 (doc, field) 独立 UPSERT
-            document_id=doc_id, field_id=field_id, defaults=defaults
-        )
-        if custom_field.data_type == DOCUMENTLINK:
-            doc = Document.objects.get(id=doc_id)
-            reflect_doclinks(doc, custom_field, value)  # ② 写目标文档的对称链接
-
-# 处理 remove_custom_fields 中的 DOCUMENTLINK 对称删除
-for doclink_being_removed_instance in ...:
-    for target_doc_id in doclink_being_removed_instance.value:
-        remove_doclink(...)                              # ③ 每个目标文档独立 UPDATE
-
-# 最后批量删除被移除的 CF
-CustomFieldInstance.objects.filter(...).hard_delete()    # ④
-
-bulk_update_documents.apply_async(...)                     # ⑤
-```
-
-#### reflect_doclinks 内部（[bulk_edit.py#L967-L1027](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L967-L1027)）
+#### 前置知识：哪些 ORM 操作触发同步信号副作用
 
 ```python
-# 先移除不再在列表中的对称链接（逐个 remove_doclink）
-for doc_id in current_field_instance.value:
-    if doc_id not in target_doc_ids:
-        remove_doclink(...)                                # 每个目标独立 save()
-
-# 再为目标文档添加或更新对称链接
-CustomFieldInstance.objects.bulk_create(...)               # 批量插入
-CustomFieldInstance.objects.bulk_update(..., ["value_document_ids"])  # 批量更新
-Document.objects.filter(id__in=target_doc_ids).update(modified=now)   # 更新 modified
+# signals/handlers.py 注册
+@receiver(post_save, sender=CustomFieldInstance)  # ← CustomFieldInstance 保存触发
+def update_filename_and_move_files(sender, instance, **kwargs):
+    ...  # 可能同步执行文件重命名/移动（如果文件名模板用到了 custom_fields）
 ```
 
-#### remove_doclink 内部（[bulk_edit.py#L1030-L1048](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L1030-L1048)）
+不同 ORM 操作的信号触发与原子性对照表：
+
+| ORM 操作 | 是否触发 `post_save(CustomFieldInstance)` | 是否触发同步文件重命名 | SQL 原子性 |
+|---|---|---|---|
+| `Model.save()`（单实例） | **是** | 如果模板用到 custom_fields 则**是** | 单条 UPDATE/INSERT，原子（零行失败） |
+| `update_or_create()` | **是**（底层调 `.save()`） | **是** | SELECT + 单条 INSERT/UPDATE（两条语句，非原子） |
+| `QuerySet.bulk_create(list)` | **否** | **否** | 单条 INSERT（多 VALUES），原子（零行失败） |
+| `QuerySet.bulk_update(list, fields)` | **否** | **否** | 单条 UPDATE（CASE WHEN），原子（零行失败） |
+| `QuerySet.update(field=value)` | **否** | **否** | 单条 UPDATE，原子（零行失败） |
+| `QuerySet.hard_delete()` | **否**（不触发 per-instance 信号） | **否** | 单条 DELETE，原子（零行失败） |
+
+`update_filename_and_move_files` 内部的异常处理：
+- 捕获 `(OSError, DatabaseError, CannotMoveFilesException)` 并尝试回滚文件位置，**不冒泡**。
+- 其他异常（如 `TypeError`、`AttributeError`、`ValueError` 等）**会冒泡**，终止整个批量操作。
+- 执行在全局 `FileLock(settings.MEDIA_LOCK)` 内。
+
+---
+
+#### 3.4.1 modify_custom_fields 完整执行路径与原子性逐行分析
 
 ```python
-target_doc_field_instance = CustomFieldInstance.objects.filter(...).first()
-if target_doc_field_instance is not None and document.id in target_doc_field_instance.value:
-    target_doc_field_instance.value.remove(document.id)
-    target_doc_field_instance.save()   # ← 独立 save()，自动提交
-Document.objects.filter(id=target_doc_id).update(modified=timezone.now())
+def modify_custom_fields(doc_ids, add_custom_fields, remove_custom_fields):
+    qs = Document.objects.filter(id__in=doc_ids).only("pk")
+    affected_docs = list(qs.values_list("pk", flat=True))   # 纯 SELECT
+    # ... 处理 add_custom_fields 格式转换 ...
+    custom_fields = CustomField.objects.filter(...)            # 纯 SELECT
+
+    # ═══════════════ 第一阶段：add_custom_fields ═══════════════
+    for field_id, value in add_custom_fields:                  # 外层：每个字段
+        for doc_id in affected_docs:                            # 中层：每个文档
+            # ── 步骤 ①：update_or_create 写源文档的 CustomFieldInstance ──
+            CustomFieldInstance.objects.update_or_create(     # 两条 SQL：SELECT + UPSERT
+                document_id=doc_id, field_id=field_id, defaults=defaults
+            )
+            #  ↑ 触发 post_save(CustomFieldInstance) → 同步执行 update_filename_and_move_files
+            #    可能同步移动 doc_id 对应的磁盘文件（如果文件名模板用了 custom_fields）
+            #    如果同步文件重命名抛非预期异常 → 冒泡终止整个批量操作
+
+            # ── 步骤 ②：DOCUMENTLINK 类型的对称反射 ──
+            if custom_field.data_type == DOCUMENTLINK and value and doc_id not in value:
+                doc = Document.objects.get(id=doc_id)          # 纯 SELECT
+                reflect_doclinks(doc, custom_field, value)     # 见 3.4.2
+
+    # ═══════════════ 第二阶段：remove_custom_fields 的 DOCUMENTLINK 对称删除 ═══════════════
+    for doclink_being_removed_instance in CustomFieldInstance.objects.filter(  # 纯 SELECT
+        document_id__in=affected_docs,
+        field__id__in=remove_custom_fields,
+        field__data_type=DOCUMENTLINK,
+        value_document_ids__isnull=False,
+    ):
+        for target_doc_id in doclink_being_removed_instance.value:
+            # ── 步骤 ③：对每个目标文档调用 remove_doclink ──
+            remove_doclink(                                    # 见 3.4.3
+                document=Document.objects.get(id=doclink_being_removed_instance.document.id),
+                field=doclink_being_removed_instance.field,
+                target_doc_id=target_doc_id,
+            )
+            #  ↑ 每次 remove_doclink 内部的 .save() 触发 post_save → 同步文件重命名（目标文档）
+
+    # ═══════════════ 第三阶段：批量硬删除被移除的 CustomFieldInstance ═══════════════
+    # ── 步骤 ④：hard_delete ──
+    CustomFieldInstance.objects.filter(
+        document_id__in=affected_docs,
+        field_id__in=remove_custom_fields,
+    ).hard_delete()                                          # 单条 DELETE SQL，原子
+    #  ↑ 不触发 post_save/post_delete（QuerySet 批量操作不触发 per-instance 信号）
+
+    # ═══════════════ 第四阶段：调度异步副作用 ═══════════════
+    # ── 步骤 ⑤：apply_async ──
+    bulk_update_documents.apply_async(...)
+    return "OK"
 ```
 
-**modify_custom_fields 的精确异常行为**：
+---
 
-| 抛错位置 | 已生效状态 |
+#### 3.4.2 reflect_doclinks 内部（[bulk_edit.py#L967-L1027](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L967-L1027)）
+
+对单个源文档 + 单个 DOCUMENTLINK 字段，向目标文档添加/移除对称链接：
+
+```python
+# Phase A：移除「旧值有、新值没有」的对称链接
+current_field_instance = CustomFieldInstance.objects.filter(...).first()  # SELECT
+if current_field_instance is not None and current_field_instance.value is not None:
+    for doc_id in current_field_instance.value:                          # 逐个旧目标
+        if doc_id not in target_doc_ids:
+            remove_doclink(document, field, target_doc_id=doc_id)        # 见 3.4.3
+            #  ↑ 每次循环：2 条独立 UPDATE（CF.save + Document.modified）
+            #    .save() 触发同步 post_save → 可能同步移动该目标文档的磁盘文件
+            #    某次循环抛异常 → 之前的循环已提交不回滚
+
+# Phase B：构建「新目标文档」的 CF 实例列表（纯内存操作）
+existing_custom_field_instances = { ... }                                 # SELECT
+custom_field_instances_to_create = []
+custom_field_instances_to_update = []
+for target_doc_id in target_doc_ids:
+    ...  # 决定是 create 还是 update，填入 Python 列表
+
+# Phase C：批量写入（3 条独立 SQL，均不触发信号）
+CustomFieldInstance.objects.bulk_create(custom_field_instances_to_create)       # ① 单条 INSERT，原子
+CustomFieldInstance.objects.bulk_update(                                       # ② 单条 UPDATE（CASE WHEN），原子
+    custom_field_instances_to_update, ["value_document_ids"]
+)
+Document.objects.filter(id__in=target_doc_ids).update(modified=timezone.now()) # ③ 单条 UPDATE，原子
+# ↑ 以上 3 条 SQL 各自原子（零行失败），但互相不在事务中
+# ↑ 如果 ① 成功，② 失败：create 的已提交，update 的零行，modified 不更新
+# ↑ 如果 ①② 成功，③ 失败：CF 已更新，目标文档 modified 未更新
+# ↑ 以上 3 条均不触发 post_save，所以不会同步重命名目标文档文件
+```
+
+---
+
+#### 3.4.3 remove_doclink 内部（[bulk_edit.py#L1030-L1048](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L1030-L1048)）
+
+单条对称链接的删除，**两条独立 SQL 语句**：
+
+```python
+def remove_doclink(document, field, target_doc_id):
+    target_doc_field_instance = CustomFieldInstance.objects.filter(
+        document_id=target_doc_id, field=field,
+    ).first()                                                         # SELECT
+    if target_doc_field_instance is not None and document.id in target_doc_field_instance.value:
+        target_doc_field_instance.value.remove(document.id)           # Python 列表修改
+        target_doc_field_instance.save()                               # ① UPDATE，原子
+        #  ↑ 触发 post_save(CustomFieldInstance) → 同步 update_filename_and_move_files
+        #    可能同步移动 target_doc_id 对应的磁盘文件
+    Document.objects.filter(id=target_doc_id).update(modified=timezone.now())  # ② UPDATE，原子
+```
+
+**精确失败边界（每次 remove_doclink 调用）**：
+
+| 抛错位置 | 已生效内容 |
 |---|---|
-| 第 1 个 (doc, field) 的 `update_or_create` | 干净，无任何变更 |
-| 处理完 doc1 的所有 field，doc2 的第 1 个 field 的 `update_or_create` | doc1 的 CustomFieldInstances 已写入提交；doc1 的 DOCUMENTLINK 对称反射可能已部分/全部完成 |
-| doc1 的 `reflect_doclinks` 中第 3 个目标文档的 `bulk_create` | doc1 自身的 CF 已写入；目标文档 1、2 的对称链接已写入提交；目标 3 未写入；`bulk_update_documents` 尚未调度 |
-| ④ `hard_delete()` | 所有 add 操作已提交；所有 remove 的 DOCUMENTLINK 对称反射已提交；硬删除尚未执行 |
-| ⑤ `apply_async` | **所有 DB 变更已提交**；但 bulk_update_documents 没调度，意味着不会触发搜索索引更新、工作流、文件重命名、WebSocket 推送 |
+| `.save()` 本身（数据库层） | 零行提交（单条 UPDATE 原子失败） |
+| `.save()` 后的 post_save 信号（update_filename_and_move_files 抛非预期异常） | **`.save()` 已提交**，CF value 已更新；但 modified 未更新；同步文件重命名部分执行（取决于异常位置） |
+| ② `Document.update(modified=...)` | `.save()` 已提交；同步文件重命名已执行；modified 未更新 |
 
-**结论**：`modify_custom_fields` 任何一步失败都会留下**部分提交的状态**，且越往后失败，已生效的变更越多。前端收到 400 无法感知实际变更量。
+---
+
+#### 3.4.4 modify_custom_fields 总览：逐步骤失败边界表
+
+假设输入：2 个文档（doc1, doc2）× 1 个 DOCUMENTLINK 字段，目标文档为 doc3, doc4；同时 remove 另一个 DOCUMENTLINK 字段含 doc5 目标。
+
+| 抛错位置 | 已生效（已提交，不回滚） | 未生效 | 同步副作用已发生 |
+|---|---|---|---|
+| 第 1 次 `update_or_create(doc1, field)` 的 SELECT 阶段 | 零 | 全部 | 零 |
+| 第 1 次 `update_or_create(doc1, field)` 的 UPSERT 成功，但 post_save 抛异常 | **doc1 的 CustomFieldInstance 已写入** | doc2 的 CF；所有对称反射；remove 阶段；hard_delete；bulk_update_documents | **doc1 的同步文件重命名部分执行（异常位置决定）** |
+| doc1 的 `reflect_doclinks` Phase A 第 1 次 `remove_doclink` 的 `.save()` 抛 DB 异常 | doc1 的 CF 已写入；之前的 remove_doclink 调用（如果有多目标移除）已提交 | doc1 其余目标；doc2 全部；bulk_create/bulk_update；remove 阶段；hard_delete | 之前 remove_doclink 触发的目标文档同步重命名 |
+| doc1 的 `reflect_doclinks` Phase C `bulk_create` 抛 IntegrityError（并发冲突） | doc1 的 CF；Phase A 中所有 remove_doclink 提交；同步重命名 | doc3, doc4 的 CF 实例（零行插入）；doc3, doc4 的 modified 更新；doc2 全部；remove 阶段；hard_delete | Phase A 中目标文档的同步重命名 |
+| doc1 的 `reflect_doclinks` Phase C `bulk_update` 失败 | doc1 的 CF；Phase A 所有提交；bulk_create 已写入（doc3, doc4 新增的 CF） | doc3, doc4 已有 CF 的 value 更新（零行）；doc3, doc4 的 modified；doc2 全部；remove 阶段；hard_delete | 同上 |
+| doc1 的 `reflect_doclinks` Phase C `Document.update(modified)` 失败 | doc1 的 CF；Phase A 所有提交；bulk_create；bulk_update | doc3, doc4 的 modified；doc2 全部；remove 阶段；hard_delete | 同上 |
+| doc2 的 `update_or_create` 抛异常 | doc1 的 CF；doc1 的全部 reflect_doclinks（含同步重命名） | doc2 的 CF；doc2 的 reflect_doclinks；remove 阶段；hard_delete | doc1 及其目标文档的同步重命名 |
+| remove 阶段第 2 次 `remove_doclink(doc5_target)` 抛异常 | 整个 add 阶段（doc1, doc2 的 CF，所有对称反射，所有同步重命名）；remove 阶段第 1 次 remove_doclink 已提交 | remove 阶段剩余目标；hard_delete；bulk_update_documents | 整个 add 阶段的同步重命名；remove 阶段已成功 remove_doclink 触发的同步重命名 |
+| `hard_delete()` 抛 DB 异常 | 整个 add 阶段；整个 remove 阶段（所有对称删除，所有同步重命名） | 被 remove 的 CustomFieldInstance 仍存在（未硬删）；bulk_update_documents | 同上 |
+| `bulk_update_documents.apply_async()` 抛错（broker 不可用） | **所有 DB 变更已全部提交**；所有同步副作用已发生 | bulk_update_documents 未调度 → 搜索索引不更新；工作流不执行；WebSocket 不推送；异步文件重命名不执行（但同步阶段已执行过的不会再执行） | 所有同步文件重命名已发生 |
+
+---
+
+**关键结论**：
+- `modify_custom_fields` 的每个 `update_or_create`、每个 `remove_doclink`、`reflect_doclinks` Phase A 的每次循环都是**独立提交点**，中途任何异常都会留下部分提交的状态。
+- `bulk_create`、`bulk_update`、`hard_delete()`、`QuerySet.update()` 各自是**原子单条 SQL**（零行失败），但它们之间不在事务中。
+- **同步副作用（文件重命名/移动）在 `.save()` 和 `update_or_create` 之后立即发生**，不等待批量操作完成，也不参与任何事务回滚。
+- 越往后期失败，已生效的变更越多；apply_async 失败时所有 DB 和文件系统变更已不可逆转，仅后台异步任务缺失。
 
 ### 3.5 set_permissions：无事务
 
@@ -543,7 +658,7 @@ Celery Worker: bulk_update_documents([doc1, doc2])
 | **add_tag** | **无** | **零行写入（bulk_create 原子失败，无 ignore_conflicts，零行插入）** | **bulk_create 前抛错（Tag.objects.get 失败）则不调度；bulk_create 成功但 apply_async 失败则不调度** |
 | remove_tag | 无（单条 DELETE 原子） | DELETE 成功则 tag 关系已移除 | DELETE 成功但 apply_async 失败则任务未调度 |
 | **modify_tags** | **transaction.atomic()** | **全部回滚** | 不调度 |
-| **modify_custom_fields** | **无** | **前面 (doc, field) 的 CF 已写入；DOCUMENTLINK 对称反射部分写入；目标文档 modified 已更新** | apply_async 前抛则不调度 |
+| **modify_custom_fields** | **无** | **每个 `update_or_create` / 每个 `remove_doclink` / reflect_doclinks Phase A 每次循环都是独立提交点；`bulk_create`/`bulk_update`/`hard_delete`各自原子（零行失败）但互相不在事务中；同步文件重命名在每次 `.save()`/`update_or_create` 后立即发生且不可逆** | apply_async 前抛则不调度 |
 | set_permissions | 无 | 前面文档的 owner 已 UPDATE；guardian 权限表逐文档写入到抛错点 | apply_async 前抛则不调度 |
 | merge/split/edit_pdf (delete_originals=False) | 无（只写临时文件） | 临时文件可能残留（OS 级） | apply_async 前抛则不调度 consume_file |
 | merge/split/edit_pdf (delete_originals=True) | ASN 释放+恢复保护 | ASN 可能已释放；apply_async 抛错时同步恢复 | apply_async 成功后 consume 失败会 link_error 恢复 ASN |
@@ -608,13 +723,16 @@ chord(header=consume_tasks)
 
 ---
 
-## 八、关键设计总结（二次修正版）
+## 八、关键设计总结（三次修正版）
 
-| 关注点 | 真实设计（二次修正后） |
+| 关注点 | 真实设计（三次修正后） |
 |---|---|
-| **同步/异步分界** | DB 元数据修改同步完成；搜索索引、工作流、WebSocket、文件重命名全部异步（bulk_update_documents） |
+| **同步/异步分界** | DB 元数据修改同步完成；搜索索引、工作流、WebSocket 全部异步（bulk_update_documents）；**文件重命名/移动分同步+异步两路**：`.save()`/`update_or_create` 触发 CustomFieldInstance.post_save → 同步重命名；Document.post_save 在 bulk_update_documents 中异步触发 |
 | **事务策略** | 仅 `modify_tags` 用 `transaction.atomic()` + `bulk_create(ignore_conflicts=True)`；其他元数据操作全部隐式自动提交，逐语句独立 |
 | **add_tag vs modify_tags** | add_tag：一次 bulk_create，无 ignore_conflicts，并发冲突抛 IntegrityError（零行插入）；modify_tags：transaction + ignore_conflicts，并发冲突静默跳过，失败全回滚 |
+| **modify_custom_fields 失败边界** | 每个 `update_or_create` / 每个 `remove_doclink` / reflect_doclinks Phase A 每次循环都是**独立提交点**；`bulk_create`/`bulk_update`/`hard_delete()`/`QuerySet.update()`各自是**原子单条 SQL**（零行失败），但互相不在事务中 |
+| **ORM 操作 vs 信号触发** | `.save()`/`update_or_create` 触发 post_save → 同步文件重命名；`bulk_create`/`bulk_update`/`QuerySet.update()`/`hard_delete()` **不触发** post_save，无同步副作用 |
+| **同步副作用（文件重命名）** | CustomFieldInstance post_save 同步触发 update_filename_and_move_files；捕获 `OSError/DatabaseError/CannotMoveFilesException` 不冒泡，其余异常冒泡终止整个批量；同步文件移动无事务回滚 |
 | **请求级事务** | BulkEditView 外层无事务；未开启 ATOMIC_REQUESTS；同步阶段抛错不回滚已提交 SQL |
 | **任务重试** | 仅 webhook 任务配置 `autoretry_for + max_retries=3`；bulk_update_documents / consume_file / delete / reprocess 均无应用级重试 |
 | **信号异常冒泡** | 用 `Signal.send()` 非 `send_robust()`；第一个 receiver 抛异常立即终止分发并冒泡；receiver 注册顺序：run_workflows_updated → send_websocket_document_updated |
@@ -623,18 +741,20 @@ chord(header=consume_tasks)
 | **delete 任务状态** | 内部 try/except 吞掉所有异常，return "OK" → Celery state=SUCCESS → PaperlessTask.Status=SUCCESS；task_failure_handler 不触发；即便实际删除失败也显示 SUCCESS |
 | **ASN 恢复任务追踪** | `restore_archive_serial_numbers_task`（link_error 回调）**不在** TRACKED_TASKS 中，失败不可观测，无 PaperlessTask 记录 |
 | **ASN 恢复机制** | apply_async 同步抛错 → 同步恢复；consume_file 异步失败 → Celery link_error 异步恢复；delete 子任务失败 → 不恢复 ASN |
-| **update_filename_and_move_files 异常** | 内部 try/except 吞异常，尝试回滚文件位置，异常不冒泡不影响任务状态 |
 | **并发安全** | 文件操作使用全局 FileLock；工作流每次 refresh_from_db；工作流保存时指定 update_fields 白名单避免回滚 filename 字段 |
 
 ---
 
-## 附：本次修正的前后矛盾对照表
+## 附：历次修正的前后矛盾对照表
 
-| 位置 | 之前的说法（矛盾/错误） | 修正后的事实 | 代码依据 |
-|---|---|---|---|
-| 3.3 add_tag 异常行为 | "某个祖先 tag 的 bulk_create 中途失败，前面 tag 的行已经插入" | 一次 bulk_create（包含所有 tag+祖先），无 ignore_conflicts，失败零行插入 | [bulk_edit.py#L193-L194](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L193-L194) |
-| 4.3 TRACKED_TASKS | "delete 子任务不在 TRACKED_TASKS 中" | delete 任务名 `"documents.bulk_edit.delete"` 明确登记；子任务与主任务是同一个函数，都被追踪 | [handlers.py#L1016](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1016) |
-| 7.3 chord 图 | "delete 子任务无独立 PaperlessTask 记录" | delete.si() 有独立 PaperlessTask 记录（TaskType.BULK_DELETE）；真正无记录的是 `restore_archive_serial_numbers_task` | [handlers.py#L1005-L1017](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017) |
-| 7.1 对照表 add_tag | "部分祖先 tag 的 DocumentTagRelationship 可能已插入" | "零行写入（bulk_create 原子失败，零行插入）" | [bulk_edit.py#L193-L194](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L193-L194) |
-| 3.1 modify_tags | 只提了 transaction.atomic，没提 ignore_conflicts | transaction.atomic + bulk_create(ignore_conflicts=True)，并发冲突静默跳过 | [bulk_edit.py#L272-L276](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L272-L276) |
-| 3.7 delete | 只说"被 @shared_task 装饰"，未明确是否追踪 | 任务名 `"documents.bulk_edit.delete"` 在 TRACKED_TASKS 中；含精确状态流转表 | [handlers.py#L1016](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1016) |
+| 轮次 | 位置 | 之前的说法（矛盾/错误） | 修正后的事实 | 代码依据 |
+|---|---|---|---|---|
+| 2 | 3.3 add_tag 异常行为 | "某个祖先 tag 的 bulk_create 中途失败，前面 tag 的行已经插入" | 一次 bulk_create（包含所有 tag+祖先），无 ignore_conflicts，失败零行插入 | [bulk_edit.py#L193-L194](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L193-L194) |
+| 2 | 4.3 TRACKED_TASKS | "delete 子任务不在 TRACKED_TASKS 中" | delete 任务名 `"documents.bulk_edit.delete"` 明确登记；子任务与主任务是同一个函数，都被追踪 | [handlers.py#L1016](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1016) |
+| 2 | 7.3 chord 图 | "delete 子任务无独立 PaperlessTask 记录" | delete.si() 有独立 PaperlessTask 记录（TaskType.BULK_DELETE）；真正无记录的是 `restore_archive_serial_numbers_task` | [handlers.py#L1005-L1017](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017) |
+| 2 | 7.1 对照表 add_tag | "部分祖先 tag 的 DocumentTagRelationship 可能已插入" | "零行写入（bulk_create 原子失败，零行插入）" | [bulk_edit.py#L193-L194](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L193-L194) |
+| 2 | 3.1 modify_tags | 只提了 transaction.atomic，没提 ignore_conflicts | transaction.atomic + bulk_create(ignore_conflicts=True)，并发冲突静默跳过 | [bulk_edit.py#L272-L276](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L272-L276) |
+| 2 | 3.7 delete | 只说"被 @shared_task 装饰"，未明确是否追踪 | 任务名 `"documents.bulk_edit.delete"` 在 TRACKED_TASKS 中；含精确状态流转表 | [handlers.py#L1016](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1016) |
+| **3** | **3.4 modify_custom_fields** | **笼统说"三层嵌套循环均无 transaction"，未区分各 ORM 操作的原子性差异，完全遗漏同步副作用** | **`update_or_create`/`.save()` 触发 post_save → 同步文件重命名；`bulk_create`/`bulk_update`/`QuerySet.update()`/`hard_delete()`不触发信号；循环内每次迭代是独立提交点；Phase C 三条 SQL 各自原子但互不在事务中** | [bulk_edit.py#L287-L356](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L287-L356)、[handlers.py#L431-L442](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L431-L442) |
+| **3** | **reflect_doclinks Phase C** | **未区分 bulk_create、bulk_update、modified 更新三条 SQL 的原子性和信号差异** | **三条 SQL 各自原子（零行失败）但互不在事务中；均不触发 post_save，无同步副作用；① 成功② 失败时 create 已提交 update 零行；①② 成功③ 失败时 modified 未更新** | [bulk_edit.py#L256-L265](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L256-L265) |
+| **3** | **remove_doclink** | **只说"独立 save()，自动提交"，未区分两条 SQL 和同步副作用** | **两条独立 UPDATE（CF.save + Document.modified）均原子但互不在事务中；.save() 触发 post_save → 同步文件重命名；save 成功但 modified 失败时 CF 已提交 modified 未更新** | [bulk_edit.py#L1030-L1048](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L1030-L1048) |
