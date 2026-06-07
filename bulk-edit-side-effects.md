@@ -58,22 +58,33 @@ except Exception as e:
 
 各函数内部事务情况差异极大，下面逐函数说明。
 
-### 3.1 modify_tags：唯一使用 transaction.atomic() 的元数据操作
+### 3.1 modify_tags：唯一使用 transaction.atomic() + ignore_conflicts=True 的元数据操作
 
-[modify_tags](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L226-L284) 是所有元数据编辑中**唯一**使用 `transaction.atomic()` 的函数：
+[modify_tags](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L226-L284) 是所有元数据编辑中**唯一**使用 `transaction.atomic()` 的函数，同时其 `bulk_create` 开启了 `ignore_conflicts=True`：
 
 ```python
 with transaction.atomic():
     if expanded_remove_tags:
         DocumentTagRelationship.objects.filter(...).delete()     # ①
     if expanded_add_tags:
-        DocumentTagRelationship.objects.bulk_create(to_create, ignore_conflicts=True)  # ②
+        existing_pairs = set(DocumentTagRelationship.objects.filter(...).values_list(...))
+        to_create = [DocumentTagRelationship(...) for (doc, tag) not in existing_pairs]
+        if to_create:
+            DocumentTagRelationship.objects.bulk_create(
+                to_create,
+                ignore_conflicts=True,   # ② 静默跳过唯一约束冲突的行
+            )
 # 事务提交后才调度异步任务
 if affected_docs:
     bulk_update_documents.apply_async(...)
 ```
 
-**异常行为**：如果 ① 或 ② 任何一步抛异常，整个事务回滚，`apply_async` 也不会执行。这是最"干净"的回滚。
+**关键事实**：
+- `ignore_conflicts=True` 意味着即使并发请求已经插入了相同的 (doc, tag) 对，数据库层面不会抛 IntegrityError，重复行被静默跳过，`bulk_create` 返回成功。
+- 只有非唯一约束类的数据库错误才会抛异常 → 触发 `transaction.atomic()` 回滚 → DELETE 和 INSERT 全部撤销，`apply_async` 也不会调度。
+- 这是所有批量元数据编辑中**最干净的回滚保证**。
+
+与 `add_tag`（单标签接口）的关键对比：`add_tag` 的 `bulk_create` **没有** `ignore_conflicts=True`，并发冲突会抛 IntegrityError（虽然由于单条 SQL 原子性也零行插入，但异常会冒泡到前端）。
 
 ### 3.2 set_correspondent / set_document_type / set_storage_path：单条 SQL 原子
 
@@ -91,25 +102,46 @@ return "OK"
 - 若 ② UPDATE 抛错（数据库层），没有已修改数据，返回 400。
 - 若 ② 成功、③ `apply_async` 抛错（如 broker 不可用）：**DB 中 correspondent 已更新且提交，但后台副作用任务没有被调度**。前端拿到 400，但文档属性实际已变。
 
-### 3.3 add_tag / remove_tag：多步独立语句，无事务
+### 3.3 add_tag / remove_tag：一次 bulk_create（无 ignore_conflicts）+ 无事务
 
 以 [add_tag](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L176-L202) 为例：
 
 ```python
-for t in tags_to_add:   # tag 本身 + 所有祖先
+tag_obj = Tag.objects.get(pk=tag)
+tags_to_add = [tag_obj, *tag_obj.get_ancestors()]   # tag 本身 + 所有祖先
+
+DocumentTagRelationship = Document.tags.through
+to_create = []
+affected_docs: set[int] = set()
+
+for t in tags_to_add:                        # 每个 tag（仅 SELECT，无写操作）
     qs = Document.objects.filter(Q(id__in=doc_ids) & ~Q(tags__id=t.id))
-    doc_ids_missing_tag = list(qs.values_list("pk", flat=True))   # 每条 SELECT 各自提交
-    affected_docs.update(...)
-    to_create.extend(DocumentTagRelationship(document_id=doc, tag_id=t.id) ...)
+    doc_ids_missing_tag = list(qs.values_list("pk", flat=True))
+    affected_docs.update(doc_ids_missing_tag)
+    to_create.extend(                         # 仅构建 Python 列表
+        DocumentTagRelationship(document_id=doc, tag_id=t.id)
+        for doc in doc_ids_missing_tag
+    )
 
 if to_create:
-    DocumentTagRelationship.objects.bulk_create(to_create)   # 单条 bulk INSERT
+    DocumentTagRelationship.objects.bulk_create(to_create)   # ① 一次 bulk INSERT，无 ignore_conflicts
 
 if affected_docs:
-    bulk_update_documents.apply_async(...)
+    bulk_update_documents.apply_async(...)                    # ②
 ```
 
-**异常行为**：如果某个祖先 tag 的 `bulk_create` 中途（数据库层唯一约束冲突等）失败，前面 tag 的行已经插入并提交，状态不完整。
+**关键事实**：
+- 整个 for 循环只做 SELECT 和 Python 列表构建，**不写 DB**。
+- 只有一次 `bulk_create(to_create)`，把 tag 及其所有祖先的 (doc, tag) 对**一次性**插入。
+- **没有 `ignore_conflicts=True`**。单条 INSERT 语句在数据库层面原子：任何一行违反唯一约束（如并发冲突），整条语句失败，**零行插入**。
+
+**异常行为**：
+- 若 ① `bulk_create` 抛 IntegrityError（如并发请求在 SELECT 和 INSERT 之间插入了相同的 (doc, tag)）：**零行插入**，DB 状态与调用前完全一致（无事务，也不需要回滚）。异常冒泡到视图，返回 400。
+- 若 ① 成功、② `apply_async` 抛错：所有 (doc, tag) 对已写入提交，但后台副作用任务未调度。
+
+对比 [modify_tags](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L226-L284) 的 `bulk_create(to_create, ignore_conflicts=True)`：modify_tags 在事务中且开启 ignore_conflicts，重复行会被静默跳过不抛错。
+
+[remove_tag](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L205-L223) 只有一次 `qs.delete()`（单条 DELETE SQL，原子）+ 一次 `apply_async`。
 
 ### 3.4 modify_custom_fields：完全无事务——逐文档逐字段 update_or_create
 
@@ -217,25 +249,42 @@ if delete_originals:
 
 chord 编排（split / edit_pdf + delete_original）同理，见 [bulk_edit.py#L673-L682](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L673-L682)。
 
-### 3.7 delete（bulk_edit.delete）：自身是 async task
+### 3.7 delete（bulk_edit.delete）：自身是 async task，且在 TRACKED_TASKS 中登记
 
-[delete](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L359-L392) 被 `@shared_task` 装饰，内部有 try/except：
+[delete](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L359-L392) 被 `@shared_task` 装饰，任务名 `"documents.bulk_edit.delete"` 在 [TRACKED_TASKS](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017) 中登记为 TaskType.BULK_DELETE。内部 try/except 吞掉所有异常：
 
 ```python
 try:
-    Document.objects.filter(id__in=delete_ids).delete()   # Django ORM delete，级联清理
-    with get_backend().batch_update() as batch:
+    Document.objects.filter(id__in=delete_ids).delete()   # ① Django ORM delete，级联清理
+    with get_backend().batch_update() as batch:           # ② Tantivy 搜索索引批量移除
         for id in delete_ids:
             batch.remove(id)
-    status_mgr.send_documents_deleted(delete_ids)
+    status_mgr.send_documents_deleted(delete_ids)          # ③ WebSocket 推送删除事件
 except Exception as e:
     if "Data too long for column" in str(e):
         logger.warning(...)
-    logger.error(f"Error deleting documents: {e!s}")       # 吞掉异常
-return "OK"
+    logger.error(f"Error deleting documents: {e!s}")       # ④ 吞掉异常
+return "OK"                                                  # ⑤ 正常返回
 ```
 
-**关键**：异常被捕获并记录日志，任务最终返回 "OK"，PaperlessTask 状态会被标记为 **SUCCESS**（不是 FAILURE）。即使文档删除或索引清理失败，任务层面看不出失败，只能查日志。
+**delete 任务的精确状态流转**（从 Celery 信号到 PaperlessTask）：
+
+| 阶段 | Celery 信号 | PaperlessTask 状态 | 触发条件 |
+|---|---|---|---|
+| 调度 | `before_task_publish` | **PENDING** | 调用 `delete.apply_async()` 或 `delete.si()` 时 |
+| 开始执行 | `task_prerun` | **STARTED** | Celery worker 开始执行 |
+| 执行中抛异常被 try/except 捕获 | — | STARTED（不变） | ①②③ 任何一步异常，走到 ④ |
+| 函数 return "OK" | `task_postrun` (state=SUCCESS) | **SUCCESS** | 函数正常返回（无论是否吞过异常） |
+| （理论路径）函数外抛异常 | `task_failure` | FAILURE | try/except 之外抛异常（当前代码不会发生） |
+
+**关键矛盾点澄清**：
+- 即便 ① 或 ② 或 ③ 内部抛异常并被 ④ 捕获，函数仍然走到 ⑤ `return "OK"`。Celery 看到的是 task 正常返回，state=SUCCESS。
+- `task_failure_handler` **不会**被触发（因为 Celery 只在 task 向外层抛异常时才发 task_failure 信号）。
+- `task_postrun_handler` 被触发，`_CELERY_STATE_TO_STATUS["SUCCESS"]` → `PaperlessTask.Status.SUCCESS`。
+- retval 是字符串 `"OK"`，不是 dict，所以不会触发 `task_postrun_handler` 中的 `isinstance(retval, dict)` 分支，也不会被改成 FAILURE。
+- 最终：**即使删除操作实际失败了，PaperlessTask.Status = SUCCESS**，失败信息仅在日志中。
+
+**部分失败的真实状态**：如果 ① `Document.objects.delete()` 只删除了部分文档（Django ORM delete 本身是事务性的，要么全部删除要么零个——因为级联删除在同一事务中；但如果 `batch.remove()` 中部分文档的索引删除失败，或 WebSocket 推送失败，这些都在 try 块内），被吞异常后任务仍返回 "OK"，PaperlessTask 仍为 SUCCESS。
 
 ### 3.8 reprocess：逐文档独立调度
 
@@ -350,9 +399,11 @@ PENDING ──▶ STARTED ──▶ SUCCESS
 | `task_failure` | Status = FAILURE，result_data（含 error_type / error_message / traceback）|
 | `task_revoked` | Status = REVOKED，date_done |
 
-被登记追踪的任务（[TRACKED_TASKS](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017)）：`consume_file`、`train_classifier`、`sanity_check`、`llmindex_index`、`empty_trash`、`check_scheduled_workflows`、**`bulk_update_documents`**（TaskType.BULK_UPDATE）、**`reprocess_document`**、`build_share_link_bundle`、**`bulk_edit.delete`**（TaskType.BULK_DELETE）。
+被登记追踪的任务（[TRACKED_TASKS](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017)：`consume_file`、`train_classifier`、`sanity_check`、`llmindex_index`、`empty_trash`、`check_scheduled_workflows`、**`bulk_update_documents`**（TaskType.BULK_UPDATE）、**`reprocess_document`**、`build_share_link_bundle`、**`bulk_edit.delete`**（TaskType.BULK_DELETE，任务名 `"documents.bulk_edit.delete"`）。
 
-注意 `consume_file` 在 link/link_error/chord 中的子任务（delete、restore_archive_serial_numbers_task）**不在 TRACKED_TASKS 中**，不会产生 PaperlessTask 记录。
+**关键事实**：
+- `delete.si(affected_docs)（merge/split/edit_pdf 中 link/chord 触发的删除子任务）使用的是**同一个** `bulk_edit.delete` 函数，Celery 任务名完全相同，**会被追踪**，会产生 PaperlessTask 记录（TaskType.BULK_DELETE）。
+- 真正**不在** TRACKED_TASKS 中的是 `restore_archive_serial_numbers_task（任务名 `"documents.bulk_edit.restore_archive_serial_numbers_task"`），它作为 link_error 回调失败补偿任务，失败时没有 PaperlessTask 记录，无法通过 PaperlessTask 追踪。
 
 ---
 
@@ -489,7 +540,7 @@ Celery Worker: bulk_update_documents([doc1, doc2])
 | set_correspondent | 无（单条 UPDATE 原子） | UPDATE 成功则 correspondent 已写入；否则无 | UPDATE 成功但 apply_async 失败则任务未调度 |
 | set_document_type | 无（单条 UPDATE 原子） | 同上 | 同上 |
 | set_storage_path | 无（单条 UPDATE 原子） | 同上 | 同上 |
-| add_tag | 无 | 部分祖先 tag 的 DocumentTagRelationship 可能已插入 | 取决于抛错位置，apply_async 前抛则不调度 |
+| **add_tag** | **无** | **零行写入（bulk_create 原子失败，无 ignore_conflicts，零行插入）** | **bulk_create 前抛错（Tag.objects.get 失败）则不调度；bulk_create 成功但 apply_async 失败则不调度** |
 | remove_tag | 无（单条 DELETE 原子） | DELETE 成功则 tag 关系已移除 | DELETE 成功但 apply_async 失败则任务未调度 |
 | **modify_tags** | **transaction.atomic()** | **全部回滚** | 不调度 |
 | **modify_custom_fields** | **无** | **前面 (doc, field) 的 CF 已写入；DOCUMENTLINK 对称反射部分写入；目标文档 modified 已更新** | apply_async 前抛则不调度 |
@@ -512,38 +563,78 @@ Celery Worker: bulk_update_documents([doc1, doc2])
 
 ```
                     consume_file 成功
-                   ┌───────────────────────────────▶ delete(原文档)
-                   │                                (独立任务，若失败 ASN 不自动恢复，
-                   │                                 无独立 PaperlessTask 记录)
+                   ┌───────────────────────────────▶ delete.si(原文档) = bulk_edit.delete
+                   │                                (独立 Celery 任务，任务名 "documents.bulk_edit.delete"，
+                   │                                 **在 TRACKED_TASKS 中** → 有独立 PaperlessTask 记录)
+                   │                                 若该任务内部 try/except 吞掉异常 → Status = SUCCESS
+                   │                                 若该任务抛异常（理论上不会，因为被内部 try/except 捕获）→ Status = FAILURE
+                   │                                 任务失败时 ASN 不会自动恢复（因为恢复 ASN 的 link_error 只挂在 consume_file 上）
                    │
 chord(header=consume_tasks)
                    │
                    │ consume_file 失败
-                   └───────────────────────────────▶ restore_archive_serial_numbers_task
-                                                     (独立任务，不在 TRACKED_TASKS 中)
+                   └───────────────────────────────▶ restore_archive_serial_numbers_task.s(backup)
+                                                     (独立 Celery 任务，任务名 "documents.bulk_edit.restore_archive_serial_numbers_task"，
+                                                      **不在 TRACKED_TASKS 中** → 没有 PaperlessTask 记录)
 ```
 
-### 7.4 bulk_edit.delete（async task）失败
+**任务追踪精确对照表**（以 merge delete_originals=True 为例）：
 
-异常被 try/except 吞掉，返回 "OK"，所以：
-- PaperlessTask.Status = **SUCCESS**（不是 FAILURE！）
-- 部分文档可能已被删除，部分未删除
-- 搜索索引可能部分更新
-- 错误信息仅出现在日志中
+| 任务 | 任务名 | 是否在 TRACKED_TASKS | 是否有 PaperlessTask |
+|---|---|---|---|
+| consume_file（主任务） | `documents.tasks.consume_file` | 是（CONSUME_FILE） | 是 |
+| delete.si(原文档)（link 回调） | `documents.bulk_edit.delete` | 是（BULK_DELETE） | 是 |
+| restore_archive_serial_numbers_task（link_error 回调） | `documents.bulk_edit.restore_archive_serial_numbers_task` | **否** | **否** |
+
+所以：如果 delete 子任务部分删除失败，PaperlessTask 状态仍为 SUCCESS（因为内部 try/except 吞异常），且 ASN 不会恢复，只能通过日志发现。如果 restore_archive_serial_numbers_task 本身执行失败，由于不在 TRACKED_TASKS，没有任何 PaperlessTask 记录，完全不可观测，只能看日志。
+
+### 7.4 bulk_edit.delete（async task）失败可观测性
+
+详见 3.7 节完整分析。此处列出**前后矛盾的修正点**：
+
+**之前的矛盾**：文档一方面说 delete 任务在 TRACKED_TASKS 中（有 PaperlessTask 记录），另一方面又说 link/chord 中的 delete 子任务"无独立 PaperlessTask 记录"。
+
+**修正后的事实**：
+- `bulk_edit.delete` 的任务名是 `"documents.bulk_edit.delete"`，明确在 [TRACKED_TASKS](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017) 中登记（TaskType.BULK_DELETE）。
+- 无论是通过 `BulkEditView.post()` 直接调度的 `delete.apply_async()`，还是通过 Celery `link=[delete.si(affected_docs)]` / `chord(body=delete.si([...]))` 调度的子任务，使用的都是**同一个** `delete` 函数，任务名相同，**都会**被追踪，都会产生 PaperlessTask 记录。
+- 真正不在 TRACKED_TASKS 中的是 `restore_archive_serial_numbers_task`（任务名 `"documents.bulk_edit.restore_archive_serial_numbers_task"`）。
+
+**delete 任务的最终状态**（无论哪条调度路径）：
+- 内部 try/except 吞掉所有异常 → `return "OK"` → Celery state = SUCCESS
+- `task_postrun_handler` 触发 → PaperlessTask.Status = **SUCCESS**
+- `task_failure_handler` 不触发
+- retval 是字符串 "OK"（不是 dict），不会被特殊分支改为 FAILURE
+- **所以即便删除部分失败，PaperlessTask 仍为 SUCCESS**，失败信息仅出现在日志中
 
 ---
 
-## 八、关键设计总结（修正版）
+## 八、关键设计总结（二次修正版）
 
-| 关注点 | 真实设计（修正后） |
+| 关注点 | 真实设计（二次修正后） |
 |---|---|
 | **同步/异步分界** | DB 元数据修改同步完成；搜索索引、工作流、WebSocket、文件重命名全部异步（bulk_update_documents） |
-| **事务策略** | 仅 `modify_tags` 用 `transaction.atomic()`；其他元数据操作全部隐式自动提交，逐语句独立 |
+| **事务策略** | 仅 `modify_tags` 用 `transaction.atomic()` + `bulk_create(ignore_conflicts=True)`；其他元数据操作全部隐式自动提交，逐语句独立 |
+| **add_tag vs modify_tags** | add_tag：一次 bulk_create，无 ignore_conflicts，并发冲突抛 IntegrityError（零行插入）；modify_tags：transaction + ignore_conflicts，并发冲突静默跳过，失败全回滚 |
 | **请求级事务** | BulkEditView 外层无事务；未开启 ATOMIC_REQUESTS；同步阶段抛错不回滚已提交 SQL |
 | **任务重试** | 仅 webhook 任务配置 `autoretry_for + max_retries=3`；bulk_update_documents / consume_file / delete / reprocess 均无应用级重试 |
 | **信号异常冒泡** | 用 `Signal.send()` 非 `send_robust()`；第一个 receiver 抛异常立即终止分发并冒泡；receiver 注册顺序：run_workflows_updated → send_websocket_document_updated |
 | **bulk_update_documents 失败** | 外层 for 无 try/except；单个文档的信号异常导致整个任务失败，已处理文档的副作用不回滚 |
+| **delete 任务追踪** | `"documents.bulk_edit.delete"` 明确登记在 TRACKED_TASKS（TaskType.BULK_DELETE），包括 BulkEditView 直接调度和 Celery link/chord 子任务调度的两种场景；均会产生 PaperlessTask 记录 |
+| **delete 任务状态** | 内部 try/except 吞掉所有异常，return "OK" → Celery state=SUCCESS → PaperlessTask.Status=SUCCESS；task_failure_handler 不触发；即便实际删除失败也显示 SUCCESS |
+| **ASN 恢复任务追踪** | `restore_archive_serial_numbers_task`（link_error 回调）**不在** TRACKED_TASKS 中，失败不可观测，无 PaperlessTask 记录 |
 | **ASN 恢复机制** | apply_async 同步抛错 → 同步恢复；consume_file 异步失败 → Celery link_error 异步恢复；delete 子任务失败 → 不恢复 ASN |
-| **bulk_edit.delete 失败可观测性** | 异常被内部捕获，PaperlessTask 状态为 SUCCESS，失败信息仅在日志中 |
 | **update_filename_and_move_files 异常** | 内部 try/except 吞异常，尝试回滚文件位置，异常不冒泡不影响任务状态 |
 | **并发安全** | 文件操作使用全局 FileLock；工作流每次 refresh_from_db；工作流保存时指定 update_fields 白名单避免回滚 filename 字段 |
+
+---
+
+## 附：本次修正的前后矛盾对照表
+
+| 位置 | 之前的说法（矛盾/错误） | 修正后的事实 | 代码依据 |
+|---|---|---|---|
+| 3.3 add_tag 异常行为 | "某个祖先 tag 的 bulk_create 中途失败，前面 tag 的行已经插入" | 一次 bulk_create（包含所有 tag+祖先），无 ignore_conflicts，失败零行插入 | [bulk_edit.py#L193-L194](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L193-L194) |
+| 4.3 TRACKED_TASKS | "delete 子任务不在 TRACKED_TASKS 中" | delete 任务名 `"documents.bulk_edit.delete"` 明确登记；子任务与主任务是同一个函数，都被追踪 | [handlers.py#L1016](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1016) |
+| 7.3 chord 图 | "delete 子任务无独立 PaperlessTask 记录" | delete.si() 有独立 PaperlessTask 记录（TaskType.BULK_DELETE）；真正无记录的是 `restore_archive_serial_numbers_task` | [handlers.py#L1005-L1017](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017) |
+| 7.1 对照表 add_tag | "部分祖先 tag 的 DocumentTagRelationship 可能已插入" | "零行写入（bulk_create 原子失败，零行插入）" | [bulk_edit.py#L193-L194](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L193-L194) |
+| 3.1 modify_tags | 只提了 transaction.atomic，没提 ignore_conflicts | transaction.atomic + bulk_create(ignore_conflicts=True)，并发冲突静默跳过 | [bulk_edit.py#L272-L276](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/bulk_edit.py#L272-L276) |
+| 3.7 delete | 只说"被 @shared_task 装饰"，未明确是否追踪 | 任务名 `"documents.bulk_edit.delete"` 在 TRACKED_TASKS 中；含精确状态流转表 | [handlers.py#L1016](file:///d:/fz/0601/solo-dogfeeding/code/61-paperless-ngx/src/documents/signals/handlers.py#L1016) |
