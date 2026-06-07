@@ -42,14 +42,38 @@ Tantivy Index (磁盘)                    ▼
 
 ## 一、OCR 文本提取 → 数据库存储
 
-### 1.1 解析器提取文本
+### 1.1 解析器方法职责边界
 
-文档消费由 `DocumentConsumer.try_consume()` 驱动，位于 `src/documents/consumer.py`。核心流程：
+`DocumentConsumer.try_consume()` 位于 `src/documents/consumer.py`，是消费流程的驱动入口。解析器基类在 `src/documents/parsers.py`，其各方法有严格的职责划分：
 
-1. 根据 MIME 类型选择具体的 `DocumentParser` 子类（如 Tesseract OCR 解析器，基类在 `src/documents/parsers.py`）。
-2. 调用 `document_parser.parse(working_copy, mime_type, produce_archive=...)`。
-3. 解析器内部完成 OCR/文本抽取，将结果写入 `self.text` 实例属性。
-4. 后续通过 `document_parser.text`（或等价方式）取出字符串，连同解析到的日期、页数等一起存入数据库。
+| 方法 | 参数 | 职责 | 产物（内部状态 / 返回值） |
+|------|------|------|---------------------------|
+| `parse(document_path, mime_type, produce_archive=...)` | 文档路径 + MIME + 是否生成归档 | 核心 OCR / 文本抽取 + 日期识别 + 可选归档 PDF 生成 | 设置内部属性 `self.text`、`self.date`、`self.archive_path`（无返回值） |
+| `get_text()` | 无参 | 只读 getter | 返回 `self.text`（parse 的产物） |
+| `get_date()` | 无参 | 只读 getter | 返回 `self.date`（parse 的产物，可能为 None） |
+| `get_archive_path()` | 无参 | 只读 getter | 返回 `self.archive_path`（parse 的产物，若 produce_archive=False 则为 None） |
+| `get_thumbnail(document_path, mime_type)` | **文档路径 + MIME**（独立传参） | 独立生成缩略图（不依赖 parse 的内部状态） | 返回缩略图临时文件路径 |
+| `get_page_count(document_path, mime_type)` | **文档路径 + MIME**（独立传参） | 独立计算页数（不依赖 parse 的内部状态） | 返回 int 或 None |
+
+DocumentConsumer 中的**精确调用顺序**（`consumer.py` 第 505-553 行，全部在同一个 `try` 块内）：
+
+```
+① produce_archive = should_produce_archive(document_parser, mime_type, working_copy, ...)
+② document_parser.parse(working_copy, mime_type, produce_archive=produce_archive)
+     └─ 仅设置 self.text / self.date / self.archive_path（若开启归档）
+③ thumbnail = document_parser.get_thumbnail(working_copy, mime_type)
+     └─ 独立生成缩略图（parse 之后执行，传 working_copy 和 mime_type）
+④ text = document_parser.get_text()               ← 无参 getter
+⑤ date = document_parser.get_date()               ← 无参 getter；若 None 则回退到文件名解析
+⑥ archive_path = document_parser.get_archive_path()  ← 无参 getter
+⑦ page_count = document_parser.get_page_count(working_copy, mime_type)
+     └─ 独立计算页数（parse 之后执行，传 working_copy 和 mime_type）
+```
+
+**关键事实：**
+- `parse()` **不负责**生成缩略图和计算页数——这两项由独立方法完成，且都需要重新传入文档路径和 MIME 类型。
+- `get_text()` / `get_date()` / `get_archive_path()` 是纯 getter，不执行任何计算。
+- 若 `get_date()` 返回 None，Consumer 会进一步调用外部日期解析器（基于文件名和文本内容回退识别）。
 
 ### 1.2 Document 模型中的内容字段
 
@@ -606,13 +630,17 @@ def intersect_and_order(all_ids, filtered_qs, *, use_tantivy_sort):
 ```
 Celery task: documents.tasks.consume_file
   └─ DocumentConsumer.try_consume()
-       ├─ document_parser.parse(working_copy, mime_type, produce_archive=...)
-       │     └─ 内部完成 OCR，提取文本 / 缩略图 / 归档 PDF / 页数
-       ├─ text = document_parser.get_text()
-       ├─ date = document_parser.get_date() (或回退到文件名解析)
-       ├─ thumbnail = document_parser.get_thumbnail(...)
-       ├─ archive_path = document_parser.get_archive_path()
-       ├─ page_count = document_parser.get_page_count(...)
+       ├─ produce_archive = should_produce_archive(...)
+       ├─ ① document_parser.parse(working_copy, mime_type, produce_archive=produce_archive)
+       │     └─ 仅设置内部状态：self.text / self.date / self.archive_path
+       ├─ ② thumbnail = document_parser.get_thumbnail(working_copy, mime_type)
+       │     └─ 独立生成缩略图（parse 之后，不依赖 parse 内部状态）
+       ├─ ③ text = document_parser.get_text()               ← 纯 getter
+       ├─ ④ date = document_parser.get_date()
+       │     └─ [若 None] 回退：get_date_parser().parse(filename, text)
+       ├─ ⑤ archive_path = document_parser.get_archive_path()  ← 纯 getter
+       ├─ ⑥ page_count = document_parser.get_page_count(working_copy, mime_type)
+       │     └─ 独立计算页数（parse 之后，不依赖 parse 内部状态）
        │
        └─ transaction.atomic()
             │
