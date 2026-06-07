@@ -6,7 +6,7 @@ Paperless-ngx 中的 Saved Views（保存视图）与文档列表状态形成了
 
 - **后端**：存储 SavedView 配置（筛选规则、排序、显示模式等），基于 owner + django-guardian 对象权限控制可见范围
 - **前端**：通过 `DocumentListViewService` 管理当前列表状态，支持从 SavedView 加载、修改后回写、URL 参数同步
-- **用户 Scope**：由三层机制共同决定 SavedView 的可见性、可编辑性、删除权限和侧边栏/仪表盘入口
+- **用户 Scope**：由两层核心权限 + 一层 UI 偏好 + 派生标记/兼容层共同决定 SavedView 的可见性、可编辑性、删除权限和侧边栏/仪表盘入口
 
 ---
 
@@ -68,18 +68,26 @@ settings.saved_views.warn_on_unsaved_change       # 是否警告未保存修改
 
 ---
 
-## 3. 用户 Scope 机制：对象权限、可见性标记、列表入口
+## 3. 用户 Scope 机制：对象权限、全局权限、UI 偏好、派生标记、兼容层
 
-SavedView 的"用户 Scope"由以下**四层独立但相互协作**的机制共同决定：
+SavedView 的"用户 Scope"由以下**两层核心权限 + 一层 UI 偏好 + 派生标记/兼容层**共同决定：
 
-| 机制 | 存储位置 | 影响范围 |
-|------|---------|---------|
-| 对象权限（owner + django-guardian） | SavedView.owner + guardian UserObjectPermission/GroupObjectPermission | 是否能看到对象、是否能编辑、是否能删除 |
-| user_can_change 字段 | 序列化时动态计算（只读） | 前端快速判断是否可编辑 |
-| Dashboard/Sidebar 可见性设置 | 当前用户的 UiSettings.settings["saved_views"] | 是否出现在侧边栏/仪表盘入口 |
-| 旧版兼容字段（show_on_dashboard/show_in_sidebar） | 序列化层（API v9）模拟 | 兼容旧 API 客户端 |
+**核心层（真正决定行为）：
 
-### 3.1 层一：对象级权限（决定能否看到、编辑、删除）
+| 层级 | 机制 | 存储位置 | 影响范围 |
+|------|------|---------|---------|
+| 1 | 对象级权限（owner + django-guardian） | SavedView.owner + guardian UserObjectPermission/GroupObjectPermission | 是否能看到对象、是否能编辑、是否能删除具体 SavedView 对象 |
+| 2 | 全局 model-level 权限（Django 全局权限） | Django auth_permissions 表 | 是否能对该**类型**执行 add/view/change/delete（与具体对象无关）|
+| 3 | Dashboard/Sidebar 可见性设置 | 当前用户的 UiSettings.settings["saved_views"] | 是否出现在侧边栏/仪表盘入口 |
+
+**辅助/派生层（只读输出或兼容实现）：
+
+| 层级 | 机制 | 存储位置 | 影响范围 |
+|------|------|---------|---------|
+| A | user_can_change / permissions 字段 | 序列化时动态计算（只读派生标记） | 前端快速判断是否可编辑 |
+| B | 旧版兼容字段（show_on_dashboard/show_in_sidebar） | 序列化层（API v9）模拟 | 兼容旧 API 客户端，实际读写 UiSettings |
+
+### 3.1 核心层一：对象级权限（决定能否看到、编辑、删除具体 SavedView 对象）
 
 #### 3.1.1 所有权模型
 
@@ -162,9 +170,50 @@ class SavedViewViewSet(BulkPermissionMixin, PassUserMixin, ModelViewSet[SavedVie
 - `PaperlessObjectPermissions`：操作级权限（GET/PUT/PATCH/DELETE）
 - `ObjectOwnedOrGrantedPermissionsFilter`：查询结果过滤（list 时只返回可见对象）
 
-### 3.2 层二：user_can_change 字段（前端快速判断标记）
+### 3.2 核心层二：全局 model-level 权限（Django 全局权限）
 
-#### 3.2.1 后端计算逻辑
+全局 model-level 权限由 Django 内置的 auth_permissions 表定义（如 `documents.add_savedview`、`documents.view_savedview`、`documents.change_savedview`、`documents.delete_savedview`），与具体 SavedView 对象无关，由用户组或用户直接分配。
+
+#### 3.2.1 前端检查：currentUserCan 与 *pngxIfPermissions
+
+`*pngxIfPermissions` 指令定义于 [if-permissions.directive.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/directives/if-permissions.directive.ts#L28-L36)，调用 `permissionsService.currentUserCan(action, type)`：
+
+```typescript
+public currentUserCan(
+  action: PermissionAction,
+  type: PermissionType
+): boolean {
+  return (
+    this.currentUser?.is_superuser ||
+    this.permissions?.includes(this.getPermissionCode(action, type))
+  )
+}
+```
+
+判断逻辑：`currentUser.is_superuser` **OR** 用户的全局权限列表包含对应 permission code。
+
+`getPermissionCode` 将 `PermissionAction.Change + PermissionType.SavedView` 拼接为 `change_savedview`（对应 Django 权限 `documents.change_savedview`）。
+
+这是 SavedViewsComponent 中 Permissions 按钮和 Delete 按钮显示的**第二层**必要条件（AND）。
+
+#### 3.2.2 后端检查：DjangoObjectPermissions.has_permission
+
+`PaperlessObjectPermissions` 继承自 `DjangoObjectPermissions`，其基类的 `has_permission` 方法会检查请求用户是否具有全局的 model-level 权限（perms_map 中定义的 HTTP 方法对应的权限）。
+
+例如 `DELETE /api/saved_views/:id` 请求在到达对象级判断之前，会先通过 `has_permission` 检查用户是否有全局 `documents.delete_savedview` 权限（或用户是 superuser）。
+
+#### 3.2.3 全局权限 vs 对象级权限的关系
+
+| 检查阶段 | 位置 | 决定什么 |
+|---------|------|---------|
+| `has_permission`（全局） | DjangoObjectPermissions 基类 | 用户是否有权对该类型执行该 HTTP 操作 |
+| `has_object_permission`（对象级） | PaperlessObjectPermissions | 用户是否有权对这个**具体对象**执行操作 |
+
+两者都通过，请求才会被允许。
+
+### 3.3 派生层 A：user_can_change / permissions 字段（只读序列化派生标记）
+
+#### 3.3.1 后端计算逻辑
 
 定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L354-L363) 的 `OwnedObjectSerializer.get_user_can_change`：
 
@@ -186,7 +235,7 @@ def get_user_can_change(self, obj) -> bool:
 
 这个字段与 3.1.3 节中 `PaperlessObjectPermissions.has_object_permission` 对 PUT/PATCH 的判断**完全一致**，区别在于它是序列化时**附加到响应对象**的一个布尔标记，供前端直接读取，无需再做权限判断。
 
-#### 3.2.2 字段返回条件（full_perms 参数）
+#### 3.3.2 字段返回条件（full_perms 参数）
 
 定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L267-L278)：
 
@@ -219,7 +268,7 @@ def get_permissions(self, obj) -> dict:
     }
 ```
 
-#### 3.2.3 前端使用 user_can_change
+#### 3.3.3 前端使用 user_can_change
 
 定义于 [permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/permissions.service.ts#L75-L97)：
 
@@ -251,11 +300,11 @@ public currentUserHasObjectPermissions(
 
 前端判断 Change 权限时，会**同时**使用 `currentUserOwnsObject`、`object.user_can_change` 以及完整的 `permissions.change` 列表，任意一个满足即可。
 
-### 3.3 层三：Dashboard/Sidebar 可见性设置（用户个人偏好）
+### 3.4 核心层三：Dashboard/Sidebar 可见性设置（用户个人 UI 偏好）
 
 这一层与 SavedView 对象权限**完全解耦**，是每个用户自己的 UI 偏好，不影响 SavedView 对象本身。
 
-#### 3.3.1 存储位置
+#### 3.4.1 存储位置
 
 存储在请求用户自己的 `UiSettings.settings` JSON 中：
 
@@ -266,7 +315,7 @@ UiSettings.settings["saved_views"]["sidebar_views_visible_ids"]   = [1, 3, 9]
 
 该设置是**用户私有**的：不同用户对同一个 SavedView 可以有不同的可见性设置。
 
-#### 3.3.2 前端注入：SavedViewService.withUserVisibility
+#### 3.4.2 前端注入：SavedViewService.withUserVisibility
 
 定义于 [saved-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/rest/saved-view.service.ts#L75-L95)：
 
@@ -289,7 +338,7 @@ private isDashboardVisible(view: SavedView): boolean {
 
 每次 `SavedViewService.list()` 返回结果时，前端会**根据当前用户的 UiSettings 动态注入** `show_on_dashboard` 和 `show_in_sidebar` 两个布尔字段。这两个字段**不回写到 SavedView 对象**，仅用于前端 UI 展示。
 
-#### 3.3.3 保存可见性设置
+#### 3.4.3 保存可见性设置
 
 定义于 [settings.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/settings.service.ts#L728-L739)：
 
@@ -336,7 +385,7 @@ public save() {
 }
 ```
 
-#### 3.3.4 侧边栏/仪表盘列表入口
+#### 3.4.4 侧边栏/仪表盘列表入口
 
 定义于 [saved-view.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/rest/saved-view.service.ts#L97-L127)：
 
@@ -358,11 +407,11 @@ get dashboardViews(): SavedView[] {
 
 注意：这里的 `this.savedViews` 已经经过 3.1.2 节的后端过滤，只包含用户有权查看的 SavedView。`sidebarViews` / `dashboardViews` 在此基础上再应用用户个人的可见性偏好。
 
-### 3.4 层四：旧版 API 兼容（show_on_dashboard/show_in_sidebar 字段模拟）
+### 3.5 派生层 B：旧版 API 兼容（show_on_dashboard/show_in_sidebar 字段模拟）
 
 API v10 将 show_on_dashboard/show_in_sidebar 从 SavedView 模型迁移到了 UiSettings。为保持向后兼容，v9 API 仍在序列化层模拟这两个字段。
 
-#### 3.4.1 序列化时注入（GET）
+#### 3.5.1 序列化时注入（GET）
 
 定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1409-L1434)：
 
@@ -385,7 +434,7 @@ def to_representation(self, instance):
 
 这意味着 v9 API 返回的 `show_on_dashboard` / `show_in_sidebar` 是**请求用户个人**的可见性偏好，而非 SavedView 对象的固有属性。
 
-#### 3.4.2 反序列化时提取（PUT/PATCH/POST）
+#### 3.5.2 反序列化时提取（PUT/PATCH/POST）
 
 定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1436-L1460)：
 
@@ -406,7 +455,7 @@ def to_internal_value(self, data):
     return ret
 ```
 
-#### 3.4.3 持久化到 UiSettings
+#### 3.5.3 持久化到 UiSettings
 
 定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L1350-L1408) 的 `_update_legacy_visibility_preferences`，以及在 `create` / `update` 中调用：
 
@@ -468,20 +517,31 @@ public canDeleteSavedView(view: SavedView): boolean {
 }
 ```
 
-`currentUserOwnsObject` 定义于 [permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/permissions.service.ts#L55-L67)：
+`currentUserOwnsObject` 定义于 [permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/permissions.service.ts#L66-L73)：
 
 ```typescript
-public currentUserOwnsObject(object: ObjectWithOwner): boolean {
+public currentUserOwnsObject(object: ObjectWithPermissions): boolean {
   return (
-    this.currentUserIsSuperuser ||                 // 全局 superuser
-    object.owner === undefined ||                   // 无 owner 字段
-    object.owner === null ||                        // owner = null（无主）
-    object.owner === this.currentUser.id            // owner 是当前用户
+    !object ||                                // object 本身为 falsy（undefined/null）
+    !object.owner ||                          // owner 为 falsy（undefined/null/0 等，即无主）
+    this.currentUser.is_superuser ||          // 当前用户是 Django superuser
+    object.owner === this.currentUser.id      // owner 就是当前用户
   )
 }
 ```
 
-**结论**：这个 `@if` 条件控制整个 Actions 列（包括 Permissions + Delete 两个按钮）是否出现。仅 superuser / owner / 对象无主 时可见。
+`ObjectWithPermissions` 接口定义于 [object-with-permissions.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/data/object-with-permissions.ts#L14-L22)：
+
+```typescript
+export interface ObjectWithPermissions extends ObjectWithId {
+  owner?: number
+  permissions?: PermissionsObject
+  user_can_change?: boolean
+  is_shared_by_requester?: boolean
+}
+```
+
+**结论**：这个 `@if` 条件控制整个 Actions 列（包括 Permissions + Delete 两个按钮）是否出现。仅 `!object` / owner 为 falsy（无主）/ `currentUser.is_superuser` / owner == 当前用户 时可见。
 
 #### 4.1.2 Permissions 按钮：model-level Change 权限
 
@@ -497,8 +557,8 @@ public currentUserOwnsObject(object: ObjectWithOwner): boolean {
 `*pngxIfPermissions` 指令定义于 [if-permissions.directive.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/directives/if-permissions.directive.ts#L28-L36)，调用 `permissionsService.currentUserCan(action, type)` —— 这是**全局 model-level 权限**检查（即用户是否有 `documents.change_savedview` 这个 Django 全局权限，与具体 SavedView 对象无关）。
 
 **Permissions 按钮显示条件（AND）**：
-1. `canDeleteSavedView(view)` = true（superuser / owner / 无主）
-2. `*pngxIfPermissions(Change, SavedView)` = true（全局有 change_savedview 权限）
+1. `canDeleteSavedView(view)` = true（`!object` / owner 为 falsy 无主 / `currentUser.is_superuser` / owner == 当前用户）—— 外层 `@if`
+2. `*pngxIfPermissions(Change, SavedView)` = true（全局有 `documents.change_savedview` 权限）—— 指令级检查
 
 #### 4.1.3 Delete 按钮：双重权限判断
 
@@ -514,7 +574,7 @@ public currentUserOwnsObject(object: ObjectWithOwner): boolean {
 Delete 按钮同样有两层判断：
 
 **Delete 按钮显示条件（AND）**：
-1. `canDeleteSavedView(view)` = true（superuser / owner / 无主）—— 外层 `@if`
+1. `canDeleteSavedView(view)` = true（`!object` / owner 为 falsy 无主 / `currentUser.is_superuser` / owner == 当前用户）—— 外层 `@if`
 2. `*pngxIfPermissions(Delete, SavedView)` = true（全局有 `documents.delete_savedview` 权限）—— 指令级检查
 
 删除动作本身还会经过后端 `PaperlessObjectPermissions.has_object_permission` 的**对象级**校验（见 4.3 节）。
@@ -534,7 +594,7 @@ public canEditSavedView(view: SavedView): boolean {
 
 ```typescript
 return (
-  this.currentUserOwnsObject(object) ||           // superuser / owner / 无主
+  this.currentUserOwnsObject(object) ||           // !object / owner 为 falsy / currentUser.is_superuser / owner == 当前用户
   object.user_can_change ||                        // 后端计算的简化标记
   object.permissions?.change.users.includes(this.currentUser.id) ||
   object.permissions?.change.groups.filter((g) =>
@@ -588,10 +648,13 @@ def has_object_permission(self, request, view, obj):
 ```
 
 **DELETE 的实际执行需要同时满足**：
-1. **全局 model-level**：用户有 `documents.delete_savedview` 权限（由 `DjangoObjectPermissions` 基类的 `has_permission` 检查）
-2. **对象级**：`request.user == obj.owner` 或 `obj.owner is None`，或 django-guardian 中该用户有 `delete_savedview` 对象级权限
+1. **全局 model-level**：用户有 `documents.delete_savedview` 权限（由 `DjangoObjectPermissions` 基类的 `has_permission` 检查，或 `currentUser.is_superuser`）
+2. **对象级**：`request.user == obj.owner` 或 `obj.owner is None`（无主），或 django-guardian 中该用户有 `delete_savedview` 对象级权限
 
-**但是**：系统**没有**任何 UI 或 API 入口可以授予 `delete_savedview` 对象级权限（见 4.5 节 `set_permissions` 只支持 view/change）。所以实际上只有 owner / 无主 / superuser 能真正 DELETE。
+**结合前端限制的最终结论**：
+- 前端删除按钮还需额外通过 `canDeleteSavedView(view)`（`currentUserOwnsObject`）的 `@if` 判断
+- 系统**没有**任何 UI 或 API 入口可以授予 `delete_savedview` 对象级权限（见 4.5 节 `set_permissions` 只支持 view/change，[PermissionsFormComponent](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/common/input/permissions/permissions-form/permissions-form.component.ts#L62-L74) 的 FormGroup 也只有 view/change 两组）
+- 因此实际能看到并执行 DELETE 的用户范围是：`currentUser.is_superuser` **OR**（用户有全局 `documents.delete_savedview` 权限 **AND**（`request.user == obj.owner` **OR** `obj.owner is None`（无主）））
 
 ### 4.4 新建 SavedView 时的 owner 归属
 
@@ -960,40 +1023,47 @@ saveViewConfig()
 
 ## 10. 关键设计点总结
 
-1. **四层 Scope 解耦**：
-   - 对象权限（owner + guardian）：决定能否看到 SavedView 对象本身、能否编辑、能否删除
-   - `user_can_change` 字段：后端序列化时动态计算的简化布尔标记，供前端快速判断
-   - Dashboard/Sidebar 可见性设置：用户个人 UiSettings，与 SavedView 对象完全解耦
-   - 旧版兼容层（API v9）：在序列化层模拟 `show_on_dashboard` / `show_in_sidebar` 字段，实际读写用户 UiSettings
+1. **用户 Scope 的分层结构（两层核心权限 + 一层 UI 偏好 + 派生标记/兼容层）**：
+   - **核心层 1**：对象级权限（owner + django-guardian view/change 对象级权限）— 决定能否看到、编辑、删除具体 SavedView 对象
+   - **核心层 2**：全局 model-level 权限（Django 全局 add/view/change/delete）— `*pngxIfPermissions` 指令检查的就是这个，与具体对象无关
+   - **核心层 3**：用户个人 UI 偏好（UiSettings 中 dashboard/sidebar 可见 ID）— 决定侧边栏/仪表盘入口
+   - **派生层 A**：序列化派生标记（user_can_change、is_shared_by_requester、permissions 字段）— 只读输出，供前端快速判断
+   - **派生层 B**：API v9 兼容层（show_on_dashboard/show_in_sidebar 模拟）— 实际读写 UiSettings
 
 2. **full_perms 请求参数二选一**：`full_perms=true` 返回完整权限列表（view/change users/groups），默认返回简化的 `user_can_change` + `is_shared_by_requester`。
 
-3. **删除按钮的双重权限判断（AND）**：
-   - 外层 `@if (canDeleteSavedView(view))` → `currentUserOwnsObject(view)`（superuser / owner / 无主）
-   - 内层 `*pngxIfPermissions(Delete, SavedView)` → 全局 `documents.delete_savedview` model-level 权限
-   - 后端执行 DELETE 还需再经对象级校验；但系统**没有**任何 UI/API 入口能分发 `delete_savedview` 对象级权限
+3. **currentUserOwnsObject 的精确实现**（[permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/permissions.service.ts#L66-L73)）：
+   ```typescript
+   !object || !object.owner || this.currentUser.is_superuser || object.owner === this.currentUser.id
+   ```
+   接口名是 `ObjectWithPermissions`，没有 `currentUserIsSuperuser` 这个属性，直接用 `this.currentUser.is_superuser`。
 
-4. **set_permissions 只支持 view/change，change 自动赋 view**：
+4. **删除按钮的双重权限判断（AND）**：
+   - 外层 `@if (canDeleteSavedView(view))` → `currentUserOwnsObject(view)`（`!object` / owner 为 falsy 无主 / `currentUser.is_superuser` / owner == 当前用户）
+   - 内层 `*pngxIfPermissions(Delete, SavedView)` → 全局 `documents.delete_savedview` model-level 权限
+   - 后端执行 DELETE 还需再经 `PaperlessObjectPermissions.has_object_permission` 对象级校验
+   - 系统**没有**任何 UI 或 API 入口能分发 `delete_savedview` 对象级权限（`set_permissions` 只支持 view/change，[PermissionsFormComponent](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/common/input/permissions/permissions-form/permissions-form.component.ts#L62-L74) 的 FormGroup 也只有 view/change 两组）
+
+5. **set_permissions 只支持 view/change，change 自动赋 view**：
    - `validate_set_permissions` 只循环 `["view", "change"]`，其他 action（如 delete）被完全忽略
    - `set_permissions_for_object` 中 `action == "change"` 时会自动 `assign_perm("view_...")`
-   - 前端 PermissionsDialogComponent 也只显示 View / Change 两个选项
 
-5. **owner/set_permissions 变更限制：PermissionDenied（403），非 ValidationError（400）**：
-   - 触发条件：试图变更 owner 字段或提交 set_permissions，且非 superuser / owner / 无主
+6. **owner/set_permissions 变更限制：PermissionDenied（403），非 ValidationError（400）**：
+   - 触发条件：试图变更 owner 字段或提交 set_permissions，且非 `is_superuser` / `is_owner` / `is_unowned`
    - 异常类型：`rest_framework.exceptions.PermissionDenied` → HTTP 403
    - 错误消息：`_("Insufficient permissions.")`（翻译），不是 "Only superusers, owners or unowned objects can change permissions"
 
-6. **前端全局权限 vs 对象级权限分离**：
-   - `*pngxIfPermissions` 指令检查全局 model-level 权限（`permissionsService.currentUserCan`）
-   - `canEditSavedView` / `canDeleteSavedView` 检查对象级权限（owner / user_can_change / permissions）
+7. **前端全局权限 vs 对象级权限分离**：
+   - `*pngxIfPermissions` 指令 → `currentUserCan` → **全局 model-level** Django 权限
+   - `canEditSavedView` / `canDeleteSavedView` → **对象级**权限（owner / user_can_change / permissions）
    - Permissions 按钮和 Delete 按钮需要同时满足两者
 
-7. **状态隔离**：每个 SavedView 拥有独立的 `ListViewState`（Map key 为 SavedView ID），默认视图（null key）持久化到 localStorage。
+8. **状态隔离**：每个 SavedView 拥有独立的 `ListViewState`（Map key 为 SavedView ID），默认视图（null key）持久化到 localStorage。
 
-8. **Dirty Tracking**：通过 `unmodifiedSavedView` 快照对比检测修改。
+9. **Dirty Tracking**：通过 `unmodifiedSavedView` 快照对比检测修改。
 
-9. **全量替换 FilterRule**："先删后建"简化前后端逻辑。
+10. **全量替换 FilterRule**："先删后建"简化前后端逻辑。
 
-10. **URL 同步策略差异**：非 SavedView 模式完整同步，SavedView 模式仅同步分页。
+11. **URL 同步策略差异**：非 SavedView 模式完整同步，SavedView 模式仅同步分页。
 
-11. **WebSocket 驱动刷新**：文档消费完成或删除时实时 reload。
+12. **WebSocket 驱动刷新**：文档消费完成或删除时实时 reload。
