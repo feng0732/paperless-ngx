@@ -711,7 +711,7 @@ bulk_update_documents → for each doc:
       └─ update_filename_and_move_files() 调用 ×1  ★ 第 2 次（早退空跑）
 ```
 
-> 单元测试 `test_multiple_workflows_trash_then_assignment` [test_workflows.py#L4565-L4632](src/documents/tests/test_workflows.py#L4565-L4632) 精确验证了此场景：Workflow 1 软删除后 Workflow 2 不执行，且软删除的 WorkflowRun 会被级联硬删除（因为 WorkflowRun 不继承 SoftDeleteModel）。
+> 单元测试 `test_multiple_workflows_trash_then_assignment` [test_workflows.py#L4565-L4632](src/documents/tests/test_workflows.py#L4565-L4632) 精确验证了此场景：Workflow 1 软删除后 Workflow 2 不执行，并通过日志确认后续 Workflow 被跳过。
 
 ---
 
