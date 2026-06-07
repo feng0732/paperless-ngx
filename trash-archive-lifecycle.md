@@ -311,7 +311,7 @@ document_updated.connect(send_websocket_document_updated)         # 仅 WebSocke
 | 删除文档版本 | [src/documents/views.py L2046](src/documents/views.py#L2046) | ✅ 是（L2022 已显式 `add_or_update` 根文档） |
 | 更新版本标签 | [src/documents/views.py L2119](src/documents/views.py#L2119) | ❌ 否（此处无显式索引调用） |
 | `bulk_update_documents` 内循环 | [src/documents/tasks.py L260](src/documents/tasks.py#L260) | ⭕ 稍后批量处理（见路径二） |
-| 消费中生成新版本后 | [src/documents/consumer.py L732](src/documents/consumer.py#L732) | ❌ 否（消费流程走 `document_consumption_finished`） |
+| 消费中生成新版本后 | [src/documents/consumer.py L732-L735](src/documents/consumer.py#L732-L735) | ❌ 否（`document_consumption_finished` 发送的是版本文档，此处 `document_updated` 发送的是**根文档**，用于通知前端变更） |
 
 **`document_updated` 的两个处理函数**：
 
@@ -373,12 +373,101 @@ def bulk_update_documents(document_ids) -> None:
 
 **触发位置**：[src/documents/consumer.py L658-L666](src/documents/consumer.py#L658-L666)
 
-仅在**新文档首次消费完成**时触发（以及测试代码中的手动触发）。恢复文档不会触发消费流程。
+> ⚠️ **修正之前不准确结论**："仅在新文档首次消费完成时触发"是错误的。实际上，**新文档消费**和**为已有文档新增版本消费**都会触发该信号，但两种场景下 `send()` 的 `document` 参数是不同的对象。
 
-**对索引的影响**：
-- **Tantivy 搜索索引**：✅ [add_to_index()](src/documents/signals/handlers.py L794-L800) → `get_backend().add_or_update(document, effective_content=...)`
-- **LLM 向量索引**：✅（仅当启用）[add_or_update_document_in_llm_index()](src/documents/signals/handlers.py L1331-L1339) → 异步 `update_document_in_llm_index`
-- 此外还会自动匹配往来人、文档类型、标签、存储路径，运行 `DOCUMENT_ADDED` 工作流
+---
+
+##### 场景 A：新文档首次消费（`self.input_doc.root_document_id` 为空）
+
+执行路径见 [src/documents/consumer.py L643-L649](src/documents/consumer.py#L643-L649) 和 [L654-L731](src/documents/consumer.py#L654-L731)：
+
+```python
+# L643-L649: 走 _store 分支，创建全新根文档
+document = self._store(text=text, date=date, page_count=page_count, mime_type=mime_type)
+
+# L654-L656: document 是新创建的根文档
+document = Document.objects.prefetch_related("versions").get(pk=document.pk)
+
+# L658-L666: 发送 document_consumption_finished，参数是根文档
+document_consumption_finished.send(sender=self.__class__, document=document, ...)
+
+# L729: 保存根文档
+document.save()
+
+# L731: document.root_document_id 为空 → 不发送 document_updated
+if document.root_document_id:
+    document_updated.send(...)   # 跳过
+```
+
+| 信号 | 发送对象 | Tantivy | LLM | 工作流 | WebSocket |
+|------|---------|---------|-----|-------|----------|
+| `document_consumption_finished` | **根文档** | ✅ 加入 | ✅ 加入（启用时） | ✅ `DOCUMENT_ADDED` | ❌ |
+| `document_updated` | —（不发送） | — | — | — | — |
+
+---
+
+##### 场景 B：为已有文档新增版本（`self.input_doc.root_document_id` 不为空）
+
+执行路径见 [src/documents/consumer.py L589-L642](src/documents/consumer.py#L589-L642) 和 [L654-L735](src/documents/consumer.py#L654-L735)：
+
+```python
+# L589-L601: 获取根文档，创建版本文档（继承根文档的 title/created/owner 等，
+#            但有独立 pk、content、checksum）
+root_doc = Document.objects.get(pk=self.input_doc.root_document_id)
+original_document = self._create_version_from_root(root_doc, text=text, ...)
+
+# L642: ⭐ 关键：document 被赋值为新创建的「版本文档」，不是根文档！
+document = original_document
+
+# L654-L656: 预取后 document 仍然是版本文档
+document = Document.objects.prefetch_related("versions").get(pk=document.pk)
+
+# L658-L666: 发送 document_consumption_finished，参数是「版本文档」
+document_consumption_finished.send(sender=self.__class__, document=document, ...)
+
+# L729: 保存版本文档
+document.save()
+
+# L731-L735: document.root_document_id 不为空 → 额外发送 document_updated，
+#            这次发送的是「根文档」
+if document.root_document_id:
+    document_updated.send(sender=self.__class__, document=document.root_document)
+```
+
+**版本文档的结构**（[src/documents/consumer.py L279-L295](src/documents/consumer.py#L279-L295)）：
+- `root_document=root_doc_frozen` —— 外键指向根文档
+- `version_index` —— 递增的版本号
+- 独立的 `pk`、`content`、`checksum`、`page_count`、`mime_type`
+- 继承 `title`、`created`、`owner_id`、tags 等元数据
+
+---
+
+##### 两种场景下各处理函数的实际作用
+
+`document_consumption_finished` 共连接 8 个处理函数（[src/documents/apps.py L24-L31](src/documents/apps.py#L24-L31)），两种场景下它们的实际效果：
+
+| 处理函数 | 场景 A（新文档）接收：根文档 | 场景 B（新增版本）接收：版本文档 |
+|---------|-------------------------|------------------------------|
+| `add_inbox_tags` | ✅ 为新根文档打 inbox 标签 | ⚠️ 为版本文档打标签（版本本身没有独立 tag 管理，通常无实际效果） |
+| `set_correspondent` | ✅ 自动匹配根文档往来人 | ⚠️ 为版本文档匹配（版本继承自根文档，通常覆盖无效） |
+| `set_document_type` | ✅ 自动匹配根文档类型 | ⚠️ 同上 |
+| `set_tags` | ✅ 自动匹配根文档标签 | ⚠️ 同上 |
+| `set_storage_path` | ✅ 设置根文档存储路径 | ⚠️ 同上 |
+| `add_to_index` | ✅ 根文档按自身 pk 加入 Tantivy | ⚠️ **版本文档按自身 pk 加入 Tantivy**，但 REST API 查询层有 `filter(root_document__isnull=True)`（[src/documents/views.py L1042](src/documents/views.py#L1042)），搜索结果的二次交集过滤会排除版本 ID，用户搜索不到版本 |
+| `run_workflows_added` | ✅ 运行根文档 `DOCUMENT_ADDED` 工作流 | ⚠️ 对版本文档运行 `DOCUMENT_ADDED` 工作流（工作流内部通常通过 `document.root_document` 找到根再操作，具体取决于工作流动作） |
+| `add_or_update_document_in_llm_index` | ✅ 根文档加入 LLM 向量索引 | ⚠️ **版本文档按自身 pk 加入 LLM 向量索引**（插件内部行为取决于 `paperless_ai` 实现） |
+
+此外场景 B 在文件写入后还会额外发送：
+
+| 信号 | 发送对象 | Tantivy | LLM | 工作流 | WebSocket |
+|------|---------|---------|-----|-------|----------|
+| `document_updated` | **根文档**（`document.root_document`） | ❌ | ❌ | ✅ `DOCUMENT_UPDATED` | ✅ 推送通知 |
+
+---
+
+##### 对恢复文档路径的启示
+
+恢复文档不会触发消费流程，因此上述两种场景都不会自动发生。如需让恢复的文档重新出现在搜索中，需要依赖其他路径（批量编辑、手动重建索引等）。
 
 ---
 
@@ -460,9 +549,11 @@ python manage.py document_llmindex update
 | `doc.restore()` 本身 | 回收站恢复 | ❌ 不更新 | ❌ 不更新 | ❌ 不触发 | ❌ 不推送 | ❌ 无效 |
 | `document_updated` 信号 | 单文档编辑、版本变更等 | ❌ 不更新（仅信号处理） | ❌ 不更新 | ✅ 运行 | ✅ 推送 | ❌ 信号本身不更新索引 |
 | `bulk_update_documents` | 批量编辑往来人/标签/类型/字段等 | ✅ `batch.add_or_update` | ✅ `update_llm_index`（启用时） | ✅ 运行 | ✅ 推送 | ✅ 需在恢复后编辑 |
-| `document_consumption_finished` | 新文档首次消费 | ✅ `add_to_index` | ✅ `add_or_update_document_in_llm_index`（启用时） | ✅ 运行 | ❌ 不推送 | ❌ 恢复不会重新消费 |
+| `document_consumption_finished`（场景 A） | 新文档首次消费，发送对象=根文档 | ✅ `add_to_index`（按根文档 pk） | ✅ `add_or_update_document_in_llm_index`（启用时） | ✅ `DOCUMENT_ADDED` | ❌ 不推送 | ❌ 恢复不会重新消费 |
+| `document_consumption_finished`（场景 B） | 为已有文档新增版本，发送对象=版本文档 | ⚠️ `add_to_index`（按版本文档 pk，搜索层过滤排除） | ⚠️ `add_or_update_document_in_llm_index`（按版本 pk） | ⚠️ 对版本运行 `DOCUMENT_ADDED` | ❌ 不推送 | ❌ 恢复不会重新消费 |
+| `document_updated`（场景 B 追加） | 新增版本后追加发送，发送对象=根文档 | ❌ | ❌ | ✅ `DOCUMENT_UPDATED` | ✅ 推送 | ❌ |
 | Admin `DocumentAdmin.save_model` | 管理员后台编辑保存 | ✅ `add_or_update` | ❌ 不更新 | ❌ 不触发 | ❌ 不推送 | ✅ Tantivy 有效，LLM 无效 |
-| `document_index reindex` | 手动管理命令 | ✅ `get_backend().rebuild()` 全量 | — | ❌ | ❌ | ✅ 最可靠 |
+| `document_index reindex` | 手动管理命令 | ✅ `get_backend().rebuild()` 全量（含版本文档，但搜索层过滤） | — | ❌ | ❌ | ✅ 最可靠 |
 | `document_llmindex rebuild` | 手动管理命令 | — | ✅ 全量重建（启用时） | ❌ | ❌ | ✅ 最可靠 |
 | REST API 单文档 `PUT/PATCH` | 前端编辑保存 | ✅ 显式 `add_or_update`（信号前调用） | ❌ 不更新 | ✅ 运行 | ✅ 推送 | ✅ Tantivy 有效，LLM 无效 |
 | 备注增删 API | 新增/删除文档备注 | ✅ 显式 `add_or_update` | ❌ 不更新 | ❌ | ❌ | ✅ Tantivy 有效，LLM 无效 |
@@ -643,10 +734,24 @@ def remove(self, doc_id: int) -> None:
         batch.remove(doc_id)
 ```
 
-索引添加只在文档消费完成时触发，信号连接定义在 [src/documents/apps.py L29](src/documents/apps.py#L29)：
-```python
-document_consumption_finished.connect(add_to_index)
-```
+Tantivy 索引的添加通过多条路径触发，**不只有消费完成**：
+
+1. **文档消费完成信号**（新文档或新增版本都会触发，区分发送对象）：信号连接定义在 [src/documents/apps.py L29](src/documents/apps.py#L29)
+   ```python
+   document_consumption_finished.connect(add_to_index)
+   ```
+   - 新文档消费：`document_consumption_finished` 发送**根文档**，`add_to_index` 按根文档 pk 加入索引
+   - 新增版本消费：`document_consumption_finished` 发送**版本文档**，`add_to_index` 按版本文档 pk 加入索引（但前端搜索层通过 `filter(root_document__isnull=True)` 过滤排除）
+
+2. **REST API 单文档 PUT/PATCH**：[src/documents/views.py L1176](src/documents/views.py#L1176) 显式调用 `get_backend().add_or_update(doc)`
+
+3. **备注增删 API**：[src/documents/views.py L1660](src/documents/views.py#L1660) 和 [L1704](src/documents/views.py#L1704) 显式调用
+
+4. **`bulk_update_documents` 异步任务**：[src/documents/tasks.py L268-L272](src/documents/tasks.py#L268-L272) 批量 `batch.add_or_update(doc)`
+
+5. **后台管理保存**：[src/documents/admin.py L116-L119](src/documents/admin.py#L116-L119) 显式 `get_backend().add_or_update(obj)`
+
+6. **`document_index reindex` 管理命令**：全量重建
 
 `add_to_index` 的实现见 [src/documents/signals/handlers.py L794-L800](src/documents/signals/handlers.py#L794-L800)。
 
@@ -771,12 +876,12 @@ A：因为 `django-softdelete` 的软删除内部也会触发 Django 的 `post_d
 
 **Q：恢复文档后，搜索能立刻搜到吗？LLM 问答能用到吗？**
 A：不能。代码证据：
-1. Tantivy 索引 `add_to_index` 只在 `document_consumption_finished` 信号连接（[src/documents/apps.py L29](src/documents/apps.py#L29)），restore 不触发该信号
-2. LLM 索引 `add_or_update_document_in_llm_index` 同样只在 `document_consumption_finished` 连接（[src/documents/apps.py L31](src/documents/apps.py#L31)）
+1. Tantivy 索引添加有 6 条路径（消费完成信号、REST PUT、备注增删、批量编辑、Admin 保存、手动重建命令），但 **`restore()` 本身不触发任何一条。其中 `add_to_index` 处理函数只在 `document_consumption_finished` 信号连接（[src/documents/apps.py L29](src/documents/apps.py#L29)）
+2. LLM 索引添加同样主要在 `document_consumption_finished` 信号连接（[src/documents/apps.py L31](src/documents/apps.py#L31)），此外只有 `bulk_update_documents` 会条件性更新 LLM
 3. `document_updated` 信号没有连接任何索引更新函数（[src/documents/apps.py L32-L33](src/documents/apps.py#L32-L33)）
 4. [TrashView.post()](src/documents/views.py#L5116-L5118) 的 restore 分支中没有任何显式索引调用
 
-需要靠后续触发索引重建的事件（如编辑保存文档）或手动调用索引管理命令。
+需要靠后续触发索引重建的事件（如编辑保存文档、批量编辑）或手动调用索引管理命令。
 
 **Q：删除根文档时，版本文档怎么办？**
 A：会被一并软删除。[Document.delete()](src/documents/models.py#L503-L514) 在检测到 `root_document_id is None`（即当前是根文档）时，显式 `Document.objects.filter(root_document=self).delete()` 软删除所有版本。硬删除时则由 `root_document` 外键的 `on_delete=models.CASCADE` 自动级联。测试见 [test_delete_root_deletes_versions](src/documents/tests/test_document_model.py#L105-L125)。
