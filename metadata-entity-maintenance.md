@@ -235,7 +235,20 @@ def set_correspondent(doc_ids, correspondent):
 - 使用 Django ORM `.update()`，单条 SQL 批量更新
 - 最后异步调用 `bulk_update_documents` 重新索引搜索（Whoosh/Elasticsearch）
 
-**modify_tags 核心逻辑（Tag 层级感知）：**
+**modify_tags 核心逻辑（Tag 层级感知，一次请求同时 add+remove）：**
+
+前端 `setTags()` 会把 ChangedItems 的 `itemsToAdd` 和 `itemsToRemove` 同时传给一次 `modify_tags` 请求
+[bulk-editor.component.ts#L540-L549](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src-ui/src/app/components/document-list/bulk-editor/bulk-editor.component.ts#L540-L549)：
+```typescript
+this.executeBulkEditMethod(modal, 'modify_tags', {
+  add_tags: changedTags.itemsToAdd.map((t) => t.id),
+  remove_tags: changedTags.itemsToRemove.map((t) => t.id),
+})
+```
+
+后端序列化器同时要求 `add_tags` 和 `remove_tags` 两个参数都必须存在
+[serialisers.py#L1870-L1879](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src/documents/serialisers.py#L1870-L1879)，
+且后端函数签名也是 `modify_tags(doc_ids, add_tags, remove_tags)` [bulk_edit.py#L226-L284](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src/documents/bulk_edit.py#L226-L284)。
 
 ```python
 def modify_tags(doc_ids, add_tags, remove_tags):
@@ -323,14 +336,20 @@ RULE_TYPES 中对应实体的枚举：
 - `28 = has document type in`
 - `29 = does not have document type in`
 
-##### D. django-guardian 对象级权限表
+##### D. django-guardian 对象级权限表（object_pk 是 CharField，删除实体时不会自动清理，会产生孤儿行）
 
 | 表 | 说明 |
 |---|---|
-| UserObjectPermission | 用户对实体的对象级权限（通过 content_type + object_pk 关联） |
-| GroupObjectPermission | 用户组对实体的对象级权限（通过 content_type + object_pk 关联） |
+| UserObjectPermission | 用户对实体的对象级权限（通过 `content_type` ForeignKey + `object_pk` CharField 关联） |
+| GroupObjectPermission | 用户组对实体的对象级权限（通过 `content_type` ForeignKey + `object_pk` CharField 关联） |
 
-删除实体时 django-guardian 会级联清理这些行，但实体合并时这些权限**不会自动迁移到目标实体**。
+**关键行为校准**：由于 `object_pk` 字段是 `CharField`（存储对象主键的字符串形式），并非真正的 ForeignKey（因为需要支持多种不同的模型类型），所以 Django 删除实体时**不会自动级联清理**这些权限记录，会产生孤儿行。
+证据：
+- [permissions.py#L188-L196](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src/documents/permissions.py#L188-L196) 中查询时需要 `Cast("object_pk", IntegerField())` 把字符串转成整数
+- [views.py#L4641-L4642](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src/documents/views.py#L4641-L4642) 批量删除时只有一句 `objs.delete()`，没有清理权限的代码
+- [test_management_exporter.py#L271-L277](file:///d:/fz/0601/solo-dogfeeding/code/64-paperless-ngx/src/documents/tests/test_management_exporter.py#L271-L277) 测试用例中必须手动 `UserObjectPermission.objects.all().delete()` / `GroupObjectPermission.objects.all().delete()` 才能清理干净
+
+实体合并时，这些权限**不会自动迁移到目标实体**。
 
 #### 4.2.5 限制条件总结
 
@@ -338,12 +357,12 @@ RULE_TYPES 中对应实体的枚举：
 
 1. **没有原子性保证**：迁移引用和删除旧实体是两个独立的 HTTP 请求，中间可能失败
 2. **只迁移 Document 引用**：Workflow、MailRule、SavedView、Guardian 权限等其他引用不会被自动迁移
-3. **Tag 合并需要两次 modify_tags 操作**：
-   - 第一次：`add_tags = [target_tag_id]`（把目标 Tag 加到所有文档）
-   - 第二次：`remove_tags = [source_tag_id]`（把源 Tag 从所有文档移除）
-   - 注意：Tag 层级会自动展开祖先/子孙
+3. **Tag 合并只需要一次 modify_tags 操作**：
+   - `modify_tags(add_tags=[target_tag_id], remove_tags=[source_tag_id])`，在同一个事务中先删旧 tag（含子孙）再加新 tag（含祖先）
+   - 注意：Tag 层级会自动展开祖先/子孙，无需手动计算
 4. **Correspondent 和 DocumentType 是单值字段**：`set_correspondent` 直接覆盖原值，天然等于"合并"
 5. **SavedViewFilterRule 无任何保护**：删除实体后，引用该实体 ID 的保存视图规则会变成"指向不存在实体"的无效规则，不会报错但过滤结果为空
+6. **Guardian 权限记录产生孤儿**：删除实体后，UserObjectPermission / GroupObjectPermission 中对应行不会被清理，产生脏数据
 
 ---
 
