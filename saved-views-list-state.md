@@ -448,30 +448,152 @@ def _update_legacy_visibility_preferences(self, saved_view_id, *, show_on_dashbo
 
 ### 4.1 SavedView 管理页（SavedViewsComponent）
 
-定义于 [saved-views.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L240-L249)：
+#### 4.1.1 Actions 区块的总体可见性：canDeleteSavedView
+
+在 [saved-views.component.html](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.html#L27-L45) 中：
+
+```html
+<div class="col-auto">
+  @if (canDeleteSavedView(view)) {
+    <!-- Permissions 按钮和 Delete 按钮都在这里 -->
+  }
+</div>
+```
+
+`canDeleteSavedView` 定义于 [saved-views.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/manage/saved-views/saved-views.component.ts#L247-L249)：
+
+```typescript
+public canDeleteSavedView(view: SavedView): boolean {
+  return this.permissionsService.currentUserOwnsObject(view)
+}
+```
+
+`currentUserOwnsObject` 定义于 [permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/permissions.service.ts#L55-L67)：
+
+```typescript
+public currentUserOwnsObject(object: ObjectWithOwner): boolean {
+  return (
+    this.currentUserIsSuperuser ||                 // 全局 superuser
+    object.owner === undefined ||                   // 无 owner 字段
+    object.owner === null ||                        // owner = null（无主）
+    object.owner === this.currentUser.id            // owner 是当前用户
+  )
+}
+```
+
+**结论**：这个 `@if` 条件控制整个 Actions 列（包括 Permissions + Delete 两个按钮）是否出现。仅 superuser / owner / 对象无主 时可见。
+
+#### 4.1.2 Permissions 按钮：model-level Change 权限
+
+```html
+<button
+  (click)="editPermissions(view)"
+  *pngxIfPermissions="{ action: PermissionAction.Change, type: PermissionType.SavedView }"
+>
+  Permissions
+</button>
+```
+
+`*pngxIfPermissions` 指令定义于 [if-permissions.directive.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/directives/if-permissions.directive.ts#L28-L36)，调用 `permissionsService.currentUserCan(action, type)` —— 这是**全局 model-level 权限**检查（即用户是否有 `documents.change_savedview` 这个 Django 全局权限，与具体 SavedView 对象无关）。
+
+**Permissions 按钮显示条件（AND）**：
+1. `canDeleteSavedView(view)` = true（superuser / owner / 无主）
+2. `*pngxIfPermissions(Change, SavedView)` = true（全局有 change_savedview 权限）
+
+#### 4.1.3 Delete 按钮：双重权限判断
+
+```html
+<pngx-confirm-button
+  (confirm)="deleteSavedView(view)"
+  *pngxIfPermissions="{ action: PermissionAction.Delete, type: PermissionType.SavedView }"
+  iconName="trash"
+>
+</pngx-confirm-button>
+```
+
+Delete 按钮同样有两层判断：
+
+**Delete 按钮显示条件（AND）**：
+1. `canDeleteSavedView(view)` = true（superuser / owner / 无主）—— 外层 `@if`
+2. `*pngxIfPermissions(Delete, SavedView)` = true（全局有 `documents.delete_savedview` 权限）—— 指令级检查
+
+删除动作本身还会经过后端 `PaperlessObjectPermissions.has_object_permission` 的**对象级**校验（见 4.3 节）。
+
+#### 4.1.4 表单字段可编辑性：canEditSavedView
 
 ```typescript
 public canEditSavedView(view: SavedView): boolean {
-  // 控制 name/page_size/display_mode/display_fields 表单字段是否可编辑
   return this.permissionsService.currentUserHasObjectPermissions(
     PermissionAction.Change,
     view
   )
 }
-
-public canDeleteSavedView(view: SavedView): boolean {
-  // 控制删除按钮是否显示：只有 owner（或无 owner、或 superuser）能删
-  return this.permissionsService.currentUserOwnsObject(view)
-}
 ```
 
-注意：**所有人都能切换 `show_on_dashboard` / `show_in_sidebar` 的复选框**（代码中这两个控件始终 `disabled: false`），因为这只影响用户自己的 UiSettings。
+`currentUserHasObjectPermissions(Change, view)` 定义于 [permissions.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/services/permissions.service.ts#L75-L97)：
+
+```typescript
+return (
+  this.currentUserOwnsObject(object) ||           // superuser / owner / 无主
+  object.user_can_change ||                        // 后端计算的简化标记
+  object.permissions?.change.users.includes(this.currentUser.id) ||
+  object.permissions?.change.groups.filter((g) =>
+    this.currentUser.groups.includes(g)
+  ).length > 0
+)
+```
+
+这控制 `name / page_size / display_mode / display_fields` 表单字段是否 `[disabled]="!canEditSavedView(view)"`。
+
+注意：**`show_on_dashboard` / `show_in_sidebar` 的复选框始终 `disabled: false`**（所有人都能切换），因为它们只写入用户自己的 UiSettings，不修改 SavedView 对象。
 
 ### 4.2 文档列表页保存按钮
 
-在 [document-list.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/document-list/document-list.component.ts) 中，保存当前视图修改的按钮可见性由 `canEditSavedView(activeSavedView)` 控制。
+在文档列表组件中，保存当前视图修改的按钮可见性由 `canEditSavedView(activeSavedView)` 控制（即 Change 对象级权限）。
 
-### 4.3 新建 SavedView 时的 owner 归属
+### 4.3 后端 DELETE 权限映射与实际执行
+
+#### 4.3.1 perms_map：HTTP 方法 → Django 权限名
+
+定义于 [permissions.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/permissions.py#L28-L42)：
+
+```python
+class PaperlessObjectPermissions(DjangoObjectPermissions):
+    perms_map = {
+        "GET":    ["%(app_label)s.view_%(model_name)s"],
+        "POST":   ["%(app_label)s.add_%(model_name)s"],
+        "PUT":    ["%(app_label)s.change_%(model_name)s"],
+        "PATCH":  ["%(app_label)s.change_%(model_name)s"],
+        "DELETE": ["%(app_label)s.delete_%(model_name)s"],
+    }
+```
+
+即 `DELETE /api/saved_views/:id` → 需要 `documents.delete_savedview` 权限。
+
+#### 4.3.2 对象级判断
+
+定义于 [permissions.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/permissions.py#L44-L51)：
+
+```python
+def has_object_permission(self, request, view, obj):
+    if hasattr(obj, "owner") and obj.owner is not None:
+        if request.user == obj.owner:
+            return True                                 # 所有者：全部操作通过
+        else:
+            return super().has_object_permission(       # 非所有者：django-guardian 判断
+                request, view, obj
+            )
+    else:
+        return True   # 无所有者：全部操作通过
+```
+
+**DELETE 的实际执行需要同时满足**：
+1. **全局 model-level**：用户有 `documents.delete_savedview` 权限（由 `DjangoObjectPermissions` 基类的 `has_permission` 检查）
+2. **对象级**：`request.user == obj.owner` 或 `obj.owner is None`，或 django-guardian 中该用户有 `delete_savedview` 对象级权限
+
+**但是**：系统**没有**任何 UI 或 API 入口可以授予 `delete_savedview` 对象级权限（见 4.5 节 `set_permissions` 只支持 view/change）。所以实际上只有 owner / 无主 / superuser 能真正 DELETE。
+
+### 4.4 新建 SavedView 时的 owner 归属
 
 定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L435-L450) 的 `OwnedObjectSerializer.create`：
 
@@ -483,12 +605,73 @@ def create(self, validated_data):
         or (request is not None and "owner" not in request.data)
     ) and self.user:
         validated_data["owner"] = self.user  # 默认归属当前用户
-    ...
+    if "set_permissions" in validated_data:
+        self._set_permissions(validated_data["set_permissions"], instance)
+    return instance
 ```
 
-### 4.4 编辑 SavedView 时的 owner / 权限变更限制
+### 4.5 set_permissions：只含 view/change，change 自动赋 view
 
-定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L452-L480)：
+#### 4.5.1 仅支持 view / change 两个 action
+
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L191-L211) 的 `SetPermissionsMixin.validate_set_permissions`：
+
+```python
+def validate_set_permissions(self, set_permissions=None):
+    permissions_dict = {
+        "view": {},
+        "change": {},
+    }
+    if set_permissions is not None:
+        for action in ["view", "change"]:          # 只循环 view 和 change
+            if action in set_permissions:
+                if "users" in set_permissions[action]:
+                    users = set_permissions[action]["users"]
+                    permissions_dict[action]["users"] = self._validate_user_ids(users)
+                if "groups" in set_permissions[action]:
+                    groups = set_permissions[action]["groups"]
+                    permissions_dict[action]["groups"] = self._validate_group_ids(groups)
+            else:
+                del permissions_dict[action]
+    return permissions_dict
+```
+
+传入的 `set_permissions` 如果包含 `delete` 或其他 action 会被**完全忽略**，只有 `view` 和 `change` 会被处理。
+
+#### 4.5.2 change 权限自动附带 view
+
+定义于 [permissions.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/permissions.py#L93-L164) 的 `set_permissions_for_object`：
+
+```python
+for action, entry in permissions.items():
+    permission = f"{action}_{object.__class__.__name__.lower()}"
+    if "users" in entry:
+        users_to_add = User.objects.filter(id__in=entry["users"])
+        for user in users_to_add:
+            assign_perm(permission, user, object)
+            if action == "change":
+                # change gives view too
+                assign_perm(
+                    f"view_{object.__class__.__name__.lower()}",
+                    user,
+                    object,
+                )
+    if "groups" in entry:
+        # 对 groups 同样处理
+        for group in groups_to_add:
+            assign_perm(permission, group, object)
+            if action == "change":
+                assign_perm(f"view_{object.__class__.__name__.lower()}", group, object)
+```
+
+**结论**：
+- 授予 `change` 会**自动同时**授予 `view`，无需单独设置
+- `delete` 权限没有任何对象级授权入口，不能通过 `set_permissions` 分发
+- 前端 [PermissionsDialogComponent](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src-ui/src/app/components/common/permissions-dialog/permissions-dialog.component.ts) 也只显示 View / Change 两个权限选项
+
+### 4.6 owner / set_permissions 变更限制：PermissionDenied（非 ValidationError）
+
+定义于 [serialisers.py](file:///d:/fz/0601/solo-dogfeeding/code/59-paperless-ngx/src/documents/serialisers.py#L452-L469)：
 
 ```python
 def update(self, instance, validated_data):
@@ -501,12 +684,24 @@ def update(self, instance, validated_data):
         ("owner" in validated_data and validated_data["owner"] != instance.owner)
         or "set_permissions" in validated_data
     ) and not (is_superuser or is_owner or is_unowned):
-        raise serializers.ValidationError(
-            {"error": "Only superusers, owners or unowned objects can change permissions"}
+        raise PermissionDenied(           # ← 注意：是 PermissionDenied，不是 ValidationError
+            _("Insufficient permissions."),  # ← 错误消息是这个，不是 "Only superusers..."
         )
+
+    if "set_permissions" in validated_data:
+        self._set_permissions(validated_data["set_permissions"], instance)
+    return super().update(instance, validated_data)
 ```
 
-只有 superuser、对象 owner、或对象无 owner 时，才能修改 `owner` 字段或设置 `set_permissions`。
+**关键差异**：
+
+| 项目 | 实际 | 常见误解 |
+|------|------|---------|
+| 异常类型 | `rest_framework.exceptions.PermissionDenied` → HTTP **403** | `serializers.ValidationError` → HTTP **400** |
+| 错误消息 | `_("Insufficient permissions.")`（翻译） | `"Only superusers, owners or unowned objects can change permissions"` |
+| 触发条件 | 试图改 owner 或发 set_permissions，且非 superuser/owner/无主 | 同上 |
+
+只有 superuser、对象 owner、或对象无主时，才能修改 `owner` 字段或设置 `set_permissions`。
 
 ---
 
@@ -773,14 +968,32 @@ saveViewConfig()
 
 2. **full_perms 请求参数二选一**：`full_perms=true` 返回完整权限列表（view/change users/groups），默认返回简化的 `user_can_change` + `is_shared_by_requester`。
 
-3. **权限限制分层**：删除仅 owner 能做；修改 owner/set_permissions 仅限 superuser、owner 或无主对象。
+3. **删除按钮的双重权限判断（AND）**：
+   - 外层 `@if (canDeleteSavedView(view))` → `currentUserOwnsObject(view)`（superuser / owner / 无主）
+   - 内层 `*pngxIfPermissions(Delete, SavedView)` → 全局 `documents.delete_savedview` model-level 权限
+   - 后端执行 DELETE 还需再经对象级校验；但系统**没有**任何 UI/API 入口能分发 `delete_savedview` 对象级权限
 
-4. **状态隔离**：每个 SavedView 拥有独立的 `ListViewState`（Map key 为 SavedView ID），默认视图（null key）持久化到 localStorage。
+4. **set_permissions 只支持 view/change，change 自动赋 view**：
+   - `validate_set_permissions` 只循环 `["view", "change"]`，其他 action（如 delete）被完全忽略
+   - `set_permissions_for_object` 中 `action == "change"` 时会自动 `assign_perm("view_...")`
+   - 前端 PermissionsDialogComponent 也只显示 View / Change 两个选项
 
-5. **Dirty Tracking**：通过 `unmodifiedSavedView` 快照对比检测修改。
+5. **owner/set_permissions 变更限制：PermissionDenied（403），非 ValidationError（400）**：
+   - 触发条件：试图变更 owner 字段或提交 set_permissions，且非 superuser / owner / 无主
+   - 异常类型：`rest_framework.exceptions.PermissionDenied` → HTTP 403
+   - 错误消息：`_("Insufficient permissions.")`（翻译），不是 "Only superusers, owners or unowned objects can change permissions"
 
-6. **全量替换 FilterRule**："先删后建"简化前后端逻辑。
+6. **前端全局权限 vs 对象级权限分离**：
+   - `*pngxIfPermissions` 指令检查全局 model-level 权限（`permissionsService.currentUserCan`）
+   - `canEditSavedView` / `canDeleteSavedView` 检查对象级权限（owner / user_can_change / permissions）
+   - Permissions 按钮和 Delete 按钮需要同时满足两者
 
-7. **URL 同步策略差异**：非 SavedView 模式完整同步，SavedView 模式仅同步分页。
+7. **状态隔离**：每个 SavedView 拥有独立的 `ListViewState`（Map key 为 SavedView ID），默认视图（null key）持久化到 localStorage。
 
-8. **WebSocket 驱动刷新**：文档消费完成或删除时实时 reload。
+8. **Dirty Tracking**：通过 `unmodifiedSavedView` 快照对比检测修改。
+
+9. **全量替换 FilterRule**："先删后建"简化前后端逻辑。
+
+10. **URL 同步策略差异**：非 SavedView 模式完整同步，SavedView 模式仅同步分页。
+
+11. **WebSocket 驱动刷新**：文档消费完成或删除时实时 reload。
