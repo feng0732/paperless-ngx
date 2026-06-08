@@ -116,36 +116,74 @@ src/documents/tasks.py
 
 **Tesseract 的后备（Fallback）机制**（`parse()` L494-L659）：
 
+**参数构造 vs 实际运行可达路径的区分**：
+
+`construct_ocrmypdf_parameters()`（L266-L383）是一个**纯参数构造函数**，理论上对任何 mode 都能生成参数字典。但 `parse()` 中存在多处**提前 return**，使得 safe_fallback 分支（L628-L646）在某些 mode 下**根本不可达**。两者需要严格区分：
+
 ```
-OCR_MODE=off（完全不调用 OCR）:
-  ├── 不生成归档 + PDF → 直接返回 pdftotext 文本
-  ├── 图片输入 → img2pdf 转换 + pikepdf 打 PDF/A 标签
-  └── PDF 输入 → Ghostscript (_convert_pdf_to_pdfa) 直接转 PDF/A
+parse() 控制流（OCR_MODE 的可达性分析）:
 
-OCR_MODE=auto + 原文有文本 + 不生成归档:
-  └── 跳过 ocrmypdf，直接返回 pdftotext 结果
+┌─ mode == OFF ───────────────────────────────────────────────┐
+│  L529 if self.settings.mode == ModeChoices.OFF:             │
+│    ├─ not produce_archive + PDF                             │
+│    │    └─ self.text = text_original; return     (L535-536) │
+│    ├─ produce_archive + image (is_image(mime_type)=True)    │
+│    │    └─ _convert_image_to_pdfa(); return        (L542-551)│
+│    └─ produce_archive + PDF                                 │
+│         └─ _convert_pdf_to_pdfa(GS); return       (L553-562)│
+│                                                              │
+│  ⚠️  所有 OFF 分支都在 L599 ocrmypdf.ocr() 之前 return        │
+│      → safe_fallback (L619 except 分支) **完全不可达**        │
+│      → construct_ocrmypdf_parameters(..., safe_fallback=True)│
+│        在 OFF 模式下**永远不会被调用**                          │
+└──────────────────────────────────────────────────────────────┘
 
-完整 OCR 流程（其他情况）:
-  ├── 第一次尝试: ocrmypdf.ocr(normal_args)
-  │     ├── 成功 → 提取 sidecar.txt / 归档 PDF 文本
-  │     └── 失败异常:
-  │           ├── DigitalSignatureError / EncryptedPdfError → 若原 PDF 有文本则用原文本
-  │           ├── SubprocessOutputError(Ghostscript PDF/A 失败) → 提示 PAPERLESS_OCR_USER_ARGS 并 raise ParseError
-  │           └── NoTextFoundException / InputFileError / PriorOcrFoundError → 进入 Fallback
-  │
-  └── Fallback 重试（safe_fallback=True）:
-        ├── construct_ocrmypdf_parameters(..., safe_fallback=True)
-        │     └── 仅强制 force_ocr=True，其他全部配置原样保留（见 safe_fallback 详解）
-        └── ocrmypdf.ocr(fallback_args)
-              ├── 成功 → 提取文本，归档文件
-              └── 失败 → raise ParseError
+┌─ mode == AUTO + original_has_text + not produce_archive ───┐
+│  L565: if AUTO and original_has_text and not produce_archive│
+│      └─ self.text = text_original; return        (L570-574)│
+│                                                              │
+│  ⚠️  同样在 L599 之前 return                                   │
+│      → safe_fallback **不可达**                                │
+└──────────────────────────────────────────────────────────────┘
 
-文本提取优先级（extract_text() L236-L264）:
+┌─ 所有其他路径（真正会调用 ocrmypdf.ocr）─────────────────────┐
+│  AUTO + 无文本 / 需归档  |  REDO  |  FORCE                   │
+│    L591: construct_ocrmypdf_parameters(skip_text=...)       │
+│    L600: try: ocrmypdf.ocr(**args)                           │
+│      ├── 成功 → 提取文本                                      │
+│      ├── DigitalSignatureError / EncryptedPdfError           │
+│      │    └─ 用原文本，不进 fallback                           │
+│      ├── SubprocessOutputError                               │
+│      │    └─ _handle_subprocess_output_error()               │
+│      │       （提示 OCR_USER_ARGS，直接 raise ParseError）    │
+│      │       → 不进 fallback                                  │
+│      ├── NoTextFoundException / InputFileError /             │
+│      │   PriorOcrFoundError                                   │
+│      │    └─ L619 except → **进入 safe_fallback**             │
+│      │         L628: construct_ocrmypdf_parameters(          │
+│      │               safe_fallback=True)                      │
+│      │         L637: ocrmypdf.ocr(fallback_args)             │
+│      │           └── 失败 → raise ParseError                  │
+│      └── 其他 Exception                                       │
+│           └── 直接 raise ParseError，不进 fallback            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**safe_fallback 的完整可达条件**（必须同时满足）：
+1. `settings.mode` 不能是 `OFF`
+2. 如果 mode 是 `AUTO`，不能同时满足 `original_has_text=True and not produce_archive`
+3. 第一次 `ocrmypdf.ocr()` 必须抛出 **`NoTextFoundException` / `InputFileError` / `PriorOcrFoundError`** 三者之一
+   - `DigitalSignatureError` / `EncryptedPdfError` → 用原文本，不 fallback
+   - `SubprocessOutputError` → 直接 raise ParseError，不 fallback
+   - 其他任意 Exception → 直接 raise ParseError，不 fallback
+
+---
+
+文本提取优先级（`extract_text()` L236-L264）:
   1. sidecar.txt（ocrmypdf 生成），除非 REDO 模式
   2. sidecar 含 "[OCR skipped on page" → 判定不完整，丢弃
   3. 从归档 PDF 中用 pdftotext 提取
   4. 仍为空 → 若原 PDF 有文本则用原文本，否则空串 + 告警
-```
 
 **safe_fallback 实际保留/修改的配置详解**（`construct_ocrmypdf_parameters()` L266-L383）：
 
@@ -239,30 +277,51 @@ safe_fallback **无任何影响**。两者互斥，完全由 `settings.pages` �
 
 ---
 
-#### E. `user_args`（L360-L367）— 合并在最后，可以覆盖 force_ocr
+#### E. `user_args`（L360-L367）— 合并在最后，`force_ocr` 仅为内置默认值而非最终结果
 
 ```python
 if self.settings.user_args is not None:
     try:
-        ocrmypdf_args = {**ocrmypdf_args, **self.settings.user_args}  # ← 合并顺序：user_args 在右侧
+        ocrmypdf_args = {**ocrmypdf_args, **self.settings.user_args}  # ← user_args 在右侧
     except Exception as e:
-        ...
+        self.log.warning("There is an issue with PAPERLESS_OCR_USER_ARGS ...")
 ```
 
-**关键**：字典展开合并时 `user_args` 在**右侧**，因此 user_args 中的同名键**会覆盖**之前 safe_fallback 设置的所有参数。
+**核心结论**：safe_fallback 设置的 `force_ocr=True` **只能保证是"构造阶段的内置默认值"，不能保证是传给 ocrmypdf 的最终值**。因为 user_args 在所有参数构造完成后、最后通过字典解包合并，且位于右侧（同名键覆盖左侧）。
 
-| user_args 内容 | 对 safe_fallback 的影响 |
-|----------------|-----------------------|
-| `{"force_ocr": False}` | ❌ **覆盖** — safe_fallback 设置的 `force_ocr=True` 被 user_args 覆盖为 False |
-| `{"redo_ocr": True}` | ✅ 新增 — 最终同时存在 `force_ocr=True` 和 `redo_ocr=True`（ocrmypdf 会报错或忽略冲突） |
-| `{"deskew": True}` | ✅ 叠加 — 可强制启用原 mode=REDO 时被禁用的 deskew |
-| `{"skip_text": True}` | ✅ 叠加 — 可强制跳过文本（抵消 safe_fallback 的效果） |
+| user_args 内容 | safe_fallback 构造阶段设置 | 最终传给 ocrmypdf 的值 |
+|----------------|--------------------------|----------------------|
+| `None`（未配置） | `force_ocr=True` | ✅ `force_ocr=True`（不变） |
+| `{"force_ocr": False}` | `force_ocr=True` | ❌ **被覆盖为 `force_ocr=False`** — fallback 的核心目的失效 |
+| `{"redo_ocr": True}` | `force_ocr=True` | ✅ 两者同时存在：`force_ocr=True, redo_ocr=True` — **参数冲突** |
+| `{"skip_text": True}` | `force_ocr=True` | ✅ 两者同时存在：`force_ocr=True, skip_text=True` — **参数冲突** |
+| `{"force_ocr": False, "skip_text": True}` | `force_ocr=True` | ❌ 被覆盖，只剩 `skip_text=True` — fallback 完全失效 |
+| `{"deskew": True}` | 原 mode=REDO 时 deskew 未设置 | ✅ **叠加生效** — 可绕过原 mode 的兼容性限制 |
 
-> user_args 是**最顶层的覆盖层**，优先级高于 safe_fallback 的所有逻辑。
+> 从 Paperless-ngx 仓库代码的角度，`force_ocr` 只是 safe_fallback 流程"尽力而为"设置的一个建议值。只要用户配置了 `PAPERLESS_OCR_USER_ARGS`，最终结果就脱离了仓库代码的控制范围。
 
 ---
 
-#### F. 其他配置 — 无 mode 依赖，均保留
+#### F. 冲突参数传递给 ocrmypdf 后的行为 — 仓库代码无法断言
+
+当 user_args 将 `redo_ocr=True` 或 `skip_text=True` 叠加到已有的 `force_ocr=True` 上时，最终参数中会出现互斥组合：
+
+| 冲突组合 | Paperless-ngx 代码中的处理 | 传给 ocrmypdf.ocr() 后实际发生什么 |
+|---------|--------------------------|----------------------------------|
+| `force_ocr=True` + `redo_ocr=True` | 仓库代码不做任何校验或去重，直接透传 | **仓库代码无法断言** — 取决于 ocrmypdf 库内部实现 |
+| `force_ocr=True` + `skip_text=True` | 仓库代码不做任何校验或去重，直接透传 | **仓库代码无法断言** — 取决于 ocrmypdf 库内部实现 |
+| `redo_ocr=True` + `skip_text=True`（user_args 同时设置） | 仓库代码不做任何校验或去重，直接透传 | **仓库代码无法断言** |
+
+**为什么无法断言**：
+1. Paperless-ngx 的 `construct_ocrmypdf_parameters()` 中 **没有任何参数冲突检测或去重逻辑**，最终字典直接透传给 `ocrmypdf.ocr(**args)`
+2. 仓库测试用例中也 **没有覆盖 user_args 导致参数冲突的场景**（test_consumer.py 和 test_tesseract.py 中未见相关断言）
+3. 实际行为属于 ocrmypdf 库的内部实现细节：可能是抛 `ValueError`、静默忽略其中一个参数、按某种优先级取其中一个，或者产生 undefined behavior — 这些都不在 Paperless-ngx 代码的控制范围内
+
+> 这是一个典型的"配置逃逸边界"：Paperless-ngx 提供 `PAPERLESS_OCR_USER_ARGS` 作为高级用户的逃逸口，但不对其与内部参数的组合结果做任何保证。
+
+---
+
+#### G. 其他配置 — 无 mode 依赖，均保留
 
 | 配置项 | safe_fallback 下是否保留 | 说明 |
 |--------|-------------------------|------|
@@ -278,12 +337,21 @@ if self.settings.user_args is not None:
 
 #### safe_fallback 小结
 
-"安全"的真正含义是：
+需要区分三层来理解 safe_fallback 的"安全"含义：
+
+**第一层：参数构造阶段（仓库代码可控）**
 1. **强制 `force_ocr=True`**，绕过 AUTO/REDO/OFF 模式下的文本层检测，对所有页面强制 OCR
-2. **跳过 `skip_text` / `redo_ocr` 参数**（通过 if-elif 链排他性）
+2. **跳过 `skip_text` / `redo_ocr` 参数**（通过 if-elif 链排他性，只要 safe_fallback=True 就不会进入这两个分支）
 3. **保守保留 mode 相关的兼容性限制**（clean_final 降级、deskew 禁用等逻辑仍按原 mode 判断，避免触发 ocrmypdf 参数冲突）
-4. **不简化任何其他参数**（clean/deskew/rotate/pages/user_args 全部保留原配置）
-5. user_args 仍可覆盖所有参数
+4. **不简化任何其他参数**（clean/rotate/pages/language/output_type 全部保留原配置）
+
+**第二层：可达性约束（parse() 控制流可控）**
+5. safe_fallback **仅在 mode≠OFF 且第一次 ocrmypdf.ocr() 抛出 NoTextFoundException/InputFileError/PriorOcrFoundError 三者之一时才可达**；mode=OFF 和 AUTO+有文本+不归档场景下**根本不可达**（parse() 在更早位置已 return）
+6. SubprocessOutputError、DigitalSignatureError、EncryptedPdfError 和其他未列举的 Exception **均不触发 safe_fallback**
+
+**第三层：配置逃逸边界（仓库代码不可控）**
+7. `force_ocr=True` **只是构造阶段的内置默认值，不是最终结果** — `PAPERLESS_OCR_USER_ARGS` 在最后合并时位于右侧，可覆盖为 False，也可叠加 `redo_ocr=True` / `skip_text=True` 产生参数冲突
+8. 参数冲突传递给 `ocrmypdf.ocr()` 后的行为（报错/忽略/undefined）**仓库代码无法断言** — 属于 ocrmypdf 库内部实现细节，Paperless-ngx 不做任何校验或去重
 
 ### 3.2 Tika + Gotenberg — `src/paperless/parsers/tika.py`
 
