@@ -7,17 +7,18 @@
 2. **文本重算** — OCR 重跑（Reprocess）时的文本解析与归档文件重建
 3. **文件状态更新** — 文档变更后文件名生成、文件移动、搜索索引更新、WebSocket 通知等
 
+所有文件路径均以 `src/documents/` 为基准（项目根目录下）。
+
 ---
 
 ## 一、核心数据模型
 
 ### 1.1 Document 模型中的版本字段
 
-文件位置：[models.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/models.py#L157-L516)
+文件位置：`models.py`
 
 ```python
 class Document(SoftDeleteModel, ModelWithOwner):
-    # ...
     root_document = models.ForeignKey(
         "self",
         blank=True,
@@ -29,14 +30,14 @@ class Document(SoftDeleteModel, ModelWithOwner):
     version_label = models.CharField(max_length=64, blank=True, null=True)
 ```
 
-关键约束（[models.py#L341-L349](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/models.py#L341-L349)）：
+关键约束：
 - `(root_document, version_index)` 组合唯一
 - `root_document=None` 表示这是根文档（原始文档）
-- `version_index` 从 1 开始递增，单调不重复（即使中间版本被删除）
+- `version_index` 从 1 开始递增，单调不重复（即使中间版本被删除，也不会复用其索引）
 
 ### 1.2 ConsumableDocument — 消费输入载体
 
-文件位置：[data_models.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/data_models.py#L161-L188)
+文件位置：`data_models.py`
 
 ```python
 @dataclasses.dataclass
@@ -48,9 +49,11 @@ class ConsumableDocument:
     mailrule_id: int | None = None
 ```
 
+`root_document_id` 是判断"创建新版本"还是"创建全新文档"的唯一分水岭。
+
 ### 1.3 DocumentMetadataOverrides — 元数据覆盖
 
-文件位置：[data_models.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/data_models.py#L12-L148)
+文件位置：`data_models.py`
 
 ```python
 @dataclasses.dataclass
@@ -65,37 +68,103 @@ class DocumentMetadataOverrides:
 
 ### 1.4 PaperlessTask — 任务追踪
 
-文件位置：[models.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/models.py#L664-L816)
+文件位置：`models.py`
 
 ```python
 class TaskType(models.TextChoices):
     CONSUME_FILE = "consume_file"
     REPROCESS_DOCUMENT = "reprocess_document"
     BULK_UPDATE = "bulk_update"
-    # ...
 ```
 
 ---
 
-## 二、版本保存流程
+## 二、PDF 操作分类：哪些会创建新版本
 
-### 2.1 版本创建的触发入口
+判断原则：**只要 `ConsumableDocument(root_document_id=...)` 传了非空值就创建新版本；不传就创建全新文档。**
+
+### 2.1 操作分类总表
+
+| 操作 | 函数位置 | 创建新版本？ | 说明 |
+|------|---------|------------|------|
+| **旋转 PDF** | `bulk_edit.py` `rotate()` | ✅ 总是 | 始终 `root_document_id=pair.root_doc.id` |
+| **删除页面** | `bulk_edit.py` `delete_pages()` | ✅ 总是 | 始终 `root_document_id=pair.root_doc.id` |
+| **编辑 PDF** | `bulk_edit.py` `edit_pdf()` | ✅ 仅当 `update_document=True` | `update_document=False` 时创建全新文档（可选删除原文档） |
+| **移除密码** | `bulk_edit.py` `remove_password()` | ✅ 仅当 `update_document=True` | `update_document=False` 时创建全新文档（可选删除原文档） |
+| **合并 PDF** | `bulk_edit.py` `merge()` | ❌ 不创建 | 始终创建**全新独立文档**，可选 `delete_originals=True` 删除原文档 |
+| **分割 PDF** | `bulk_edit.py` `split()` | ❌ 不创建 | 始终创建**多个全新独立文档**，可选 `delete_originals=True` 删除原文档 |
+| **API 上传新版本** | `views.py` `update_version()` | ✅ 总是 | 用户显式上传新版本 |
+
+### 2.2 创建新版本的操作详细说明
+
+#### 2.2.1 旋转（rotate）
+
+`bulk_edit.py` 中 `rotate()` 对每个根文档生成旋转后的临时 PDF，然后：
+
+```python
+consume_file.apply_async(
+    kwargs={
+        "input_doc": ConsumableDocument(
+            source=DocumentSource.ConsumeFolder,
+            original_file=filepath,
+            root_document_id=pair.root_doc.id,  # ← 绑定根文档
+        ),
+        "overrides": overrides,  # 从根文档继承 title/correspondent/tags 等
+    },
+    headers={"trigger_source": trigger_source},
+)
+```
+
+#### 2.2.2 删除页面（delete_pages）
+
+与旋转完全相同的模式：临时文件 + `root_document_id=pair.root_doc.id` + 继承元数据。
+
+#### 2.2.3 编辑 PDF（edit_pdf）
+
+- **`update_document=True`**：单输出文档，创建新版本（`root_document_id=pair.root_doc.id`）
+- **`update_document=False`（默认）**：生成一个或多个全新独立文档，通过 `delete_original=True` 可选删除原文档
+
+代码中显式校验：`update_document and len(pdf_docs) > 1` 会抛 `ValueError`——因为多输出无法对应到单一版本链。
+
+#### 2.2.4 移除密码（remove_password）
+
+与 `edit_pdf` 相同的双模式：
+- `update_document=True` → 创建新版本
+- `update_document=False`（默认）→ 创建全新文档，可选 `delete_original=True`
+
+### 2.3 不创建新版本的操作
+
+#### 2.3.1 合并（merge）
+
+`ConsumableDocument` 构造时**不设置 `root_document_id`**，产生一个与原文档完全独立的新 Document。
+如果设置了 `delete_originals=True`，Celery canvas 的 `link` 会在消费成功后删除原文档（chord 保证等所有消费任务完成后才删）。
+
+#### 2.3.2 分割（split）
+
+每个切片都生成独立的新 Document（`title` 自动追加 `(split N)`），同样不设 `root_document_id`。
+`delete_originals=True` 时使用 Celery `chord`：所有分割任务完成后才执行删除。
+
+---
+
+## 三、版本保存流程
+
+### 3.1 版本创建的触发入口
 
 新版本创建均通过构造 `ConsumableDocument(root_document_id=X)` 并调用 `consume_file` 任务实现，主要入口：
 
 | 操作 | 入口文件 | 关键位置 |
 |------|---------|---------|
-| API 上传新版本 | [views.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/views.py#L1883-L1950) | `update_version()` 方法 |
-| 旋转 PDF | [bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/bulk_edit.py#L433-L500) | `rotate()` |
-| 删除页面 | [bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/bulk_edit.py#L692-L742) | `delete_pages()` |
-| 编辑 PDF（更新模式） | [bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/bulk_edit.py#L745-L872) | `edit_pdf(update_document=True)` |
-| 移除密码（更新模式） | [bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/bulk_edit.py#L875-L964) | `remove_password(update_document=True)` |
+| API 上传新版本 | `views.py` | `update_version()` 方法 |
+| 旋转 PDF | `bulk_edit.py` | `rotate()` |
+| 删除页面 | `bulk_edit.py` | `delete_pages()` |
+| 编辑 PDF（更新模式） | `bulk_edit.py` | `edit_pdf(update_document=True)` |
+| 移除密码（更新模式） | `bulk_edit.py` | `remove_password(update_document=True)` |
 
-### 2.2 版本创建核心流程
+### 3.2 版本创建核心流程
 
 **第一步：API/操作层 → 构造 ConsumableDocument**
 
-以 `update_version` 为例（[views.py#L1890-L1941](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/views.py#L1890-L1941)）：
+以 `update_version` 为例（`views.py`）：
 
 ```python
 input_doc = ConsumableDocument(
@@ -115,7 +184,7 @@ consume_file.apply_async(
 
 **第二步：consume_file 任务 → 插件链执行**
 
-文件位置：[tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/tasks.py#L123-L220)
+文件位置：`tasks.py`
 
 ```python
 @shared_task(bind=True)
@@ -131,7 +200,7 @@ def consume_file(self, input_doc, overrides=None):
 
 **第三步：ConsumerPlugin._create_version_from_root — 创建版本 Document**
 
-文件位置：[consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/consumer.py#L256-L295)
+文件位置：`consumer.py`
 
 ```python
 def _create_version_from_root(self, root_doc, *, text, page_count, mime_type):
@@ -163,7 +232,7 @@ def _create_version_from_root(self, root_doc, *, text, page_count, mime_type):
 
 **第四步：ConsumerPlugin.run — 保存版本并写入文件**
 
-文件位置：[consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/consumer.py#L408-L784)
+文件位置：`consumer.py`
 
 ```python
 with transaction.atomic():
@@ -209,9 +278,9 @@ with transaction.atomic():
         document_updated.send(sender=self.__class__, document=document.root_document)
 ```
 
-### 2.3 版本读取与解析
+### 3.3 版本读取与解析
 
-文件位置：[versioning.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/versioning.py)
+文件位置：`versioning.py`
 
 | 函数 | 作用 |
 |------|------|
@@ -220,11 +289,11 @@ with transaction.atomic():
 | `resolve_requested_version_for_root(root_doc, request)` | 解析 URL `?version=ID` 参数 |
 | `resolve_effective_document(request_doc, request)` | 综合逻辑：有 version 参数取指定版本，否则对根文档取最新版本 |
 
-根文档的 `get_effective_content()`（[models.py#L363-L400](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/models.py#L363-L400)）会自动取最新版本的 content 用于搜索和建议。
+根文档的 `get_effective_content()`（`models.py`）会自动取最新版本的 content 用于搜索和建议。
 
-### 2.4 版本删除
+### 3.4 版本删除
 
-文件位置：[views.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/views.py#L1994-L2055)
+文件位置：`views.py`
 
 ```python
 def delete_version(self, request, pk=None, version_id=None):
@@ -240,17 +309,17 @@ def delete_version(self, request, pk=None, version_id=None):
 
 ---
 
-## 三、OCR 重跑（文本重算）流程
+## 四、OCR 重跑（文本重算）流程
 
-### 3.1 入口
+### 4.1 入口
 
 | 入口 | 位置 |
 |------|------|
-| Web API `/api/documents/reprocess/` | [views.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/views.py#L3000-L3024) `ReprocessDocumentsView` |
-| bulk_edit.reprocess() | [bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/bulk_edit.py#L395-L402) |
-| 管理命令 `document_archiver` | [management/commands/document_archiver.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/management/commands/document_archiver.py) |
+| Web API `/api/documents/reprocess/` | `views.py` `ReprocessDocumentsView` |
+| bulk_edit.reprocess() | `bulk_edit.py` |
+| 管理命令 `document_archiver` | `management/commands/document_archiver.py` |
 
-### 3.2 bulk_edit.reprocess
+### 4.2 bulk_edit.reprocess
 
 ```python
 def reprocess(doc_ids: list[int]) -> Literal["OK"]:
@@ -264,9 +333,9 @@ def reprocess(doc_ids: list[int]) -> Literal["OK"]:
 
 **注意：** Reprocess **不创建新版本**，它直接在原 Document 记录上更新 content、archive_checksum、archive_filename。
 
-### 3.3 update_document_content_maybe_archive_file 核心实现
+### 4.3 update_document_content_maybe_archive_file 核心实现
 
-文件位置：[tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/tasks.py#L278-L395)
+文件位置：`tasks.py`
 
 ```python
 @shared_task
@@ -292,7 +361,9 @@ def update_document_content_maybe_archive_file(document_id) -> None:
             if parser.get_archive_path():
                 # 3a. 有归档文件：更新 content + archive_checksum + archive_filename
                 checksum = compute_checksum(parser.get_archive_path())
-                document.archive_filename = generate_unique_filename(document, archive_filename=True)
+                document.archive_filename = generate_unique_filename(
+                    document, archive_filename=True,
+                )
                 Document.objects.filter(pk=document.pk).update(
                     archive_checksum=checksum,
                     content=parser.get_text(),
@@ -327,26 +398,102 @@ def update_document_content_maybe_archive_file(document_id) -> None:
         clear_document_caches(document.pk)
 ```
 
-### 3.4 与版本创建的区别
+### 4.4 OCR 原地更新后的索引、缓存、信号相互关系
+
+这是最关键的细节：**`update_document_content_maybe_archive_file` 刻意避开了 Django 的信号机制，所有更新动作手动执行。**
+
+#### 4.4.1 为什么没有触发 post_save？
+
+代码使用的是 `Document.objects.filter(pk=document.pk).update(...)` 而非 `document.save()`。
+Django ORM 的 `QuerySet.update()` **不会**发出 `post_save` / `pre_save` 信号，这是有意为之：
+- 避免 `update_filename_and_move_files` 被触发（归档文件和源文件还没落盘，此时重命名会出错）
+- 避免 LLM 建议缓存失效逻辑被重复触发
+
+#### 4.4.2 手动更新链路详解
+
+```
+update_document_content_maybe_archive_file(document_id)
+        │
+        ├──► QuerySet.update(...)  ──► 直接更新 DB，不触发任何 Django 信号
+        │       │
+        │       ├── 更新 content（OCR 重新提取的文本）
+        │       ├── 更新 archive_checksum / archive_filename（若生成了归档 PDF）
+        │       └── 写审计日志 LogEntry（reason="Update document content"）
+        │
+        ├──► 文件落盘（FileLock 内）
+        │       ├── 归档 PDF 移至 document.archive_path
+        │       └── 缩略图移至 document.thumbnail_path
+        │
+        ├──► Tantivy 全文搜索索引
+        │       │   文件：search/_backend.py
+        │       │   入口：get_backend().add_or_update(document)
+        │       │   实现：先 remove(doc_id) 再 add_document(...) 实现 upsert
+        │       └── 索引字段含 title、content、tags、correspondent、type、created 等
+        │
+        ├──► LLM 向量索引（条件执行）
+        │       │   条件：AIConfig().llm_index_enabled == True
+        │       │   入口：llm_index_add_or_update_document(document)
+        │       └── 基于 document.content 重新计算 embedding 并写入向量库
+        │
+        └──► 缓存清除
+                │   入口：clear_document_caches(document.pk)
+                │   文件：caching.py
+                └── 删除三个 cache key：
+                    ├── doc_{id}_suggestions   （LLM 自动建议缓存）
+                    ├── doc_{id}_metadata      （元数据缓存）
+                    └── doc_{id}_thumbnail_modified （缩略图时间戳缓存）
+```
+
+#### 4.4.3 哪些链路**没有**被触发？
+
+由于既不发 `post_save` 也不发 `document_updated`，以下流程在 OCR 重跑后**不会执行**：
+
+| 未触发的动作 | 正常触发位置 | 影响 |
+|-------------|------------|------|
+| `update_filename_and_move_files` | `Document.post_save` | 文件名不会根据新 content 自动重命名（合理，因为 reprocess 不改 title/tags 等命名模板依赖字段） |
+| `update_llm_suggestions_cache` | `Document.post_save` | 该函数同样是调 `invalidate_llm_suggestions_cache()`，但 `clear_document_caches` 已手动清除了建议缓存，**实际效果一致** |
+| `run_workflows_updated` | `document_updated` 信号 | **DOCUMENT_UPDATED 类型的工作流不会运行**——这是一个有意的设计选择：OCR 重跑不视为"文档内容业务上的更新" |
+| `send_websocket_document_updated` | `document_updated` 信号 | **前端不会收到 WebSocket 推送**；但 Celery 任务完成状态会通过任务追踪通知前端 |
+
+#### 4.4.4 与 bulk_update_documents 的对比
+
+`bulk_update_documents`（批量元数据修改任务）走完整链路：
+
+```python
+for doc in documents:
+    clear_document_caches(doc.pk)
+    document_updated.send(sender=None, document=doc, ...)  # 工作流 + WebSocket
+    post_save.send(Document, instance=doc, created=False)  # 重命名 + LLM 缓存
+```
+
+而 OCR 重跑走**精简链路**：只更新数据库、索引、缓存，不触发工作流和 WebSocket。
+
+### 4.5 与版本创建的区别
 
 | 维度 | 版本创建 (consume_file + root_document_id) | OCR 重跑 (reprocess) |
 |------|------------------------------------------|----------------------|
 | 新 Document 记录 | 是，创建新行 | 否，原地更新 |
 | version_index | 递增分配 | 不变 |
-| content 更新 | 解析新文件得到 | 重新解析原文件 |
-| 归档文件 | 使用新文件生成 | 重新生成（覆盖原路径） |
-| 触发信号 | `document_consumption_finished` + `document_updated`（根） | 仅通过 `post_save` 触发后续 |
-| 审计日志 | "Version Added" 记录在根文档 | "Update document content" |
+| content 更新 | 解析新文件得到 | 重新解析原 source_path |
+| 归档文件 | 基于新文件生成 | 基于原 source_path 重新生成 |
+| DB 更新方式 | `document.save()` → 触发 `post_save` | `QuerySet.update()` → **不触发**任何信号 |
+| 搜索索引 | `document_consumption_finished` → `add_to_index` | 手动 `get_backend().add_or_update()` |
+| LLM 索引 | `document_consumption_finished` → `add_or_update_document_in_llm_index` | 手动 `llm_index_add_or_update_document()` |
+| 缓存清除 | `update_filename_and_move_files` 内 `clear_document_caches` | 手动 `clear_document_caches()` |
+| 工作流 | `document_consumption_finished`（DOCUMENT_ADDED）+ `document_updated`（根文档 DOCUMENT_UPDATED） | ❌ 不触发任何工作流 |
+| WebSocket 通知 | `document_updated` 触发 | ❌ 不发送（仅 Celery 任务状态通知） |
+| 文件名重算 | `post_save` → `update_filename_and_move_files` | ❌ 不重算（合理：reprocess 不改命名模板字段） |
+| 审计日志 | 根文档上记录 "Version Added" | 当前文档上记录 "Update document content" |
 
 ---
 
-## 四、文件状态更新流程
+## 五、文件状态更新流程
 
 文档保存/更新后触发一系列级联更新，主要通过 Django `post_save` 信号和自定义 `document_updated` / `document_consumption_finished` 信号驱动。
 
-### 4.1 信号注册
+### 5.1 信号注册
 
-文件位置：[apps.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/apps.py#L10-L36)
+文件位置：`apps.py`
 
 ```python
 def ready(self) -> None:
@@ -362,11 +509,11 @@ def ready(self) -> None:
     document_updated.connect(send_websocket_document_updated)     # WebSocket 通知
 ```
 
-### 4.2 update_filename_and_move_files — 文件名生成与文件移动
+### 5.2 update_filename_and_move_files — 文件名生成与文件移动
 
 **触发时机**：`Document.post_save`、`Document.tags.m2m_changed`、`CustomFieldInstance.post_save`
 
-文件位置：[signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/signals/handlers.py#L430-L628)
+文件位置：`signals/handlers.py`
 
 ```python
 @receiver(models.signals.post_save, sender=CustomFieldInstance, weak=False)
@@ -412,11 +559,11 @@ def update_filename_and_move_files(sender, instance, **kwargs):
         clear_document_caches(instance.pk)
 ```
 
-**版本文件命名**：当 `document.root_document_id is not None` 时，`generate_filename` 会追加 `-v{version_index}` 后缀（参考 [tests/test_file_handling.py#L1329-L1414](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/tests/test_file_handling.py#L1329-L1414)）。
+**版本文件命名**：当 `document.root_document_id is not None` 时，`generate_filename` 会追加 `-v{version_index}` 后缀。
 
-### 4.3 bulk_update_documents — 批量触发更新链
+### 5.3 bulk_update_documents — 批量触发更新链
 
-文件位置：[tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/tasks.py#L252-L275)
+文件位置：`tasks.py`
 
 ```python
 @shared_task
@@ -435,9 +582,9 @@ def bulk_update_documents(document_ids) -> None:
         update_llm_index(rebuild=False)
 ```
 
-### 4.4 document_updated 信号处理
+### 5.4 document_updated 信号处理
 
-文件位置：[signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/signals/handlers.py#L819-L851)
+文件位置：`signals/handlers.py`
 
 ```python
 def run_workflows_updated(sender, document, logging_group=None, **kwargs):
@@ -456,7 +603,7 @@ def send_websocket_document_updated(sender, document, **kwargs):
         )
 ```
 
-### 4.5 document_consumption_finished 信号处理
+### 5.5 document_consumption_finished 信号处理
 
 该信号在新文档/新版本消费完成后触发，依次执行：
 1. `add_inbox_tags` — 添加收件箱标签
@@ -468,7 +615,7 @@ def send_websocket_document_updated(sender, document, **kwargs):
 7. `run_workflows_added` — 执行 DOCUMENT_ADDED 工作流
 8. `add_or_update_document_in_llm_index` — 添加到 LLM 向量索引
 
-### 4.6 整体状态更新时序图
+### 5.6 整体状态更新时序图
 
 ```
 文档保存（Document.save / Document.objects.update）
@@ -511,9 +658,9 @@ update_filename_and_move_files   update_llm_suggestions_cache
 
 ---
 
-## 五、Celery 任务追踪
+## 六、Celery 任务追踪
 
-文件位置：[signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/signals/handlers.py#L1005-L1141)
+文件位置：`signals/handlers.py`
 
 通过 Celery 的 `before_task_publish`、`task_prerun`、`task_postrun` 信号，将每个异步任务记录到 `PaperlessTask` 模型中，便于前端展示进度。
 
@@ -531,17 +678,19 @@ TRACKED_TASKS = {
 
 ---
 
-## 六、关键文件索引
+## 七、关键文件索引
 
 | 文件 | 作用 |
 |------|------|
-| [models.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/models.py) | Document、PaperlessTask 等数据模型 |
-| [versioning.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/versioning.py) | 版本解析、根文档/最新版本获取 |
-| [consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/consumer.py) | 文档消费核心（ConsumerPlugin._create_version_from_root） |
-| [tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/tasks.py) | consume_file、update_document_content_maybe_archive_file 等 Celery 任务 |
-| [bulk_edit.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/bulk_edit.py) | rotate/merge/split/delete_pages/edit_pdf/remove_password/reprocess 等批量操作入口 |
-| [views.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/views.py) | API 层：update_version、delete_version、ReprocessDocumentsView 等 |
-| [signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/signals/handlers.py) | update_filename_and_move_files、工作流执行、WebSocket 通知、任务追踪 |
-| [signals/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/signals/__init__.py) | 自定义信号定义 |
-| [apps.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/apps.py) | 信号处理器注册 |
-| [data_models.py](file:///d:/fz/0601/solo-dogfeeding/code/114-paperless-ngx/src/documents/data_models.py) | ConsumableDocument、DocumentMetadataOverrides |
+| `models.py` | Document、PaperlessTask 等数据模型 |
+| `versioning.py` | 版本解析、根文档/最新版本获取 |
+| `consumer.py` | 文档消费核心（ConsumerPlugin._create_version_from_root） |
+| `tasks.py` | consume_file、update_document_content_maybe_archive_file、bulk_update_documents 等 Celery 任务 |
+| `bulk_edit.py` | rotate/merge/split/delete_pages/edit_pdf/remove_password/reprocess 等批量操作入口 |
+| `views.py` | API 层：update_version、delete_version、ReprocessDocumentsView 等 |
+| `signals/handlers.py` | update_filename_and_move_files、工作流执行、WebSocket 通知、任务追踪 |
+| `signals/__init__.py` | 自定义信号定义（document_consumption_finished、document_updated） |
+| `apps.py` | 信号处理器注册 |
+| `data_models.py` | ConsumableDocument、DocumentMetadataOverrides |
+| `caching.py` | clear_document_caches 等缓存工具 |
+| `search/_backend.py` | Tantivy 搜索索引的 add_or_update 实现 |
