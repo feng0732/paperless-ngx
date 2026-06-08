@@ -259,91 +259,129 @@ requires_pdf_rendition = True
 ```
 PDF 始终生成，与 `produce_archive` 无关。
 
-**完整流程**：
+---
+
+#### 3.6.1 整体流程（按代码执行顺序）
 
 ```
-parse(document_path, mime_type)
+parse(document_path, mime_type)                                    [L196-L282]
   │
-  ├─ 1. imap_tools 解析 EML → MailMessage 对象
-  │    └─ parse_file_to_message()，缺少 From 头则 ParseError
+  ├─ ① imap_tools 解析 EML → MailMessage 对象
+  │    └─ parse_file_to_message()                                [L469-L499]
+  │       缺少 From 头 → ParseError
   │
-  ├─ 2. 组装格式化文本（Subject/From/To/CC/BCC/附件列表 + HTML 文本 + 纯文本）
-  │    └─ HTML 内容经 Tika 服务器提取纯文本（tika_parse()）
+  ├─ ② 组装 DB 文本（build_formatted_text，内联定义 L233-L261）
+  │    拼接顺序：
+  │    ├─ Subject / From / To （必有）
+  │    ├─ CC / BCC / Attachments （可选）
+  │    ├─ "HTML content:" + Tika 提取的纯文本（仅 mail.html 非空时，调 tika_parse() L501-L532）
+  │    └─ mail.text 纯文本正文
   │
-  ├─ 3. 生成 PDF — generate_pdf()
-  │    │
-  │    ├─ A. 邮件正文 → HTML 模板渲染 (mail_to_html())
-  │    │    └─ Gotenberg Chromium HTML→PDF（chromium.html_to_pdf()）
-  │    │         └─ 应用 A4 纸张、0.1 英寸页边距、email_msg_template.html + output.css
-  │    │
-  │    ├─ B. 邮件 HTML 正文（如果有）→ generate_pdf_from_html()
-  │    │    ├─ <script> 标签替换为 <div hidden>（安全清洗）
-  │    │    ├─ 附件以 cid: 引用写入临时文件并注册为资源
-  │    │    └─ Gotenberg Chromium HTML→PDF
-  │    │
-  │    └─ C. 按 MailRule.PdfLayout 合并（Gotenberg merge 路由）
-  │         ├─ TEXT_HTML（默认）: [正文PDF, HTML内容PDF]
-  │         ├─ HTML_TEXT:         [HTML内容PDF, 正文PDF]
-  │         ├─ HTML_ONLY:         仅 HTML 内容
-  │         └─ TEXT_ONLY:         仅正文
+  ├─ ③ 日期处理：mail.date → self._date（无时区则 make_aware）
   │
-  └─ 4. 每一步 Gotenberg 调用都应用 PDF/A 格式化（_settings_to_gotenberg_pdfa()）
+  └─ ④ 生成归档 PDF — generate_pdf(mail_message, pdf_layout)    [L534-L606]
+       │
+       ▼
+       ┌─────────────────────────────────────────────────────────┐
+       │  步骤 1（始终执行）：生成正文模板 PDF                      │
+       │    mail_pdf_file = generate_pdf_from_mail()             │
+       │    └─ mail_to_html() → email_msg_template.html 渲染     │
+       │    └─ Gotenberg Chromium HTML→PDF                       │
+       │         (A4 纸、0.1 英寸边距、output.css、PDF/A 格式化)  │
+       │                                                         │
+       │  步骤 2：确定 pdf_layout（MailRule 或全局默认值）          │
+       │                                                         │
+       │  步骤 3：按 mail_message.html 分支                      │
+       │    ├─ 分支 A：无 HTML 正文                               │
+       │    │    └─ archive_path.write_bytes(mail_pdf_file)      │
+       │    │       直接拷贝正文 PDF，不调用 Merge，结束            │
+       │    │                                                     │
+       │    └─ 分支 B：有 HTML 正文                               │
+       │         ├─ 生成 HTML 正文 PDF：                          │
+       │         │    pdf_of_html_content =                      │
+       │         │      generate_pdf_from_html(mail.html, atts)  │
+       │         │    ├─ <script> → <div hidden>（安全清洗）      │
+       │         │    ├─ cid:xxx 附件注册为 Chromium 资源         │
+       │         │    └─ Gotenberg Chromium HTML→PDF + PDF/A     │
+       │         │                                               │
+       │         └─ Gotenberg Merge 路由合并（PDF/A 再次应用）     │
+       │              match pdf_layout:                          │
+       │              ├─ HTML_TEXT : [HTML内容PDF, 正文PDF]       │
+       │              ├─ HTML_ONLY : [HTML内容PDF]               │
+       │              ├─ TEXT_ONLY : [正文PDF]                   │
+       │              └─ TEXT_HTML | _ : [正文PDF, HTML内容PDF]   │
+       │                                                         │
+       └─────────────────────────────────────────────────────────┘
 ```
 
-**PDF/A 版本映射**（[_settings_to_gotenberg_pdfa()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L452-L466)，与 Tika 逻辑一致）：
+---
+
+#### 3.6.2 分支 A：无 HTML 正文（纯文本邮件）
+
+代码路径：[mail.py:L566-L567](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L566-L567)
+
+```python
+if not mail_message.html:
+    archive_path.write_bytes(mail_pdf_file.read_bytes())
+```
+
+**执行动作（按顺序）**：
+1. ✅ `generate_pdf_from_mail()` — 1 次 Gotenberg Chromium 调用（邮件头+正文模板渲染 PDF）
+2. ✅ `_settings_to_gotenberg_pdfa()` — 1 次 PDF/A 格式化（在 Chromium 调用内）
+3. ❌ `generate_pdf_from_html()` — **不执行**
+4. ❌ Gotenberg Merge — **不执行**（直接字节拷贝，无再次 PDF/A 处理）
+5. ❌ 不考虑 pdf_layout（TEXT_ONLY 等设置对纯文本邮件无影响）
+
+**Gotenberg 总调用 = 1 次** ｜ **PDF/A 应用 = 1 次**
+
+---
+
+#### 3.6.3 分支 B：有 HTML 正文（富文本邮件）
+
+代码路径：[mail.py:L568-L604](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L568-L604)
+
+**执行动作（按顺序）**：
+
+| 步骤 | 代码位置 | Gotenberg 调用 | PDF/A 应用 |
+|------|---------|---------------|-----------|
+| 1 | `generate_pdf_from_mail()` [L673-L737](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L673-L737) | Chromium HTML→PDF（邮件头+正文模板） | ✅ 第 1 次 |
+| 2 | `generate_pdf_from_html()` [L739-L834](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L739-L834) | Chromium HTML→PDF（邮件 HTML 正文）<br>+ `<script>`→`<div hidden>` 安全清洗<br>+ `cid:xxx` 附件注册为资源 | ✅ 第 2 次 |
+| 3 | `client.merge.merge()` [L576-L604](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L576-L604) | Merge 按 pdf_layout 合并 | ✅ 第 3 次 |
+
+**Merge 的 pdf_layout 实际含义（仅在有 HTML 时生效）**：
+| 值 | `route.merge([...])` 参数 | 最终内容 |
+|----|--------------------------|---------|
+| `TEXT_HTML`（默认） | `[正文PDF, HTML内容PDF]` | 邮件头模板页在前，HTML 正文在后 |
+| `HTML_TEXT` | `[HTML内容PDF, 正文PDF]` | HTML 正文在前，邮件头模板页在后 |
+| `HTML_ONLY` | `[HTML内容PDF]` | **只**含 HTML 正文，不含邮件头模板页 |
+| `TEXT_ONLY` | `[正文PDF]` | **只**含邮件头模板页，不含 HTML 正文（仍走 Merge 路由） |
+
+**Gotenberg 总调用 = 3 次** ｜ **PDF/A 应用 = 3 次**（每步 Gotenberg 都独立应用一次 PDF/A 格式化）
+
+---
+
+#### 3.6.4 PDF/A 版本映射
+
+方法：[_settings_to_gotenberg_pdfa()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L452-L466)，与 Tika 逻辑一致：
 
 | `OCR_OUTPUT_TYPE` | Gotenberg `PdfAFormat` | 说明 |
 |-------------------|------------------------|------|
 | `pdfa` / `pdfa-2` | `A2b` | 默认 PDF/A-2b |
-| `pdfa-1` | `A2b` | Gotenberg 不支持 A1，日志警告后降级 |
+| `pdfa-1` | `A2b` | Gotenberg 不支持 A1，日志 WARNING 后降级 |
 | `pdfa-3` | `A3b` | PDF/A-3b |
-| `pdf` | `None` | 不设置 `pdf_format()`，输出普通 PDF |
+| `pdf` | `None` | 不调用 `pdf_format()`，输出普通 PDF |
 
-**注意**：邮件解析器在三处独立调用 Gotenberg（正文 HTML→PDF、邮件 HTML→PDF、合并），每处都会单独应用一次 PDF/A 设置。
+---
 
-**邮件有/无 HTML 分支的 Gotenberg 调用差异**：
-
-代码位置：[generate_pdf()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L534-L606)
-
-```
-if not mail_message.html:          # 无 HTML 正文（纯文本邮件）
-    archive_path = mail_pdf_file   # 直接使用正文模板渲染的 PDF
-    └─ Gotenberg 调用次数 = 1 次
-       (仅 generate_pdf_from_mail → Chromium HTML→PDF)
-    └─ PDF/A 应用次数 = 1 次
-       (仅在 Chromium 阶段，无 Merge 二次处理)
-    └─ 不调用 Gotenberg Merge 路由
-
-else:                              # 有 HTML 正文（富文本邮件）
-    pdf_of_html_content = generate_pdf_from_html(...)
-    Gotenberg Merge 合并 [mail_pdf_file, pdf_of_html_content]
-    └─ Gotenberg 调用次数 = 3 次
-       1. generate_pdf_from_mail     → Chromium HTML→PDF（正文模板）
-       2. generate_pdf_from_html     → Chromium HTML→PDF（邮件 HTML 正文）
-       3. merge                      → Gotenberg Merge 按 PdfLayout 合并
-    └─ PDF/A 应用次数 = 3 次
-       (每次 Gotenberg 调用都独立调用 _settings_to_gotenberg_pdfa())
-    └─ Merge 阶段按 PdfLayout 决定最终组成：
-         TEXT_HTML : [正文PDF, HTML内容PDF]
-         HTML_TEXT : [HTML内容PDF, 正文PDF]
-         HTML_ONLY : [HTML内容PDF]           ← 不包含正文模板
-         TEXT_ONLY : [正文PDF]                ← 不包含邮件 HTML 正文
-```
-
-**HTML 正文安全处理**（[generate_pdf_from_html()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L739-L834)）：
-- `<script>` 标签整体替换为 `<div hidden>`，防止邮件中恶意脚本在 Chromium 渲染时执行
-- 内联附件 `cid:xxx` 引用写入临时文件并通过 `route.resource()` 注册给 Chromium
-- 文件名只保留字母数字，防止路径注入
-
-**PDF 文本层 vs 数据库 content 字段（Mail 路径）**：
+#### 3.6.5 PDF 文本层 vs 数据库 content 字段（Mail 路径）
 
 | 维度 | 值 | 来源 |
 |------|---|------|
 | `Document.content`（DB 字段） | `build_formatted_text()` 拼接结果 | `Subject:`/`From:`/`To:`/`CC:`/`BCC:`/`Attachments:` 头 + HTML 内容经 Tika 提取的纯文本 + mail.text 纯文本 |
-| 归档 PDF 是否含文本层 | 通常有 | Chromium 渲染 HTML 时自动嵌入的可复制文本（含 HTML 标签残留、排版格式字符） |
+| 归档 PDF 是否含文本层 | 通常有 | Chromium 渲染 HTML 时自动嵌入的可复制文本（可能含 HTML 标签残留、排版格式字符） |
 | 两者一致性 | **差异较大** | DB content 是结构化的头字段 + 清洗后的纯文本；PDF 文本层是 HTML 渲染的视觉输出，顺序、格式完全不同 |
 
-关键代码：[build_formatted_text()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L233-L261) 在 `parse()` 内联定义，拼接顺序：
+DB content 拼接顺序（[build_formatted_text() L233-L261](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L233-L261)）：
 ```
 Subject: {subject}
 From: {from}
@@ -351,7 +389,7 @@ To: {to_list}
 CC: {cc_list}        [可选]
 BCC: {bcc_list}      [可选]
 Attachments: ...     [可选]
-HTML content: {tika_parse(mail.html)}   [仅当有 HTML 正文时]
+HTML content: {tika_parse(mail.html)}   [仅当 mail.html 非空时]
 {mail.text}                         [纯文本正文]
 ```
 
@@ -578,39 +616,64 @@ python manage.py document_archiver -d <document_id>
        └─ Yes（或 requires_pdf_rendition=True 强制）
             │
             ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │                    按 Parser 分流                            │
-  ├─────────────────────────────────────────────────────────────┤
-  │                                                             │
-  │  Tesseract（PDF / 图片）                                    │
-  │    ├─ OCR_MODE=off + 图片 → img2pdf + pikepdf                │
-  │    │                       └─ 失败: 退回普通 PDF              │
-  │    ├─ OCR_MODE=off + PDF  → Ghostscript 直接转 PDF/A          │
-  │    ├─ auto + 已有文本 + 不需归档 → 仅 pdftotext              │
-  │    └─ OCRmyPDF.ocr() 主流程                                   │
-  │         ├─ 加密/签名 → 不生成归档，只用原文文本                │
-  │         ├─ 成功 → 文本 + 归档件                                │
-  │         └─ 失败 → Force OCR 回退                              │
-  │              ├─ 成功 → 文本 + 归档件                           │
-  │              └─ 失败 → ParseError 终止                        │
-  │                                                             │
-  │  Tika（Office: DOCX/XLSX/PPTX/ODT/RTF…）                    │
-  │    ├─ Tika 文本提取                                           │
-  │    │    └─ 500 错误: from_buffer 重试                          │
-  │    └─ Gotenberg LibreOffice → PDF                             │
-  │         └─ PDF/A-1 请求 → 静默降级为 A2b + 警告日志            │
-  │                                                             │
-  │  Mail（.eml / message/rfc822）                               │
-  │    ├─ imap_tools 解析 EML                                     │
-  │    ├─ 邮件正文 HTML 模板 → Gotenberg Chromium HTML→PDF         │
-  │    ├─ 邮件 HTML 正文（如有）→ Gotenberg Chromium HTML→PDF      │
-  │    ├─ Gotenberg Merge 按布局合并（TEXT_HTML/HTML_ONLY…）       │
-  │    └─ 每步均应用 PDF/A 格式化（A-1 降级为 A2b）                 │
-  │                                                             │
-  └─────────────────────────────────────────────────────────────┘
+  ┌────────────────────────────────────────────────────────────────────┐
+  │                        按 Parser 分流                               │
+  ├────────────────────────────────────────────────────────────────────┤
+  │                                                                    │
+  │  Tesseract（PDF / 图片）                                           │
+  │    ├─ OCR_MODE=off + 图片 → img2pdf + pikepdf                       │
+  │    │                       └─ 失败: 退回普通 PDF                     │
+  │    ├─ OCR_MODE=off + PDF  → Ghostscript 直接转 PDF/A                 │
+  │    ├─ auto + 已有文本 + 不需归档 → 仅 pdftotext                     │
+  │    └─ OCRmyPDF.ocr() 主流程                                          │
+  │         ├─ 加密/签名 → 不生成归档，只用原文文本                       │
+  │         ├─ 成功 → 文本 + 归档件                                       │
+  │         └─ 失败 → Force OCR 回退                                     │
+  │              ├─ 成功 → 文本 + 归档件                                  │
+  │              └─ 失败 → ParseError 终止                               │
+  │                                                                    │
+  │  Tika（Office: DOCX/XLSX/PPTX/ODT/RTF…）                           │
+  │    ├─ ① Tika 文本提取                                                │
+  │    │    └─ 500 错误: from_buffer 重试                                 │
+  │    └─ ② Gotenberg LibreOffice → PDF                                  │
+  │         └─ PDF/A-1 请求 → 静默降级为 A2b + 警告日志                   │
+  │                                                                    │
+  │  Mail（.eml / message/rfc822）                                      │
+  │    ├─ ① imap_tools 解析 EML → MailMessage                           │
+  │    ├─ ② 组装 DB 文本（头字段 + HTML 经 Tika 提取 + 纯文本）            │
+  │    │                                                                │
+  │    └─ ③ generate_pdf() 按代码顺序执行：                              │
+  │         │                                                           │
+  │         ├─ 步骤 1（始终）: generate_pdf_from_mail()                 │
+  │         │     邮件头+正文模板 → Gotenberg Chromium HTML→PDF          │
+  │         │     (应用第 1 次 PDF/A 格式化)                             │
+  │         │                                                           │
+  │         ├─ 步骤 2: 确定 pdf_layout                                  │
+  │         │                                                           │
+  │         └─ 步骤 3: if not mail_message.html ?                       │
+  │              │                                                      │
+  │              ├─ 无 HTML（纯文本邮件）                                │
+  │              │    └─ 直接字节拷贝正文PDF → archive_path              │
+  │              │       （不调用 Merge / 不生成 HTML PDF / 忽略 layout）│
+  │              │       结束: Gotenberg=1 次, PDF/A=1 次                │
+  │              │                                                      │
+  │              └─ 有 HTML（富文本邮件）                                │
+  │                   ├─ 步骤 3a: generate_pdf_from_html()              │
+  │                   │     邮件 HTML → Chromium HTML→PDF                │
+  │                   │     (<script>清洗, cid附件注册, PDF/A 第 2 次)  │
+  │                   │                                                  │
+  │                   └─ 步骤 3b: Gotenberg Merge 合并 (PDF/A 第 3 次)  │
+  │                        match pdf_layout:                             │
+  │                        ├─ TEXT_HTML : [正文PDF, HTML内容PDF]          │
+  │                        ├─ HTML_TEXT : [HTML内容PDF, 正文PDF]          │
+  │                        ├─ HTML_ONLY : [HTML内容PDF]                  │
+  │                        └─ TEXT_ONLY : [正文PDF]                      │
+  │                        结束: Gotenberg=3 次, PDF/A=3 次              │
+  │                                                                    │
+  └────────────────────────────────────────────────────────────────────┘
        │
        ▼
-  落盘到 ARCHIVE_DIR + 写入 DB（archive_filename + archive_checksum）
+  落盘到 ARCHIVE_DIR + 写入 DB（archive_filename + archive_checksum + content）
 ```
 
 ---
