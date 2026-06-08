@@ -206,6 +206,55 @@ if num_tags == 1:
 
 任意一层失败 → 删除模型文件，触发下次重新训练。
 
+### 4.5 模型更新与建议缓存的衔接（已核对）
+
+训练完成或跳过训练时，`train()` 方法会将三个 Key 写入 Django 缓存（TTL = 50 分钟，略短于每小时一次的训练周期）：
+
+| 缓存 Key | 值 | 来源 |
+|---|---|---|
+| `CLASSIFIER_VERSION_KEY` (`"classifier_version"`) | `FORMAT_VERSION`（当前 = 10） | `DocumentClassifier.FORMAT_VERSION` |
+| `CLASSIFIER_HASH_KEY` (`"classifier_hash"`) | 训练数据 hash 的 hex 字符串（`hasher.hexdigest()`） | 逐文档逐标签 ID 累积的 SHA256 |
+| `CLASSIFIER_MODIFIED_KEY` (`"classifier_modified"`) | `latest_doc_change`（datetime） | `docs_queryset.latest("modified").modified` |
+
+这三个 Key 是**传统分类器 suggestions 缓存有效性的根凭据**，通过两条路径控制缓存：
+
+**路径一：浏览器协商缓存（`src/documents/conditionals.py`）**
+
+`suggestions` API 通过 Django `@condition` 装饰器 + 以下两个函数实现 HTTP 级缓存：
+
+- `suggestions_etag()`：返回 `"{hash}:{NUMBER_OF_SUGGESTED_DATES}"`。若分类器版本不匹配或缓存 Key 不存在，返回 `None` → 禁用协商缓存，强制重算。
+- `suggestions_last_modified()`：返回 `CLASSIFIER_MODIFIED_KEY` 记录的 datetime。同样在版本不匹配时返回 `None`。
+
+浏览器携带 `If-None-Match` / `If-Modified-Since` 请求时，Django 自动比对，未变化则返回 `304 Not Modified`。
+
+**路径二：服务端建议缓存（`src/documents/caching.py`）**
+
+建议结果以 `SuggestionCacheData(classifier_version, classifier_hash, suggestions)` 结构存入缓存，Key 为 `doc_{document_id}_suggest`。
+
+- **写入**（`set_suggestions_cache()`）：保存时记录当前分类器的 version 和 hash。传统分类器和 LLM 建议**共用同一个缓存 Key**，通过 version/hash 区分：
+  - 传统分类器：`classifier_version = FORMAT_VERSION`，`classifier_hash = hexlify(last_auto_type_hash)`
+  - LLM 建议：`classifier_version = LLM_CACHE_CLASSIFIER_VERSION (= 1000)`，`classifier_hash = backend` 名称（如 `"ollama:llama3"`）
+
+- **读取**（`get_suggestion_cache()`）：必须同时满足才返回缓存结果：
+  ```
+  当前缓存的 CLASSIFIER_VERSION_KEY == FORMAT_VERSION
+                    &&
+  当前缓存的 CLASSIFIER_VERSION_KEY == doc_suggestions.classifier_version
+                    &&
+  当前缓存的 CLASSIFIER_HASH_KEY == doc_suggestions.classifier_hash
+  ```
+  任一条件不满足 → 删除该文档的建议缓存，下次请求重算。
+
+**失效链路总结**：
+```
+train_classifier 重训（或检测到变化）
+  ↓
+更新 CLASSIFIER_VERSION_KEY / CLASSIFIER_HASH_KEY / CLASSIFIER_MODIFIED_KEY
+  ↓
+├─ conditionals.py：ETag / Last-Modified 变化 → 浏览器缓存失效（304 不再命中）
+└─ get_suggestion_cache()：version / hash 不匹配 → 服务端缓存被删除，重算
+```
+
 ---
 
 ## 五、文档消费 → 自动打标签（已核对）
@@ -344,23 +393,51 @@ Document 对象
 
 RAG 上下文来自 `src/paperless_ai/indexing.py` 的向量检索（最多 5 篇相似文档）。
 
-### 7.2 名称 → 实体映射
+### 7.2 名称 → 实体映射：fuzzy match 与 suggested_* 的差异
 
-`src/paperless_ai/matching.py` → `match_tags_by_name()` 等：
+`src/paperless_ai/matching.py` 中的名称映射分为两个阶段，职责完全不同：
+
+**阶段一：`_match_names_to_queryset()` — 名称 → 实体（含 fuzzy match）**
 
 ```
-LLM 返回的名称字符串列表
+LLM 返回的名称字符串列表（如 ["Invoice", "HR Report", "UnknownTag"]）
   ↓
-① 名称标准化（lower + 去标点 + strip）
+① 名称标准化：lower + 去标点 + strip
   ↓
-② 精确名称匹配 → 命中则加入结果
+② 精确名称匹配（完全相等）→ 命中则加入结果，从候选中移除
   ↓
-③ 模糊匹配回退（difflib.get_close_matches，cutoff=0.8）
+③ fuzzy match 回退：difflib.get_close_matches(cutoff=0.8)
+   ├─ 对每个未命中的名称，找相似度 ≥ 0.8 的最近邻
+   └─ 命中则加入结果，从候选中移除
   ↓
-返回匹配到的实体对象列表
+返回匹配到的实体对象列表（仅包含数据库中已存在的实体）
 ```
 
-未匹配到的名称通过 `extract_unmatched_names()` 提取，在 API 响应中以 `suggested_tags` / `suggested_correspondents` 等字段返回，供前端展示"是否创建新标签"选项。
+**阶段二：`extract_unmatched_names()` — 从原始名称列表中过滤已匹配项**
+
+```
+输入：
+  - LLM 返回的原始名称列表（如 ["Invoice", "HR Report", "UnknownTag"]）
+  - 阶段一返回的已匹配实体列表（如 [Tag<Invoice>, Tag<"HR-Report">]）
+  ↓
+逻辑：
+  matched_names = {实体.name.lower() for 实体 in matched_objects}
+  返回 [name for name in names if name.lower() not in matched_names]
+  ↓
+输出：未匹配到的名称字符串列表（如 ["UnknownTag"]）
+```
+
+**两者的本质差异：**
+
+| 维度 | `_match_names_to_queryset`（fuzzy match） | `extract_unmatched_names` |
+|---|---|---|
+| **阶段** | 阶段一：匹配 | 阶段二：后处理过滤 |
+| **输入** | LLM 返回的名称列表 | LLM 返回的名称列表 + 已匹配实体列表 |
+| **输出** | 匹配到的**实体对象列表** | 未匹配到的**名称字符串列表** |
+| **fuzzy match 参与** | 是（作为精确匹配失败后的回退） | 否（仅基于已匹配实体的 name 做精确过滤） |
+| **API 响应字段** | `tags` / `correspondents` 等（ID 列表） | `suggested_tags` / `suggested_correspondents` 等（字符串列表） |
+
+**⚠️ 关键细节**：`extract_unmatched_names` 的匹配是**精确大小写不敏感匹配**，不走 fuzzy。例如 LLM 返回 `"HR Report"`，数据库中存在 `"HR-Report"`，fuzzy match 阶段已将其匹配到实体；`extract_unmatched_names` 比对的是实体的 `.name`（即 `"HR-Report"`），与 `"HR Report"` 不相等（空格 vs 连字符），因此该名称会**同时出现在** `tags`（已匹配 ID）和 `suggested_tags`（未匹配字符串）中。这是设计允许的行为。
 
 ### 7.3 API 响应结构
 
@@ -391,13 +468,15 @@ resp_data = {
 |---|---|
 | `src/documents/classifier.py` | 传统 ML 分类器：训练 / 预测 / 序列化 / 文本预处理 |
 | `src/documents/matching.py` | 规则匹配 + 分类器预测的并集合并逻辑；工作流匹配 |
+| `src/documents/caching.py` | 建议缓存读写：`get_suggestion_cache` / `set_suggestions_cache` / LLM 建议缓存；缓存 Key 常量定义 |
+| `src/documents/conditionals.py` | HTTP 协商缓存：`suggestions_etag` / `suggestions_last_modified`，基于分类器 version/hash/modified |
 | `src/documents/tasks.py` | Celery 任务：`train_classifier` / `consume_file` |
 | `src/documents/consumer.py` | 文档消费主流程，加载分类器并触发 `document_consumption_finished` |
 | `src/documents/signals/handlers.py` | 信号处理器：`set_tags` / `set_correspondent` / `set_document_type` / `set_storage_path` 等 |
 | `src/documents/apps.py` | Django AppConfig，注册所有信号连接 |
 | `src/documents/models.py` | `MatchingModel` 基类、`Document.suggestion_content` / `get_effective_content()` |
 | `src/paperless_ai/ai_classifier.py` | LLM 分类：Prompt 构建 / RAG / 响应解析 |
-| `src/paperless_ai/matching.py` | LLM 返回名称 → 数据库实体的名称模糊匹配（difflib，阈值 0.8） |
+| `src/paperless_ai/matching.py` | LLM 返回名称 → 实体的两阶段映射：`_match_names_to_queryset`（精确+fuzzy）+ `extract_unmatched_names`（精确过滤） |
 | `src/documents/views.py` | `DocumentViewSet.suggestions`（传统分类器建议）<br>`DocumentViewSet.ai_suggestions`（LLM 建议） |
 | `src/documents/management/commands/document_create_classifier.py` | 管理命令：手动触发训练 |
 | `src/documents/management/commands/document_retagger.py` | 管理命令：批量重打标 |
@@ -412,7 +491,10 @@ resp_data = {
 - [x] **增量训练检测**：`last_doc_change_time`（文档修改时间）+ `last_auto_type_hash`（逐文档逐标签 ID 累积的 SHA256）双重校验 — `src/documents/classifier.py` L285-L303
 - [x] **原子持久化**：`.pickle.part` 临时文件 + `rename` + HMAC-SHA256 签名 — `src/documents/classifier.py` L196-L219
 - [x] **多级缓存**：向量化结果缓存 5 分钟（`_vectorize`）、词干提取 LRU 缓存 10000 条（`StoredLRUCache`）— `src/documents/classifier.py` L518-L534
+- [x] **建议缓存失效链路**：`train_classifier` 更新 `CLASSIFIER_VERSION_KEY / HASH_KEY / MODIFIED_KEY`，同时驱动 conditionals.py 的浏览器协商缓存和 caching.py 的服务端建议缓存失效 — `src/documents/caching.py` L132-L184, `src/documents/conditionals.py` L19-L68
+- [x] **传统分类器与 LLM 建议共享缓存 Key**：同一 `doc_{id}_suggest` Key 通过 `classifier_version`（FORMAT_VERSION vs LLM_CACHE_CLASSIFIER_VERSION=1000）区分，互不干扰 — `src/documents/caching.py` L34-L44, L200-L233
 - [x] **规则 + ML 双轨并行**：MATCH_AUTO 走分类器，其余走规则匹配，结果取并集 — `src/documents/matching.py` L110-L134
 - [x] **信号解耦**：消费流程通过 `document_consumption_finished` 分发，共 8 个处理器 — `src/documents/apps.py` L24-L31
 - [x] **软删除保护**：收件箱标签和纯手动标签（`match=""` 且非 MATCH_AUTO）不会被自动系统删除 — `src/documents/signals/handlers.py` L248-L264
 - [x] **建议接口均不自动写入**：`suggestions`（传统分类器）和 `ai_suggestions`（LLM）两个 API 均仅返回 JSON，无 DB 写入逻辑；自动写入仅发生在消费信号处理器和 `document_retagger` 中 — `src/documents/views.py` L1388-L1528
+- [x] **LLM suggested_* 与 fuzzy match 的差异**：fuzzy match 是匹配阶段的回退（阈值 0.8），`extract_unmatched_names` 是匹配后的精确过滤（仅比对 `.name.lower()`），因此同一名称可能同时出现在 `tags`（ID 列表）和 `suggested_tags`（字符串列表）中 — `src/paperless_ai/matching.py` L18-L102
