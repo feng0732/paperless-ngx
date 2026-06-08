@@ -1225,40 +1225,247 @@ with transaction.atomic():
 
 > **注意**：`document_updated` 信号被多个处理器消费（`run_workflows_updated`、`send_websocket_document_updated`），其中 `run_workflows_updated` 必须在事务内执行（因为工作流修改要和文档修改在同一事务中原子提交）。因此不能简单地把整个信号改为 `on_commit`，只能对 WebSocket 发送这一个处理器单独延迟。
 
-#### 5.3.6 根文档 modified 字段的微妙之处
+#### 5.3.6 根文档 modified 字段为什么可能不变 —— 基于代码事实的精确核准
 
+**第一步：modified 的更新机制**
 文件：[models.py#L250-L255](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/models.py#L250-L255)
 
 ```python
 modified = models.DateTimeField(
     _("modified"),
-    auto_now=True,
+    auto_now=True,      # ← 只有实例 .save() 时才自动更新
     editable=False,
     db_index=True,
 )
 ```
 
-`auto_now=True` 意味着只有对该模型实例调用 `.save()` 时才会自动更新时间戳。在 `_create_version_from_root()` 中：
-文件：[consumer.py#L256-L295](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L256-L295)
+`auto_now=True` 的语义：仅当对该模型实例调用 `.save()`（且不指定 `update_fields` 排除 modified，或显式包含 modified）时才被更新。**通过外键关联新增子记录、反向查询、ManyToMany 变更都不会触发父实例的 modified 更新。**
 
+**第二步：上传新版本流程中 root_doc 的所有使用点**
+
+逐个核准 consumer.py 中 root_doc 是否被 `.save()`：
+
+| 位置 | 操作 | 是否触发 root_doc.save() |
+|-----|------|-------------------------|
+| [consumer.py#L593-L595](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L593-L595) | `root_doc = Document.objects.get(pk=self.input_doc.root_document_id)` | ❌ 仅查询 |
+| [consumer.py#L265](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L265) | `root_doc_frozen = Document.objects.select_for_update().get(pk=root_doc.pk)` | ❌ 仅加行锁 + 查询 |
+| [consumer.py#L279-L295](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L279-L295) | `version_doc = Document(root_document=root_doc_frozen, ...)` | ❌ 只建立 FK 关联，version_doc 是新实例 |
+| [consumer.py#L618-L622](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L618-L622) | `original_document.save()` | ❌ 保存的是 version_doc（original_document 是版本实例） |
+| [consumer.py#L630-L636](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L630-L636) | `LogEntry.objects.log_create(instance=root_doc, ...)` | ❌ auditlog 写 LogEntry 表，不改 root_doc 本身 |
+| [consumer.py#L729](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L729) | `document.save()` | ❌ document 此时是 version_doc（`document = original_document` 在 L665 被赋值），保存的是版本 |
+| [consumer.py#L732-L735](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L732-L735) | `document_updated.send(sender, document=document.root_document)` | ⚠️ 发送信号，是否 save 取决于信号处理器 |
+
+**结论（无工作流时）**：上传新版本流程本身 **从不直接调用 `root_doc.save()`**，因此 `root_doc.modified` 保持为上传前的旧值。
+
+**第三步：唯一例外 —— DOCUMENT_UPDATED 工作流触发时会显式 save root_doc**
+
+信号处理器连接顺序（apps.py）：
 ```python
-def _create_version_from_root(self, root_doc, *, text, page_count, mime_type):
-    root_doc_frozen = Document.objects.select_for_update().get(pk=root_doc.pk)
-    # ↑ 只加行锁，不修改 root_doc_frozen 的任何字段，也不 .save()
-    version_doc = Document(
-        root_document=root_doc_frozen,  # ← 只建立外键关联
-        version_index=next_version_index + 1,
-        modified=timezone.now(),         # ← version_doc 的 modified
-        ...
-    )
-    return version_doc
+document_updated.connect(run_workflows_updated)           # 先执行
+document_updated.connect(send_websocket_document_updated) # 后执行
 ```
 
-整个流程中，**root_doc 从未被 .save()**，因此 `root_doc.modified` 保持为旧值。`send_websocket_document_updated()` 中 `document.refresh_from_db()` 虽然在事务内重新查询，但 root_doc 自身没有任何字段变化（新增 version_doc 是另一条记录，不影响 root_doc 的 modified），所以 WebSocket 消息中携带的 `modified` 是旧时间戳。
+`run_workflows_updated` → `run_workflows(DOCUMENT_UPDATED, document=root_doc)` 的执行路径：
+文件：[handlers.py#L875-L880](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/signals/handlers.py#L875-L880)
 
-对前端的影响：
-- `handleIncomingDocumentUpdated()` 的回声判定对比的是 `lastLocalSaveModified`（用户本地 save 时设置），正常查看时为 `null`，所以不会被误判为回声而忽略
-- 但如果用户恰好在上传新版本的同时修改了文档并保存，旧的 modified 时间戳可能导致时序判定错误
+```python
+if isinstance(document, Document) and document.root_document_id is not None:
+    # 传入的是 version_doc → 跳过
+    return None
+# 传入的是 root_doc（root_document_id 为 None）→ 正常执行工作流
+```
+
+当存在匹配的 DOCUMENT_UPDATED 工作流且触发了 ASSIGNMENT/REMOVAL 等修改操作时：
+文件：[handlers.py#L963-L984](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/signals/handlers.py#L963-L984)
+
+```python
+if not use_overrides:   # DOCUMENT_UPDATED 触发时 overrides=None → use_overrides=False
+    document.title = document.title[:128]
+    document.save(
+        update_fields=[
+            "title", "correspondent", "document_type", "storage_path",
+            "owner", "modified",   # ← 显式包含 modified！
+        ],
+    )
+```
+
+> L973-974 的代码注释也明确指出：*modified has auto_now=True but is not auto-added when update_fields is specified, so it must be listed explicitly.*
+
+**结论（有工作流时）**：如果用户配置了 DOCUMENT_UPDATED 类型的工作流且文档匹配，工作流执行时会**显式 save root_doc** 并更新 `modified`。随后 `send_websocket_document_updated()` 中的 `document.refresh_from_db()` 就能拿到更新后的时间戳。
+
+**第四步：send_websocket_document_updated 中 refresh_from_db 的作用**
+文件：[handlers.py#L837-L838](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/signals/handlers.py#L837-L838)
+
+```python
+# At this point, workflows may already have applied additional changes.
+document.refresh_from_db()
+```
+
+代码注释明确说明：工作流可能已对文档施加了额外修改，所以重新从 DB 拉取。但 `refresh_from_db()` 只能看到**同一 DB 连接**上已提交的写入。由于整个调用链在同一事务内，工作流的 save() 对这个连接是可见的；但对其他连接（如前端 HTTP 请求使用的连接），在事务 COMMIT 之前均不可见。
+
+**对前端判定的实际影响**：
+- `handleIncomingDocumentUpdated()` 的回声判定对比的是 `lastLocalSaveModified`（仅在用户本地 PATCH 保存成功时设置），正常查看时为 `null`，所以旧时间戳不会被误判为回声而忽略
+- 仅当用户恰好在上传新版本的同时，自己也在 PATCH 修改文档并保存时，旧 modified 才可能与本地保存的时间戳碰巧相等而被错误忽略（概率极低）
+
+---
+
+#### 5.3.7 详情页 HTTP GET 序列化 versions 的完整查询路径
+
+**前端 API 调用链**：
+
+| 调用方 | 方法 | URL | 参数 |
+|-------|------|-----|------|
+| DocumentDetailComponent.loadDocument() | `documentsService.get(documentId)` | `GET /api/documents/{id}/` | `full_perms=true`（全量字段，含 versions） |
+| DocumentVersionDropdownComponent（收到 SUCCESS 后） | `documentsService.getVersions(documentId)` | `GET /api/documents/{id}/` | `fields=id,versions`（仅稀疏字段） |
+
+文件：[document.service.ts#L196-L213](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/services/rest/document.service.ts#L196-L213)
+```typescript
+get(id: number, versionID: number = null, fields: string = null): Observable<Document> {
+    const params = { full_perms: true }
+    if (versionID) params.version = versionID.toString()
+    if (fields) params.fields = fields
+    return this.http.get<Document>(this.getResourceUrl(id), { params })
+}
+
+getVersions(documentId: number): Observable<Document> {
+    return this.http.get<Document>(this.getResourceUrl(documentId), {
+        params: { fields: 'id,versions' },
+    })
+}
+```
+
+**后端 ViewSet 路径**：
+
+`GET /api/documents/{id}/` → `DocumentViewSet.retrieve()`：
+文件：[views.py#L1116-L1140](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/views.py#L1116-L1140)
+
+```python
+def retrieve(self, request, *args, **kwargs):
+    response = super().retrieve(request, *args, **kwargs)
+    # ↓ RetrieveModelMixin.retrieve() 的默认实现：
+    #   instance = self.get_object()  ← get_queryset().get(pk=pk)
+    #   serializer = self.get_serializer(instance)  ← DocumentSerializer(instance)
+    #   return Response(serializer.data)
+    if "version" not in request.query_params or ...:
+        return response
+    # version 参数时才走额外逻辑（切换预览版本的 content）
+```
+
+DocumentViewSet 没有自定义的 `get_queryset()` 覆盖（使用 `Document.objects.all()`），也没有 `prefetch_related('versions')`。因此 versions 字段的查询由 serializer 在序列化时**按需触发**。
+
+**Serializer 中 versions 字段的精确实现**：
+文件：[serialisers.py#L1009](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/serialisers.py#L1009)
+```python
+versions = SerializerMethodField()  # ← 调用 get_versions()
+```
+
+文件：[serialisers.py#L1043-L1079](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/serialisers.py#L1043-L1079)
+
+```python
+@extend_schema_field(DocumentVersionInfoSerializer(many=True))
+def get_versions(self, obj):
+    # Step 1: 确定根文档
+    root_doc = obj if obj.root_document_id is None else obj.root_document
+    if root_doc is None:
+        return []
+
+    # Step 2: 检查是否已有 prefetch 缓存（DocumentViewSet 没有 prefetch，所以走 else）
+    prefetched_cache = getattr(obj, "_prefetched_objects_cache", None)
+    prefetched_versions = (
+        prefetched_cache.get("versions")
+        if isinstance(prefetched_cache, dict) else None
+    )
+
+    versions: list[Document]
+    if prefetched_versions is not None:
+        versions = [*prefetched_versions, root_doc]
+    else:
+        # Step 3: ★ 执行独立 SQL 查询 —— 这是决定新版本是否可见的关键查询
+        versions_qs = Document.objects.filter(root_document=root_doc).only(
+            "id", "added", "checksum", "version_label",
+        )
+        versions = [*versions_qs, root_doc]
+        # ↑ 此时 Django ORM 发出：SELECT id, added, checksum, version_label
+        #                    FROM documents_document
+        #                   WHERE root_document_id = <root_doc.pk>
+
+    # Step 4: 组装 + 按 id 倒序（最新版本在前）
+    def build_info(doc: Document) -> _DocumentVersionInfo:
+        return {
+            "id": doc.id,
+            "added": doc.added,
+            "version_label": doc.version_label,
+            "checksum": doc.checksum,
+            "is_root": doc.id == root_doc.id,
+        }
+    info = [build_info(doc) for doc in versions]
+    info.sort(key=lambda item: item["id"], reverse=True)
+    return info
+```
+
+**核心要点**：versions 列表来自于 `Document.objects.filter(root_document=root_doc)` 的**独立 SQL 查询**，不依赖于 `root_doc` 实例的任何缓存。因此：
+- 查询结果完全取决于**执行此 SELECT 时 DB 中已 COMMIT 的数据**
+- 不经过 root_doc 的 `_prefetched_objects_cache`（ViewSet 没有 prefetch）
+- `*versions_qs` 触发 QuerySet 的实际求值 → 发 SQL
+
+---
+
+#### 5.3.8 事务 COMMIT 前后 versions 查询结果的可见性差异
+
+结合 PostgreSQL 的 MVCC（Multiversion Concurrency Control）隔离级别（默认 `READ COMMITTED`）：
+
+```
+时间轴          Celery Worker (连接 #A)             PostgreSQL               Daphne/API (连接 #B)
+  │
+  T0  transaction.atomic() 开始
+  │     BEGIN
+  │
+  T1  version_doc = Document(root_document=root_doc, ...)
+  │     INSERT INTO documents_document (...) VALUES (...)
+  │     ← 在连接 #A 的事务快照中新增一行，其他连接不可见
+  │
+  T2  version_doc.save()
+  │     ← 仍在连接 #A 的私有事务空间
+  │
+  T3  document_updated.send() → Redis PUBLISH ──微秒级──→ 到达连接 #B
+  │                                                       WebSocket.onmessage → document_updated
+  │                                                                         ↓
+  │                                                       loadDocument() → HTTP GET /api/documents/{id}/
+  │                                                                         ↓
+  │                                                       DocumentSerializer.get_versions():
+  │                                                         SELECT ... FROM documents_document
+  │                                                         WHERE root_document_id = <pk>
+  │                                                         ← 连接 #B 在 READ COMMITTED 下
+  │                                                            只能看到 T0 之前 COMMIT 的行
+  │                                                            ❌ 新 version_doc 不可见！
+  │                                                            versions 数组少一条
+  │
+  T4  删除临时文件 (I/O 等待 几ms~几十ms)
+  │
+  T5  transaction.atomic() 退出 → COMMIT
+  │     ← 新 version_doc 行对所有连接可见
+  │
+  T6  run_post_consume_script()
+  │
+  T7  _send_progress(SUCCESS) → Redis PUBLISH ────────→ 到达连接 #B
+                                                          WebSocket.onmessage → status_update
+                                                                         ↓
+                                                          getVersions() → HTTP GET /api/documents/{id}/?fields=id,versions
+                                                                         ↓
+                                                          DocumentSerializer.get_versions():
+                                                            SELECT ... WHERE root_document_id = <pk>
+                                                            ← T5 已 COMMIT
+                                                            ✅ 新 version_doc 可见！
+                                                            versions 数组完整
+```
+
+**实证总结**：
+| 消息类型 | DB 状态 | `filter(root_document=root_doc)` 查询结果 | 前端 versions 数组 |
+|---------|---------|------------------------------------------|-------------------|
+| `document_updated`（事务内发送，通常先到达） | T3，未 COMMIT | 不包含新 version_doc 行 | ❌ 缺失最新版本 |
+| `status_update(SUCCESS)`（事务外发送，通常后到达） | T7，已 COMMIT + post consume 完成 | 包含新 version_doc 行 | ✅ 完整，含最新版本 |
+
+这也解释了为什么**两条消息共同存在时最终状态总是正确**：即使第一次 `loadDocument()` 由于事务未 COMMIT 拿到旧 versions，几十毫秒后 `status_update(SUCCESS)` 驱动的第二次 `getVersions()` 一定能拿到完整版本列表。高 I/O 负载下用户可能短暂看到版本列表不完整，但最终会被第二次刷新修正。
 
 ### 5.4 后端 WebSocket 分发 —— Consumer 侧
 
@@ -1731,10 +1938,17 @@ loadDocument(documentId, forceRemote):
 
 ### 7.9 事务内发送通知的竞态窗口
 - **双写割裂问题**：Django `transaction.atomic()` 无法控制 Redis Pub/Sub 的发送时机，`async_to_sync(channel_layer.group_send)` 在事务内调用时会立即发出 Redis 消息，而 DB COMMIT 可能在几毫秒~几十毫秒之后才发生
-- **前端读到旧数据的风险**：消息到达浏览器后 `loadDocument()` 发起新的 HTTP 请求（独立 DB 连接），PostgreSQL READ COMMITTED 隔离级别下看不到未提交的 version_doc，versions 数组可能短暂缺失新版本
-- **信号处理器的内部可见性**：`send_websocket_document_updated()` 内的 `refresh_from_db()` 在发送者事务内执行，能看到未提交数据，但这仅限于发送方所在的同一 DB 连接
-- **缓解机制**：`status_update(SUCCESS)` 在事务外 + post consume 脚本之后发送，是端到端可靠的完成信号，会触发第二次 `getVersions()` 拉取，最终状态收敛正确
+- **versions 查询的可见性完全取决于 COMMIT 时机**：`DocumentSerializer.get_versions()` 通过独立 SQL `Document.objects.filter(root_document=root_doc)` 拉取版本列表，不经过 prefetch 缓存，查询结果严格遵循 PostgreSQL MVCC，只能看到 SQL 执行时刻已 COMMIT 的行
+- **document_updated 消息到达时 versions 数组可能缺失最新版本**：事务未 COMMIT 前 `filter(root_document=root_doc)` 查不到新插入的 version_doc 行，详情页第一次 reload 时版本下拉少一条
+- **信号处理器的内部可见性**：`send_websocket_document_updated()` 内的 `refresh_from_db()` 在发送者事务内执行，能看到同一连接上未提交数据，但这对其他连接（前端 HTTP 请求）无效
+- **缓解机制**：`status_update(SUCCESS)` 在事务外 + post consume 脚本之后发送，是端到端可靠的完成信号，会触发第二次 `getVersions()` 拉取，此时 COMMIT 已完成，versions 一定完整
 - **改进方案**：对 `send_websocket_document_updated` 处理器单独使用 `transaction.on_commit()` 延迟 Redis 发送到 COMMIT 之后，但不能对整个 `document_updated` 信号做此处理（因为 `run_workflows_updated` 必须在事务内原子提交）
 
-### 7.10 与 SSE 的区别
+### 7.10 根文档 modified 不变的代码核准结论
+- **上传新版本流程本身从不 save root_doc**：consumer.py 中 root_doc 的 7 处使用点全部是查询、加行锁、外键关联、LogEntry 写入，没有一处调用 `root_doc.save()`，因此 `auto_now=True` 的 modified 字段保持旧值
+- **唯一例外：DOCUMENT_UPDATED 工作流**：如果配置了匹配的工作流，`run_workflows()` 会显式调用 `document.save(update_fields=[..., "modified"])` 更新 root_doc，此时 `send_websocket_document_updated()` 中的 `refresh_from_db()` 能在同一事务内看到新时间戳
+- **refresh_from_db 的连接可见性边界**：只能看到同一 DB 连接中的写入，前端新 HTTP 请求使用独立连接，在 COMMIT 之前看不到工作流对 root_doc 的修改
+- **对前端回声判定几乎无影响**：`handleIncomingDocumentUpdated()` 只对比 `lastLocalSaveModified`（用户本地 PATCH 保存时才设置），正常查看时为 null，旧时间戳不会被误判为回声
+
+### 7.11 与 SSE 的区别
 系统仅在 AI Chat 功能中使用 SSE 风格的 `StreamingHttpResponse`（[views.py](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/views.py#L2181-L2185)），用于流式输出 LLM 回答。该实现与实时通知系统完全独立，不经过 WebSocket / Channels 层。
