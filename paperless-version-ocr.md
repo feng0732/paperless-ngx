@@ -144,18 +144,60 @@ consume_file.apply_async(
 每个切片都生成独立的新 Document（`title` 自动追加 `(split N)`），同样不设 `root_document_id`。
 `delete_originals=True` 时使用 Celery `chord(header=consume_tasks, body=delete.si([doc.id]))`——因为分割会产生**多个**消费任务，需要等待所有切片消费完成后才执行删除。
 
-#### 2.3.3 各操作删除原文档的 Celery 原语对比
+#### 2.3.3 各操作删除原文档的 Celery 原语与回滚链路对比
 
 判断原则：**输出只有 1 个文档用 `link`，输出多个文档用 `chord`**。
 
-| 操作 | delete_original=True 时的 Celery 原语 | 原因 |
-|------|-------------------------------------|------|
-| 合并（merge） | `consume_task.apply_async(link=[delete.si(...)])` | 只有 1 个合并输出文档 |
-| 分割（split） | `chord(header=consume_tasks, body=delete.si(...))` | N 个切片输出，需全部成功后再删 |
-| 编辑 PDF（edit_pdf，`update_document=False`） | `chord(header=consume_tasks, body=delete.si(...))` | 可输出多个文档，需全部成功后再删 |
-| 移除密码（remove_password，`update_document=False`） | `chord(header=consume_tasks, body=delete.si(...))` | 代码结构复用多任务模式（即使只有 1 个输出） |
+| 操作 | Celery 原语 | release ASN（backup） | link_error 回滚 | try/except 兜底 | 原因 |
+|------|-----------|----------------------|----------------|----------------|------|
+| 合并（merge） | `consume_task.apply_async(link=[delete.si(...)])` | ✅ | ✅ | ✅ | 只有 1 个合并输出文档；需把原文档 ASN 转移给新合并文档 |
+| 分割（split） | `chord(header=consume_tasks, body=delete.si(...))` | ✅ | ✅ | ✅ | N 个切片输出，需全部成功后再删；需释放原文档 ASN |
+| 编辑 PDF（edit_pdf，`update_document=False`） | `chord(header=consume_tasks, body=delete.si(...))` | ✅ | ✅ | ✅ | 可输出多个文档，需全部成功后再删；需释放原文档 ASN |
+| 移除密码（remove_password，`update_document=False`） | `chord(header=consume_tasks, body=delete.si(...))` | ❌ | ❌ | ❌ | 不涉及 ASN 变更；即使消费失败原文档也未被修改，无需回滚 |
 
-所有删除原文档的场景均配置了 `link_error=[restore_archive_serial_numbers_task.s(backup)]`，消费失败时会将已释放的 ASN 还原。
+#### 2.3.4 ASN 回滚链路详解（仅 merge / split / edit_pdf）
+
+三个涉及 ASN 转移/释放的操作共享完全相同的三段式回滚模式：
+
+**第一步：同步释放 ASN 并获取 backup**
+
+```python
+backup = release_archive_serial_numbers(affected_docs)
+```
+
+- `release_archive_serial_numbers()` 将原文档的 `archive_serial_number` 置为 NULL，
+  并返回原始 ASN 列表（"backup"）供回滚时恢复。
+- 此操作在当前请求线程**同步执行**——如果后续 Celery 任务投递失败，需要立即手动恢复。
+
+**第二步：配置 Celery link_error（异步失败回滚）**
+
+```python
+link_error=[restore_archive_serial_numbers_task.s(backup)]
+```
+
+- 如果 Celery worker 侧消费任务执行失败，`link_error` 会触发 `restore_archive_serial_numbers_task`，
+  把 backup 中记录的 ASN 重新写回原文档。
+
+**第三步：try/except 兜底（任务投递失败回滚）**
+
+```python
+try:
+    consume_task.apply_async(link=..., link_error=...)
+except Exception:
+    restore_archive_serial_numbers(backup)   # 同步恢复
+    raise
+```
+
+- 如果 `apply_async()` 本身抛异常（例如 Broker 不可达），任务根本没进队列，
+  `link_error` 也不会触发，此时由同步的 `restore_archive_serial_numbers(backup)` 兜底。
+
+#### 2.3.5 remove_password 为什么不需要回滚
+
+`remove_password` 删除原文档时既不调 `release_archive_serial_numbers`，也不配置 `link_error`：
+
+- **ASN 不变**：移除密码只是输出一份无密码副本，原文档和新文档的 ASN 没有转移关系，不需要释放/恢复。
+- **原文档未改动**：即使消费任务失败，原文档（带密码）依然完整存在于数据库和磁盘，没有任何副作用需要回滚。
+- **失败代价**：最坏情况是临时文件残留在 `SCRATCH_DIR`，不影响业务数据一致性。
 
 ---
 
