@@ -135,7 +135,7 @@ OCR_MODE=auto + 原文有文本 + 不生成归档:
   │
   └── Fallback 重试（safe_fallback=True）:
         ├── construct_ocrmypdf_parameters(..., safe_fallback=True)
-        │     └── force_ocr=True，其他配置尽量简化
+        │     └── 仅强制 force_ocr=True，其他全部配置原样保留（见 safe_fallback 详解）
         └── ocrmypdf.ocr(fallback_args)
               ├── 成功 → 提取文本，归档文件
               └── 失败 → raise ParseError
@@ -146,6 +146,33 @@ OCR_MODE=auto + 原文有文本 + 不生成归档:
   3. 从归档 PDF 中用 pdftotext 提取
   4. 仍为空 → 若原 PDF 有文本则用原文本，否则空串 + 告警
 ```
+
+**safe_fallback 实际保留/修改的配置详解**（`construct_ocrmypdf_parameters()` L266-L383）：
+
+`safe_fallback` 的代码影响只有 **一行**（L293）：
+```python
+if safe_fallback or self.settings.mode == ModeChoices.FORCE:
+    ocrmypdf_args["force_ocr"] = True
+```
+
+也就是说，`safe_fallback=True` **等价于强制 OCR 模式为 FORCE**，其他所有配置**不做任何简化或屏蔽**，**完整保留**：
+
+| 配置项 | safe_fallback 时是否保留 | 说明 |
+|--------|-------------------------|------|
+| `force_ocr` | ✅ **被强制设为 True** | 覆盖 redo_ocr/skip_text/auto 的模式判断 |
+| `use_threads` / `jobs` | ✅ 保留 | 线程配置不变 |
+| `language` | ✅ 保留 | OCR 语言不变 |
+| `output_type` | ✅ 保留 | pdfa / pdf / pdfa-1/2/3 不变 |
+| `color_conversion_strategy` | ✅ 保留 | 仅在含 "pdfa" 的 output_type 时生效 |
+| `clean` / `clean_final` | ✅ 保留 | 图像去斑点预处理不变 |
+| `deskew` | ✅ 保留 | 校正倾斜不变（注意 `mode != REDO` 的条件仍有效，但 safe_fallback 下 mode 实际被强制为 FORCE，所以仍保留） |
+| `rotate_pages` / `rotate_pages_threshold` | ✅ 保留 | 自动旋转不变 |
+| `pages` / `sidecar` | ✅ 保留 | 只处理前 N 页 / 生成 sidecar 文本不变 |
+| `image_dpi` / alpha 移除 | ✅ 保留 | 图片 DPI 三级回退、alpha 通道兼容性处理不变 |
+| `user_args`（OCR_USER_ARGS） | ✅ 保留 | 用户自定义参数完整合并 |
+| `max_image_mpixels` | ✅ 保留 | 像素限制不变 |
+
+因此 safe_fallback 的"安全"含义是：**切换到最保守的 OCR 模式（force_ocr 强制对所有页面跑 OCR，不管有没有已有文本层），而不是减少参数**。第一次失败通常是由于 REDO/AUTO 模式下 ocrmypdf 的文本层检测出问题，强制 force_ocr 绕过这些检测。
 
 ### 3.2 Tika + Gotenberg — `src/paperless/parsers/tika.py`
 
@@ -210,11 +237,63 @@ if (
 ```
 1. qpdf --replace-input working_copy   (原地修复/线性化 PDF)
 2. 重新 magic.from_file() 检测 MIME
-3. 如果检测成功：
-     └── 备份原始文件到 tmpdir/uo/<filename> 作为 unmodified_original
-         （后续存储时优先用 unmodified_original 作为 source，而不是 qpdf 修改过的 working_copy）
+3. 备份原始文件到 tmpdir/uo/<filename> 作为 unmodified_original（见下方备份条件）
 4. 如果 qpdf 失败 → 仅记录错误日志，不中断流程（working_copy 保持原样）
 ```
+
+**备份（unmodified_original）的精确条件**：
+
+从代码结构看，`unmodified_original` 的赋值位于 qpdf `run_subprocess()` 调用之后、**与 qpdf 处于同一个 try 块中**，且 **qpdf 之后没有任何 MIME 有效性检查的 if 分支**：
+
+```python
+try:
+    run_subprocess(["qpdf", "--replace-input", working_copy], ...)  # L441
+    mime_type = magic.from_file(self.working_copy, mime=True)       # L449
+    # 👇 注意：这里没有 if mime_type 有效的判断，直接执行备份
+    self.unmodified_original = Path(tmpdir) / Path("uo") / Path(self.filename)  # L452
+    self.unmodified_original.parent.mkdir(exist_ok=True)
+    copy_file_with_basic_stats(
+        self.input_doc.original_file,   # 注意：备份源是 input_doc.original_file
+        self.unmodified_original,       #       不是 qpdf 之前的 working_copy 副本
+    )
+except Exception as e:
+    self.log.error(f"Error attempting to clean PDF: {e}")
+```
+
+因此备份的唯一前置条件是：**qpdf 子进程退出码为 0 且 magic 重新检测没有抛异常**。具体：
+
+| 场景 | `unmodified_original` 是否被设置 |
+|------|--------------------------------|
+| qpdf 成功，magic 重新检测得到 `application/pdf` | ✅ 是 |
+| qpdf 成功，magic 重新检测仍是 `application/octet-stream` | ✅ **是**（代码无有效性判断） |
+| qpdf 返回非零退出码 → `run_subprocess` 抛异常 | ❌ 否（跳转到 except） |
+| `magic.from_file` 抛异常（极少） | ❌ 否（跳转到 except） |
+
+**备份的来源文件**：`self.input_doc.original_file`（用户上传的原始文件，位于消费目录或 API 上传临时位置），**不是** qpdf 修改前 working_copy 的副本。因此 `unmodified_original` 始终等同于上传原件，不受 working_copy 之前任何修改影响（当前阶段 working_copy 只是刚从 original_file 拷贝过来的副本，两者内容一致）。
+
+**qpdf 与 Pre-consume 脚本对解析器选择的影响差异**：
+
+```
+时序（consumer.py run()）:
+  L427  mime_type = magic.from_file(working_copy)       ← 初始检测
+  L431  if 条件满足 → qpdf --replace-input working_copy
+  L449    mime_type = magic.from_file(working_copy)     ← 重新检测（可覆盖 mime_type）
+  L463  parser_class = get_parser_for_file(mime_type, ...)  ← ← ← 解析器选择时刻
+  L479  document_consumption_started.send(...)
+  L485  self.run_pre_consume_script()                   ← pre-consume 执行
+  L488  with parser_class() as document_parser:         ← 解析器已锁定
+  L520    document_parser.parse(working_copy, ...)      ← 解析器实际运行
+```
+
+关键差异总结：
+
+| 维度 | qpdf | pre-consume 脚本 |
+|------|------|-----------------|
+| 执行位置 | `get_parser_for_file()` **之前** | `get_parser_for_file()` **之后** |
+| 是否修改 `mime_type` 变量 | ✅ 是（L449 重新赋值） | ❌ 否（mime_type 已是局部变量，脚本无权写入 Python 进程变量） |
+| 是否改变解析器选择 | ✅ 直接影响（传入新 mime_type） | ❌ 不改变；parser_class 已被选定 |
+| 是否修改 working_copy | ✅ 是（`--replace-input` 原地重写） | ✅ 可修改（通过 `DOCUMENT_WORKING_PATH` 环境变量指向的路径） |
+| 修改的影响范围 | 解析器选择 + 解析行为 | **仅解析行为**（如输入文件内容、格式），解析器类型不可变 |
 
 **注意**：qpdf 是 **Parser 选择之前**执行的预处理步骤，不属于任何 Parser 内部逻辑。qpdf 的输出 `working_copy` 会传给后续选定的 Parser。
 
@@ -243,6 +322,44 @@ if (
 ### 4.2 Post-consume 脚本（`run_post_consume_script()` L339-L406）
 
 **执行时机**：**事务提交之后**（文件已写入 originals/thumbnails/archive，数据库已保存）。注意它在 `ConsumerPlugin.run()` 的 `with tempfile.TemporaryDirectory` 之外（L769），说明临时目录已清理。
+
+**失败时文档持久化与任务状态的关系**：
+
+```
+consumer.py run() 关键时序:
+  L417  with tempfile.TemporaryDirectory(...) as tmpdir:     ← 临时目录起点
+  ...
+  L587    with transaction.atomic():                        ← 数据库事务起点
+  L589      if root_document_id: _create_version_from_root()
+  L644      else: _store()
+  ...
+  L670      with FileLock(settings.MEDIA_LOCK):             ← 文件写入
+  ...
+  L760    except Exception: ... _fail()
+  L769  self.run_post_consume_script(document)              ← 事务外，临时目录已清理
+  L773  self._send_progress(SUCCESS, FINISHED, doc.id)      ← 成功状态
+  L784  return ConsumeFileSuccessResult(document_id=...)
+
+tasks.py 异常处理（L194-L216）:
+  try:
+      msg = plugin.run()                ← ConsumerPlugin.run() 被调用
+  except Exception as e:                 ← run_post_consume_script 抛异常会被这里捕获
+      status_mgr.send_progress(FAILED, ...)
+      raise                             ← Celery 任务标记为失败
+  finally:
+      plugin.cleanup()
+```
+
+**状态矩阵**：
+
+| 阶段 | post-consume 脚本结果 | 文档持久化 | 临时目录 | 任务最终状态 |
+|------|----------------------|-----------|---------|-------------|
+| L769 之前 | — | 事务已提交，**文件已落盘** | **已清理**（`with` 语句已退出） | — |
+| L769 | ✅ 脚本成功 | 已完成 | 已清理 | `SUCCESS`，`ConsumeFileSuccessResult` |
+| L769 | ❌ 脚本退出码非 0 | **已完成，不可回滚** | 已清理 | 调用 `self._fail()` → 抛 `ConsumerError` → tasks.py 捕获 → `FAILED` 状态 + Celery 任务异常 |
+| L769 | ❌ 脚本路径不存在 | **已完成，不可回滚** | 已清理 | 同上，`POST_CONSUME_SCRIPT_NOT_FOUND` 错误 |
+
+> 关键结论：**post-consume 脚本失败不会导致文档回滚**，因为它在 `transaction.atomic()` 和 `with tempfile.TemporaryDirectory()` 两个上下文管理器都退出之后才执行。失败的唯一影响是 Celery 任务标记为 FAILED 状态 + 记录错误日志，用户在 UI 上看到任务失败，但文档已经存在于库中（可正常搜索、下载）。
 
 **环境变量注入**（完整）：
 | 变量 | 内容 |
