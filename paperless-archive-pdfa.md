@@ -6,37 +6,71 @@
 
 ## 1. 核心概念
 
-### 1.1 Archive 文件是什么
+### 1.1 Archive 文件是什么——两种不同性质的"归档"
 
 Paperless-ngx 为每份文档维护两份文件：
 
 | 文件 | 存储位置 | 说明 |
 |------|---------|------|
 | **Original（原件）** | `ORIGINALS_DIR` | 用户上传的原始文件，格式不变 |
-| **Archive（归档件）** | `ARCHIVE_DIR` | 可选的 PDF/A 格式副本，含 OCR 文本层，便于长期归档和全文检索 |
+| **Archive（归档件）** | `ARCHIVE_DIR` | 统一存储在 `ARCHIVE_DIR` 下的 PDF 副本，但**性质因 Parser 类型不同分为两类**，不是所有 Archive 都是"可选的 PDF/A + OCR 文本层" |
 
-归档件的核心价值：
-- 统一为 PDF 格式，便于前端预览
-- 转为 PDF/A 标准（ISO 19005），适合长期数字保存
-- 嵌入 OCR 识别的文本层，使扫描件变为可搜索 PDF
+ARCHIVE_DIR 中实际存在**两种完全不同性质的 PDF 文件**，由 [ParserProtocol](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/__init__.py#L209-L228) 的两个属性组合决定：
 
-### 1.2 关键配置枚举
+| 类别 | Parser 属性组合 | 典型 Parser | 文件名 | 生成条件 | 用途 | 文本层来源 |
+|------|----------------|-------------|--------|---------|------|-----------|
+| **A. 可选 OCR 归档件** | `can_produce_archive=True`<br>`requires_pdf_rendition=False` | `RasterisedDocumentParser`（PDF/图片） | `archive_filename` | 受 `ARCHIVE_FILE_GENERATION`（auto/always/never）控制，可跳过 | 长期 PDF/A 归档 + 可搜索 OCR 文本层 | Tesseract OCR 识别结果（隐形叠加） |
+| **B. 强制 PDF 预览件** | `can_produce_archive=False`<br>`requires_pdf_rendition=True` | `TikaDocumentParser`（Office）<br>`MailDocumentParser`（EML） | `archive_filename` | **始终生成**，不受任何设置控制 | 浏览器无法显示 DOCX/EML 原始格式，必须存一份 PDF 才能预览 | LibreOffice 导出 / Chromium HTML 渲染 |
+| **C. 不生成 PDF** | `can_produce_archive=False`<br>`requires_pdf_rendition=False` | `TextDocumentParser`（纯文本） | — | 永不生成 | — | — |
+
+两类 Archive 都落盘到同一个 `ARCHIVE_DIR`，都通过 `parser.get_archive_path()` 返回，都保存为 `Document.archive_filename`，但生成逻辑、可选性、文本层来源**完全不同**。
+
+---
+
+### 1.2 Parser 能力矩阵与 `produce_archive` 参数语义
+
+#### 1.2.1 四个 Parser 属性组合的实际含义
+
+定义在 [paperless/parsers/__init__.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/__init__.py#L209-L228)：
+
+| 属性 | 语义 |
+|------|------|
+| `can_produce_archive` | **能否产出可选的搜索型 PDF 归档副本**。若为 True，受 `ARCHIVE_FILE_GENERATION` 设置控制，可按需生成 |
+| `requires_pdf_rendition` | **是否必须产出 PDF 才能在前端显示**。若为 True，浏览器无法显示原始格式（DOCX/EML），PDF 必须始终生成，忽略所有设置 |
+
+#### 1.2.2 `parse(produce_archive=True)` 参数的实际行为差异
+
+`produce_archive` 是 `ParserProtocol.parse()` 方法的参数（默认 True），在不同 Parser 中语义完全不同：
+
+| Parser 类型 | `produce_archive=True` | `produce_archive=False` |
+|------------|----------------------|------------------------|
+| **Tesseract**<br>（A 类：可选 OCR 归档） | 执行完整 OCR + PDF/A 转换，生成归档 PDF | 跳过 PDF 生成，仅提取文本和缩略图（当已有文本 + 不需归档时生效） |
+| **Tika / Mail**<br>（B 类：强制预览件） | **被忽略**，PDF 始终生成 | **被忽略**，PDF 仍始终生成（因为 `requires_pdf_rendition=True`，浏览器无法显示原始格式） |
+
+代码证据：
+- [TikaDocumentParser.parse() 文档注释](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tika.py#L231-L234)："the `produce_archive` flag is intentionally ignored"
+- [MailDocumentParser.parse() 文档注释](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L205-L208)："the `produce_archive` flag is accepted for protocol compatibility but is always honoured"（实际代码中同样完全忽略该参数）
+- [Tesseract.parse()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tesseract.py#L530-L536)：检查 `if not produce_archive`，仅返回 pdftotext 文本，不生成归档 PDF
+
+---
+
+### 1.3 关键配置枚举
 
 定义在 [paperless/models.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/models.py)：
 
-**ArchiveFileGenerationChoices** — 是否生成归档件
+**ArchiveFileGenerationChoices** — 是否生成**A 类可选 OCR 归档件**（对 B 类强制预览件无效）
 - `auto`（默认）：智能判断
 - `always`：始终生成
 - `never`：永不生成
 
-**OutputTypeChoices** — 归档件输出格式
+**OutputTypeChoices** — Archive PDF 的输出格式（对 A、B 两类均生效）
 - `pdf`：普通 PDF（不做 PDF/A 转换）
 - `pdfa`：PDF/A-2b（默认）
-- `pdfa-1`：PDF/A-1b
+- `pdfa-1`：PDF/A-1b（Gotenberg 不支持，Tika/Mail 会降级为 A2b）
 - `pdfa-2`：PDF/A-2b
 - `pdfa-3`：PDF/A-3b
 
-**ModeChoices** — OCR 运行模式
+**ModeChoices** — OCR 运行模式（仅对 A 类 Tesseract 生效，B 类不涉及 OCR）
 - `auto`（默认）：有文本则跳过 OCR，无文本则 OCR
 - `force`：强制对所有页面重新 OCR
 - `redo`：重做已有 OCR 的页面
@@ -46,21 +80,25 @@ Paperless-ngx 为每份文档维护两份文件：
 
 ## 2. 归档文件生成决策：`should_produce_archive()`
 
-这是整个归档流程的入口阀门，决定「这份文档要不要生成归档件」。
+这是整个归档流程的入口阀门，决定「这份文档要不要生成归档件」。**注意：该函数同时覆盖 A 类（可选 OCR 归档）和 B 类（强制预览件）的决策逻辑，两者在优先级中位于不同分支。**
 
 代码位置：[documents/consumer.py:124-189](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/consumer.py#L124-L189)
 
-### 2.1 决策优先级（从高到低）
+### 2.1 决策优先级（从高到低，标注对应类别）
 
 ```
-1. parser.requires_pdf_rendition == True   → 必须生成（浏览器无法直接显示的格式，如 DOCX）
-2. parser.can_produce_archive == False     → 不能生成（如纯文本解析器）
-3. ARCHIVE_FILE_GENERATION = "always"      → 始终生成
-4. ARCHIVE_FILE_GENERATION = "never"       → 永不生成
-5. ARCHIVE_FILE_GENERATION = "auto"        → 智能判断（见下文）
+1. parser.requires_pdf_rendition == True   → 强制 True    ← B 类（Tika/Mail），忽略所有设置
+2. parser.can_produce_archive == False     → 强制 False   ← C 类（纯文本等）
+3. ARCHIVE_FILE_GENERATION = "always"      → True         ← A 类（Tesseract）配置控制
+4. ARCHIVE_FILE_GENERATION = "never"       → False        ← A 类（Tesseract）配置控制
+5. ARCHIVE_FILE_GENERATION = "auto"        → 智能判断      ← A 类（Tesseract）仅对 PDF/图片生效
 ```
 
-### 2.2 `auto` 模式的智能判断逻辑
+关键理解：
+- **B 类 Parser（Tika/Mail）永远在第 1 步返回 True**，永远不会走到 3-5 步的 `ARCHIVE_FILE_GENERATION` 配置分支
+- **A 类 Parser（Tesseract）会通过第 2 步检查（`can_produce_archive=True`）**，然后进入 3-5 步受配置控制
+
+### 2.2 `auto` 模式的智能判断逻辑（仅对 A 类 Tesseract 生效）
 
 ```
 输入是 image/*        → 生成归档件（图片必须包装成 PDF 才能预览）
@@ -90,11 +128,16 @@ Paperless-ngx 为每份文档维护两份文件：
 
 ## 3. PDF/A 格式转换实现
 
-Tesseract 解析器（`RasterisedDocumentParser`）是实际执行 PDF/A 转换的主力。
+PDF/A 转换在 A 类（可选 OCR 归档）和 B 类（强制预览件）中均会发生，但技术栈完全不同：
 
-代码位置：[paperless/parsers/tesseract.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tesseract.py)
+| 类别 | PDF/A 转换引擎 | 支持的 PDF/A 版本 |
+|------|---------------|-------------------|
+| A 类（Tesseract） | OCRmyPDF → Ghostscript，或 pikepdf 直接打标 | PDF/A-1b / 2b / 3b（全部支持） |
+| B 类（Tika/Mail） | Gotenberg（内部使用 LibreOffice / Chromium + PDF/A 后处理） | PDF/A-2b / 3b（不支持 1b，自动降级） |
 
-### 3.1 三条转换路径
+以下按 Parser 分别展开各路径。
+
+### 3.1 A 类（Tesseract）路径总览
 
 根据 `OCR_MODE` 和输入文件类型，`parse()` 方法选择不同路径：
 
