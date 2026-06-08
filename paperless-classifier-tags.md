@@ -6,21 +6,20 @@
 
 ## 一、整体架构：两套分类系统的职责边界
 
-Paperless-ngx 存在 **两套完全独立** 的分类/建议系统，切勿混淆：
+Paperless-ngx 存在 **两套完全独立** 的分类/建议系统，切勿混淆。其中 MATCH_AUTO 传统分类器自身又有**两种运行模式**（自动写入 vs 仅建议），行为不同：
 
 | 维度 | MATCH_AUTO 传统分类器 | paperless_ai LLM 建议接口 |
 |---|---|---|
 | **技术栈** | scikit-learn MLP + CountVectorizer | 外部 LLM API (Ollama/OpenAI 等) + 可选 RAG |
-| **核心文件** | `src/documents/classifier.py` | `src/paperless_ai/ai_classifier.py` |
-| **训练需求** | 需要离线训练，消费时纯推断 | 无需训练，每次推断实时调用 |
-| **触发方式** | 文档消费时**自动执行**；`document_retagger` 批量执行 | 用户在前端页面**手动点击**触发 API |
-| **写入行为** | 直接写入数据库（自动打标签） | **仅返回建议 JSON**，不写入 DB，需用户确认后手动应用 |
-| **匹配对象** | 只处理 `matching_algorithm == MATCH_AUTO` 的实体 | LLM 返回名称字符串 → 通过 `paperless_ai/matching.py` 的名称模糊匹配（阈值 0.8）映射到已有实体；未匹配的以 `suggested_*` 字段返回供用户新建 |
+| **核心文件** | `src/documents/classifier.py`、`src/documents/matching.py` | `src/paperless_ai/ai_classifier.py`、`src/paperless_ai/matching.py` |
+| **训练需求** | 需要离线训练，消费/建议时纯推断 | 无需训练，每次推断实时调用 LLM |
+| **运行模式与入口** | ① **自动写入模式**（后台自动）：<br>&nbsp;&nbsp;• 文档消费时信号触发<br>&nbsp;&nbsp;• `document_retagger` 管理命令批量执行<br><br>② **仅建议模式**（前端手动）：<br>&nbsp;&nbsp;• `GET /api/documents/<id>/suggestions/` | 仅 **仅建议模式**（前端手动）：<br>&nbsp;&nbsp;• `GET /api/documents/<id>/ai_suggestions/` |
+| **写入行为** | 自动写入模式：直接写入数据库（自动打标签）<br>仅建议模式：仅返回建议 JSON，不写入 DB | **仅返回建议 JSON**，不写入 DB，需用户确认后手动应用 |
+| **匹配对象** | 只处理 `matching_algorithm == MATCH_AUTO` 的实体（非 AUTO 走规则匹配路径） | LLM 返回名称字符串 → 通过 `paperless_ai/matching.py` 的名称模糊匹配（阈值 0.8）映射到已有实体；未匹配的以 `suggested_*` 字段返回供用户新建 |
 | **覆盖维度** | Tags / Correspondent / DocumentType / StoragePath | 上述 4 项 + Title + Dates |
-| **API 端点** | （消费流程无 API，后台自动） | `GET /api/documents/<id>/suggestions/`（传统）<br>`GET /api/documents/<id>/ai_suggestions/`（LLM） |
 | **依赖条件** | 本地模型文件存在即可 | 需要 `PAPERLESS_AI_ENABLED=true` 及 LLM 后端配置 |
 
-**注意**：传统分类器还有一个独立的前端建议接口 `suggestions`，与消费时的自动匹配使用**相同的底层逻辑**（`matching.match_*` 系列函数），但只返回结果不写入。见 `src/documents/views.py` 中 `DocumentViewSet.suggestions`。
+> **澄清**：`suggestions` 与 `ai_suggestions` 是两个不同的 API 端点，分属不同系统。前者复用传统分类器的底层逻辑（`matching.match_*`），后者调用 LLM。两者都**不会自动写入数据库**——自动写入只发生在消费流程的信号处理器和 `document_retagger` 命令中。
 
 ---
 
@@ -279,7 +278,7 @@ def match_tags(document, classifier, user=None):
 |---|---|
 | `replace=False`（消费流程默认） | 仅追加新匹配到的标签，**不删除**已有标签 |
 | `replace=True`（retagger 覆盖模式） | 先删除旧标签，再应用新标签。但以下两类受保护不被删除：<br>• `is_inbox_tag=True`（收件箱标签）<br>• `match=""` 且 `matching_algorithm != MATCH_AUTO`（纯手动添加、无匹配规则的标签） |
-| `dry_run=True`（suggest 模式） | 只计算变更集合，不写入 DB，不删除 |
+| `dry_run=True`（retagger `--suggest` 预览模式） | 只计算变更集合，不写入 DB，不删除 |
 
 `set_correspondent` / `set_document_type` / `set_storage_path` 还有 `use_first` 参数：
 - `True`（函数默认值）：多个匹配时取第一个
@@ -416,4 +415,4 @@ resp_data = {
 - [x] **规则 + ML 双轨并行**：MATCH_AUTO 走分类器，其余走规则匹配，结果取并集 — `src/documents/matching.py` L110-L134
 - [x] **信号解耦**：消费流程通过 `document_consumption_finished` 分发，共 8 个处理器 — `src/documents/apps.py` L24-L31
 - [x] **软删除保护**：收件箱标签和纯手动标签（`match=""` 且非 MATCH_AUTO）不会被自动系统删除 — `src/documents/signals/handlers.py` L248-L264
-- [x] **LLM 不自动写入**：`ai_suggestions` 仅返回 JSON，无 DB 写入逻辑 — `src/documents/views.py` L1449-L1528
+- [x] **建议接口均不自动写入**：`suggestions`（传统分类器）和 `ai_suggestions`（LLM）两个 API 均仅返回 JSON，无 DB 写入逻辑；自动写入仅发生在消费信号处理器和 `document_retagger` 中 — `src/documents/views.py` L1388-L1528
