@@ -1044,7 +1044,223 @@ ConsumerPlugin.run():
 
 两条消息分别通过 Redis Pub/Sub 广播到 `status_updates` 组，各自走 Consumer → WebSocket → 前端 Service 的独立链路。
 
-### 5.3 后端 WebSocket 分发 —— Consumer 侧
+### 5.3 事务时序深度分析 —— 为什么 document_updated 可能导致详情页读到旧数据
+
+本章节深入探讨 `document_updated` 在 `transaction.atomic` 内部发送、未使用 `transaction.on_commit` 时可能引发的跨系统时序问题，以及 `status_update(SUCCESS)` 作为事务外信号的时序可靠性。
+
+#### 5.3.1 精确事务边界代码定位
+
+文件：[consumer.py#L587](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L587)
+
+```python
+try:
+    with transaction.atomic():          # ───── 事务起点 T0
+        # ... 创建 version_doc、保存、文件写入 ...
+        document.save()                 # ───── T1 (version_doc 第二次 save)
+
+        if document.root_document_id:
+            document_updated.send(      # ───── T2 (事务内发送信号！)
+                sender=self.__class__,
+                document=document.root_document,
+            )
+            # ┌──────────────────────────────────────────────────────────┐
+            # │ 此处信号处理器内部立即调用 async_to_sync(channel_layer.  │
+            # │ group_send) → Redis PUBLISH 命令**立刻发出**！          │
+            # │ 但此时 DB 事务还未 COMMIT，外部连接看不到新数据。        │
+            # └──────────────────────────────────────────────────────────┘
+
+        self.input_doc.original_file.unlink()     # 删除临时文件
+        self.working_copy.unlink()
+        # ... 更多清理工作 ...
+                                         # ───── T3 (with 块结束 → COMMIT)
+except Exception as e:
+    self._fail(...)
+
+self.run_post_consume_script(document)  # ───── T4 (事务外)
+
+self._send_progress(100, 100, SUCCESS,  # ───── T5 (status_update SUCCESS)
+                    FINISHED, document.id)
+```
+
+关键时间点：
+- **T2**：`document_updated.send()` → 信号处理函数同步执行 → Redis PUBLISH 立刻发出
+- **T3**：`transaction.atomic()` 的 `with` 块退出 → DB 才真正 COMMIT
+- **T5**：`status_update(SUCCESS)` → 第二次 Redis PUBLISH
+
+T2 与 T3 之间可能相差若干毫秒（取决于文件删除 I/O 耗时），但 Redis 消息传播是微秒级的，因此 WebSocket 消息**极大概率在 DB COMMIT 之前到达浏览器**。
+
+#### 5.3.2 document_updated 信号处理函数的内部可见性
+
+文件：[handlers.py#L832-L851](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/signals/handlers.py#L832-L851)
+
+```python
+def send_websocket_document_updated(sender, document: Document, **kwargs) -> None:
+    # At this point, workflows may already have applied additional changes.
+    document.refresh_from_db()   # ← 事务内的 refresh，能看到本事务未提交的修改
+
+    doc_overrides = DocumentMetadataOverrides.from_document(document)
+
+    with DocumentsStatusManager() as status_mgr:
+        status_mgr.send_document_updated(
+            document_id=document.id,
+            modified=DRF_DATETIME_FIELD.to_representation(document.modified),
+            owner_id=doc_overrides.owner_id,
+            users_can_view=doc_overrides.view_users,
+            groups_can_view=doc_overrides.view_groups,
+        )
+        # __exit__ → async_to_sync(self._channel.flush) → Redis 立即发出
+```
+
+> **重要细节**：`refresh_from_db()` 在**发送者的事务内部**执行，因此能看到本事务已写入但未提交的数据（如 version_doc 的保存），`document.modified` 能拿到最新值。但这仅限于发送方所在的 DB 连接。
+
+#### 5.3.3 Redis Pub/Sub 与 DB 事务的跨系统割裂
+
+`BaseStatusManager.send()` 的实现：
+文件：[helpers.py#L107-L116](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/plugins/helpers.py#L107-L116)
+
+```python
+def send(self, payload: WebsocketPayload) -> None:
+    self.open()
+    async_to_sync(self._channel.group_send)("status_updates", payload)
+    # ↑ 此处同步等待 Redis PUBLISH 命令返回 ACK，即立即发出
+```
+
+问题根源：**Redis Pub/Sub 是独立于 DB 事务的外部系统**。Django 的 `transaction.atomic()` 只能控制 PostgreSQL/MySQL 的 COMMIT/ROLLBACK，**无法**回滚或延迟已经发送到 Redis 的消息。
+
+这就产生了经典的**双写不一致窗口**：
+
+```
+Celery Worker (同一 DB 连接 #A)           Redis             Daphne/ASGI (DB 连接 #B)      浏览器
+        │                                    │                      │                         │
+        │  transaction.atomic() 开始         │                      │                         │
+        │  version_doc.save()                │                      │                         │
+        │                                    │                      │                         │
+        │  document_updated.send()           │                      │                         │
+        │  └→ refresh_from_db()  (连接 #A)   │                      │                         │
+        │  └→ group_send() ────────────────→│  PUBLISH             │                         │
+        │     (Redis 立即发出)               │─────────────────────→│  WebSocket.onmessage    │
+        │                                    │                      │  document_updated       │
+        │  删除临时文件(几毫秒~几十毫秒)       │                      │                         │
+        │                                    │                      │  loadDocument() ───────→│
+        │                                    │                      │                         │ HTTP GET /api/documents/{id}/
+        │                                    │                      │  SELECT ... (连接 #B)   │
+        │                                    │                      │  ❌ 此时事务未 COMMIT， │
+        │                                    │                      │     version_doc 不可见， │
+        │                                    │                      │     versions 数组缺失！ │
+        │                                    │                      │                         │
+        │  with 块退出 → DB COMMIT ─────────────────────────────────────────────────────────→│ 此时才可见
+        │                                    │                      │                         │
+        │  run_post_consume_script()         │                      │                         │
+        │  _send_progress(SUCCESS) ─────────→│─────────────────────→│────────────────────────→│ 此时 load 才能读到新版本
+```
+
+在 T2 到 T3 的窗口内（可能是几毫秒到几十毫秒，取决于临时文件删除 I/O）：
+- 前端通过新 HTTP 请求（独立 DB 连接 #B）执行 `loadDocument()`
+- PostgreSQL 的 MVCC 隔离级别（默认 READ COMMITTED）保证连接 #B 看不到连接 #A 未提交的写入
+- **结果**：详情页 reload 后，versions 数组中**没有新版本**，PDF 预览仍指向旧版本文件（如果新文件还没写入磁盘甚至可能 404）
+
+但由于两条消息（document_updated 和 status_update）都会触发刷新，通常：
+1. `document_updated` 先到 → 第一次 `loadDocument()` 可能拿到旧数据
+2. 几十毫秒后 `status_update(SUCCESS)` 到达 → DocumentVersionDropdownComponent 再次 `getVersions()` → 此时事务已 COMMIT，拿到新版本
+3. 用户感知上就是版本列表出现了延迟（但 UI 会刷新两次，最终状态正确）
+
+在高 I/O 负载下（临时文件很大、磁盘慢），这个窗口可能拉大到数百毫秒甚至秒级，此时用户可能短暂看到"上传完成但列表中没有新版本"的异常状态。
+
+#### 5.3.4 为什么 status_update(SUCCESS) 是更可靠的完成信号
+
+`status_update(SUCCESS)` 的发送位置：
+文件：[consumer.py#L769-L779](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L769-L779)
+
+```python
+# ← transaction.atomic() 已在此前退出（T3 已 COMMIT）
+
+self.run_post_consume_script(document)   # T4: 外部脚本可能产生额外副作用
+
+self._send_progress(                     # T5: 发 SUCCESS
+    100, 100, ProgressStatusOptions.SUCCESS,
+    ConsumerStatusShortMessage.FINISHED, document.id,
+)
+```
+
+时序优势：
+1. **DB 已提交**：T3 时事务已经 COMMIT，所有 DB 连接都能看到 version_doc 和完整的 versions 数组
+2. **文件已落盘**：事务内 `_write()` 已经把 source、thumbnail、archive 三个文件写入磁盘（`fsync` 取决于 OS，但文件路径已存在）
+3. **Post Consume 脚本已执行**：`run_post_consume_script()` 完成所有外部系统集成
+4. **cleanup 已完成**：临时文件已删除，不会占用磁盘空间
+
+也就是说，`status_update(SUCCESS)` 代表了**端到端的全部完成**，而 `document_updated` 只代表"DB 写入请求已发出"。这也是为什么 DocumentVersionDropdownComponent 选择订阅 `onDocumentConsumptionFinished()`（由 status_update SUCCESS 驱动），而不是 `onDocumentUpdated()`。
+
+#### 5.3.5 如果使用 transaction.on_commit 的正确写法
+
+如果要消除 T2~T3 的竞态窗口，应将 Redis 发送延迟到事务 COMMIT 之后：
+
+```python
+# 当前写法（有竞态窗口）：
+with transaction.atomic():
+    document.save()
+    if document.root_document_id:
+        document_updated.send(sender=self.__class__, document=document.root_document)
+        # ↑ 信号处理函数立即 group_send → Redis 立即发出
+
+# 正确写法（延迟到 COMMIT 之后）：
+from django.db import transaction
+
+with transaction.atomic():
+    document.save()
+    if document.root_document_id:
+        root_doc = document.root_document
+        def _send_ws_update(root_doc=root_doc):
+            # 闭包捕获当前 root_doc 引用
+            send_websocket_document_updated(sender=None, document=root_doc)
+        transaction.on_commit(_send_ws_update)
+        # ↑ 注册回调，等 COMMIT 成功后才真正执行 Redis 发送
+```
+
+`transaction.on_commit()` 的保证：
+- 只有当外层事务成功 COMMIT 后才执行回调
+- 如果事务 ROLLBACK（异常抛出），回调不会被执行
+- 多个 `on_commit` 回调按注册顺序执行
+
+这样可以确保：Redis 消息发出时，DB 数据一定对所有连接可见，前端 `loadDocument()` 一定能读到新版本。
+
+> **注意**：`document_updated` 信号被多个处理器消费（`run_workflows_updated`、`send_websocket_document_updated`），其中 `run_workflows_updated` 必须在事务内执行（因为工作流修改要和文档修改在同一事务中原子提交）。因此不能简单地把整个信号改为 `on_commit`，只能对 WebSocket 发送这一个处理器单独延迟。
+
+#### 5.3.6 根文档 modified 字段的微妙之处
+
+文件：[models.py#L250-L255](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/models.py#L250-L255)
+
+```python
+modified = models.DateTimeField(
+    _("modified"),
+    auto_now=True,
+    editable=False,
+    db_index=True,
+)
+```
+
+`auto_now=True` 意味着只有对该模型实例调用 `.save()` 时才会自动更新时间戳。在 `_create_version_from_root()` 中：
+文件：[consumer.py#L256-L295](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L256-L295)
+
+```python
+def _create_version_from_root(self, root_doc, *, text, page_count, mime_type):
+    root_doc_frozen = Document.objects.select_for_update().get(pk=root_doc.pk)
+    # ↑ 只加行锁，不修改 root_doc_frozen 的任何字段，也不 .save()
+    version_doc = Document(
+        root_document=root_doc_frozen,  # ← 只建立外键关联
+        version_index=next_version_index + 1,
+        modified=timezone.now(),         # ← version_doc 的 modified
+        ...
+    )
+    return version_doc
+```
+
+整个流程中，**root_doc 从未被 .save()**，因此 `root_doc.modified` 保持为旧值。`send_websocket_document_updated()` 中 `document.refresh_from_db()` 虽然在事务内重新查询，但 root_doc 自身没有任何字段变化（新增 version_doc 是另一条记录，不影响 root_doc 的 modified），所以 WebSocket 消息中携带的 `modified` 是旧时间戳。
+
+对前端的影响：
+- `handleIncomingDocumentUpdated()` 的回声判定对比的是 `lastLocalSaveModified`（用户本地 save 时设置），正常查看时为 `null`，所以不会被误判为回声而忽略
+- 但如果用户恰好在上传新版本的同时修改了文档并保存，旧的 modified 时间戳可能导致时序判定错误
+
+### 5.4 后端 WebSocket 分发 —— Consumer 侧
 
 文件：[consumers.py](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/paperless/consumers.py)
 
@@ -1068,7 +1284,7 @@ Redis Pub/Sub → StatusConsumer (每个浏览器连接一个实例)
 
 > 注意：两条消息的 `_can_view` 权限检查各自独立，`status_update` 使用新版本的 owner/权限信息，`document_updated` 使用根文档的 owner/权限信息。通常两者一致，但如果版本创建时权限被覆盖可能出现差异。
 
-### 5.4 前端 WebsocketStatusService 分发
+### 5.5 前端 WebsocketStatusService 分发
 
 文件：[websocket-status.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts)
 
@@ -1101,7 +1317,7 @@ Redis Pub/Sub → StatusConsumer (每个浏览器连接一个实例)
     └─ 两条消息通过不同 Subject 广播出去，互不干扰
 ```
 
-### 5.5 前端组件订阅与界面刷新
+### 5.6 前端组件订阅与界面刷新
 
 两条消息分别被不同的组件订阅，以下是两条链路的前端处理细节。
 
@@ -1306,7 +1522,7 @@ loadDocument(documentId, forceRemote):
 
 > 潜在的优化空间：链路 A 已经调用了 `getVersions()` 并 `emit(versionsUpdated)` 更新了 `document.versions`，随后链路 B 的 `loadDocument()` 又会通过 `documentsService.get(documentId)` 再次拉取完整文档（含 versions），存在一次重复请求。由于两条消息到达存在时差，通常不会被用户感知。
 
-### 5.6 上传新版本端到端完整时序图
+### 5.7 上传新版本端到端完整时序图
 
 ```
  用户点击上传新版本
@@ -1513,5 +1729,12 @@ loadDocument(documentId, forceRemote):
 - `status_update(SUCCESS)` 在事务外发送（新版本 id）→ DocumentVersionDropdownComponent 负责版本列表刷新 + 状态复位
 - 两条消息互补但存在一次潜在重复请求（getVersions vs get 都拉 versions）
 
-### 7.9 与 SSE 的区别
+### 7.9 事务内发送通知的竞态窗口
+- **双写割裂问题**：Django `transaction.atomic()` 无法控制 Redis Pub/Sub 的发送时机，`async_to_sync(channel_layer.group_send)` 在事务内调用时会立即发出 Redis 消息，而 DB COMMIT 可能在几毫秒~几十毫秒之后才发生
+- **前端读到旧数据的风险**：消息到达浏览器后 `loadDocument()` 发起新的 HTTP 请求（独立 DB 连接），PostgreSQL READ COMMITTED 隔离级别下看不到未提交的 version_doc，versions 数组可能短暂缺失新版本
+- **信号处理器的内部可见性**：`send_websocket_document_updated()` 内的 `refresh_from_db()` 在发送者事务内执行，能看到未提交数据，但这仅限于发送方所在的同一 DB 连接
+- **缓解机制**：`status_update(SUCCESS)` 在事务外 + post consume 脚本之后发送，是端到端可靠的完成信号，会触发第二次 `getVersions()` 拉取，最终状态收敛正确
+- **改进方案**：对 `send_websocket_document_updated` 处理器单独使用 `transaction.on_commit()` 延迟 Redis 发送到 COMMIT 之后，但不能对整个 `document_updated` 信号做此处理（因为 `run_workflows_updated` 必须在事务内原子提交）
+
+### 7.10 与 SSE 的区别
 系统仅在 AI Chat 功能中使用 SSE 风格的 `StreamingHttpResponse`（[views.py](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/views.py#L2181-L2185)），用于流式输出 LLM 回答。该实现与实时通知系统完全独立，不经过 WebSocket / Channels 层。
