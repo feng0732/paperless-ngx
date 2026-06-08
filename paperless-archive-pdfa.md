@@ -165,6 +165,25 @@ OCRmyPDF 负责最复杂的场景：扫描件 OCR + 生成 PDF/A。
 - 含 Alpha 通道的图片（RGBA/LA）先用 ImageMagick `-alpha off` 移除透明度（img2pdf 不支持）
 - DPI 不足时抛出 `ParseError`，要求用户配置 `OCR_IMAGE_DPI`
 
+**PDF 文本层 vs 数据库 content 字段（Tesseract 路径）**：
+
+| 维度 | 值 | 来源 |
+|------|---|------|
+| `Document.content`（DB 字段） | OCR 识别的纯文本 | `self.extract_text()`：优先从 OCRmyPDF sidecar.txt 读取，否则从归档 PDF 本身用 pdftotext 提取 |
+| 归档 PDF 是否含文本层 | **有（OCR 结果嵌入）** | OCRmyPDF 将 Tesseract 识别的文本以隐形方式叠加在 PDF 图像之上，形成可搜索 PDF |
+| 两者一致性 | **高度一致** | 两者均来自同一次 Tesseract 识别结果；sidecar.txt 与 PDF 文本层是同一份数据的两种输出格式 |
+
+具体代码流程（[tesseract.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tesseract.py)）：
+1. OCRmyPDF 执行 `ocrmypdf.ocr()` → 同时产出 `archive.pdf`（含隐形文本层）和 `sidecar.txt`（纯文本副本）
+2. `extract_text(sidecar_file, archive_path)` 方法（第 236-264 行）优先读取 sidecar.txt，若不完整则 fallback 到 `extract_pdf_text(archive.pdf)`
+3. Consumer 通过 `parser.get_text()` 拿到文本，写入 `Document.content`
+4. Consumer 通过 `parser.get_archive_path()` 拿到 PDF，落盘到 ARCHIVE_DIR
+5. **两条管道共享数据源**，DB content 与 PDF 文本层本质相同
+
+特殊分支（OCR_MODE=off + 图片）：
+- `self.text = ""`（第 546 行），DB content 为空
+- 归档 PDF 只是图片包装，**无文本层**，无法在 PDF 内搜索
+
 ### 3.5 路径四：Office 文档（Tika + Gotenberg）
 
 处理 DOCX/ODT/XLSX/PPTX/RTF 等格式，由 `TikaDocumentParser` 实现。
@@ -209,6 +228,23 @@ parse(document_path, mime_type, produce_archive=...)
 
 **关键方法**：
 - [_convert_to_pdf()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tika.py#L400-L452) — LibreOffice 转 PDF + PDF/A 版本映射
+
+**PDF 文本层 vs 数据库 content 字段（Tika 路径）**：
+
+| 维度 | 值 | 来源 |
+|------|---|------|
+| `Document.content`（DB 字段） | Tika 服务器提取的纯文本 | `self._tika_client.tika.as_text.from_file()` → `self._text` → `parser.get_text()` |
+| 归档 PDF 是否含文本层 | 视 LibreOffice 而定（通常有） | LibreOffice 导出 PDF 时自动嵌入的可复制文本 |
+| 两者一致性 | **不一定一致** | Tika 与 LibreOffice 是两个独立引擎，提取/嵌入文本的顺序、格式、换行符可能不同 |
+
+具体流程：
+1. `parse()` 中 `self._text = parsed.content`（第 268 行）— 这是 Tika 文本提取结果
+2. `parse()` 中 `self._archive_path = self._convert_to_pdf()`（第 278 行）— 这是 Gotenberg/LibreOffice 渲染的 PDF
+3. Consumer 层通过 `parser.get_text()` 获取第 1 步的文本，写入 `Document.content`
+4. Consumer 层通过 `parser.get_archive_path()` 获取第 2 步的 PDF，落盘到 ARCHIVE_DIR
+5. 两条管道完全独立，Tika 的文本不会被注入到 PDF 中
+
+---
 
 ### 3.6 路径五：邮件 EML（Mail Parser + Gotenberg）
 
@@ -265,6 +301,60 @@ parse(document_path, mime_type)
 
 **注意**：邮件解析器在三处独立调用 Gotenberg（正文 HTML→PDF、邮件 HTML→PDF、合并），每处都会单独应用一次 PDF/A 设置。
 
+**邮件有/无 HTML 分支的 Gotenberg 调用差异**：
+
+代码位置：[generate_pdf()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L534-L606)
+
+```
+if not mail_message.html:          # 无 HTML 正文（纯文本邮件）
+    archive_path = mail_pdf_file   # 直接使用正文模板渲染的 PDF
+    └─ Gotenberg 调用次数 = 1 次
+       (仅 generate_pdf_from_mail → Chromium HTML→PDF)
+    └─ PDF/A 应用次数 = 1 次
+       (仅在 Chromium 阶段，无 Merge 二次处理)
+    └─ 不调用 Gotenberg Merge 路由
+
+else:                              # 有 HTML 正文（富文本邮件）
+    pdf_of_html_content = generate_pdf_from_html(...)
+    Gotenberg Merge 合并 [mail_pdf_file, pdf_of_html_content]
+    └─ Gotenberg 调用次数 = 3 次
+       1. generate_pdf_from_mail     → Chromium HTML→PDF（正文模板）
+       2. generate_pdf_from_html     → Chromium HTML→PDF（邮件 HTML 正文）
+       3. merge                      → Gotenberg Merge 按 PdfLayout 合并
+    └─ PDF/A 应用次数 = 3 次
+       (每次 Gotenberg 调用都独立调用 _settings_to_gotenberg_pdfa())
+    └─ Merge 阶段按 PdfLayout 决定最终组成：
+         TEXT_HTML : [正文PDF, HTML内容PDF]
+         HTML_TEXT : [HTML内容PDF, 正文PDF]
+         HTML_ONLY : [HTML内容PDF]           ← 不包含正文模板
+         TEXT_ONLY : [正文PDF]                ← 不包含邮件 HTML 正文
+```
+
+**HTML 正文安全处理**（[generate_pdf_from_html()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L739-L834)）：
+- `<script>` 标签整体替换为 `<div hidden>`，防止邮件中恶意脚本在 Chromium 渲染时执行
+- 内联附件 `cid:xxx` 引用写入临时文件并通过 `route.resource()` 注册给 Chromium
+- 文件名只保留字母数字，防止路径注入
+
+**PDF 文本层 vs 数据库 content 字段（Mail 路径）**：
+
+| 维度 | 值 | 来源 |
+|------|---|------|
+| `Document.content`（DB 字段） | `build_formatted_text()` 拼接结果 | `Subject:`/`From:`/`To:`/`CC:`/`BCC:`/`Attachments:` 头 + HTML 内容经 Tika 提取的纯文本 + mail.text 纯文本 |
+| 归档 PDF 是否含文本层 | 通常有 | Chromium 渲染 HTML 时自动嵌入的可复制文本（含 HTML 标签残留、排版格式字符） |
+| 两者一致性 | **差异较大** | DB content 是结构化的头字段 + 清洗后的纯文本；PDF 文本层是 HTML 渲染的视觉输出，顺序、格式完全不同 |
+
+关键代码：[build_formatted_text()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L233-L261) 在 `parse()` 内联定义，拼接顺序：
+```
+Subject: {subject}
+From: {from}
+To: {to_list}
+CC: {cc_list}        [可选]
+BCC: {bcc_list}      [可选]
+Attachments: ...     [可选]
+HTML content: {tika_parse(mail.html)}   [仅当有 HTML 正文时]
+{mail.text}                         [纯文本正文]
+```
+
 ### 3.7 Gotenberg PDF/A 版本映射与能力限制
 
 Gotenberg 的 `PdfAFormat` 枚举仅支持 `A2b` 和 `A3b`，**不支持 PDF/A-1**。
@@ -289,13 +379,17 @@ Gotenberg 的 `PdfAFormat` 枚举仅支持 `A2b` 和 `A3b`，**不支持 PDF/A-1
 | **`should_produce_archive()` 影响** | 完全服从（受 auto/always/never 控制） | 总是 True（`requires_pdf_rendition` 强制） | 总是 True |
 | **`produce_archive` 参数** | 被遵守：False 时不生成归档 PDF | 被忽略：PDF 始终生成 | 被忽略 |
 | **PDF 转换引擎** | OCRmyPDF（底层 Ghostscript + Tesseract） | Gotenberg → LibreOffice | Gotenberg → Chromium（HTML→PDF）+ Merge |
-| **OCR 文本层** | 有（Tesseract 识别 + 嵌入） | 无（Office 文本由 Tika 单独提取，不嵌入 PDF） | 无（邮件文本组装后不嵌入 PDF） |
 | **是否需要外部服务** | 否（全部本地二进制） | 是（Tika + Gotenberg，两个 HTTP 服务） | 是（Gotenberg，可选 Tika 用于 HTML 文本提取） |
 | **PDF/A-1 支持** | 是（Ghostscript 原生） | **否**（降级为 A2b + 警告） | **否**（降级为 A2b + 警告） |
 | **PDF/A 版本来源** | `output_type` → pdfa_part 字符串（`pdfa→2` 等） | `OutputTypeConfig().output_type` → `PdfAFormat` 枚举 | `settings.OCR_OUTPUT_TYPE` → `PdfAFormat` 枚举 |
-| **失败回退机制** | Force OCR 重试、加密 PDF 跳过、元数据打标降级为普通 PDF | Tika 500 重试 buffer 模式；Gotenberg 失败直接 ParseError | 无特殊回退，Gotenberg 失败直接 ParseError |
-| **文本来源** | OCR 识别结果（嵌入 PDF 文本层 + sidecar.txt） | Tika 服务器提取结果（仅存 DB，不嵌入 PDF） | 邮件头 + 正文 + HTML 经 Tika 提取的拼接文本（仅存 DB） |
 | **配置命名空间** | `OcrConfig`（含 mode/language/deskew 等 OCR 选项） | `OutputTypeConfig`（仅 output_type） | 直接读 `settings.OCR_OUTPUT_TYPE` |
+| **DB `Document.content` 来源** | `self.extract_text()`：优先 OCRmyPDF sidecar.txt，fallback 到 pdftotext 提取归档 PDF | Tika 服务器 `tika.as_text.from_file()` 纯文本提取 | `build_formatted_text()`：邮件头 + HTML 经 Tika 提取 + mail.text 的拼接结果 |
+| **归档 PDF 是否含文本层** | **有**（OCRmyPDF 将 Tesseract 识别的隐形文本叠加在图像上） | **视 LibreOffice 而定**（通常有，是 LibreOffice 导出 PDF 时自带的） | **通常有**（Chromium 渲染 HTML 时自动嵌入，可能含 HTML 标签残留） |
+| **DB content 与 PDF 文本层是否同源** | **是** — 同一次 Tesseract 识别，两条输出管道 | **否** — 独立引擎：Tika 提取 vs LibreOffice 嵌入 | **否** — 结构化头字段+纯文本拼接 vs Chromium HTML 渲染输出 |
+| **DB content 与 PDF 文本层一致性** | **高度一致** | **不一定一致**（顺序、换行、格式可能不同） | **差异较大**（结构化 vs 视觉化） |
+| **Gotenberg 调用次数** | 0（不使用 Gotenberg） | 1 次（LibreOffice 路由） | 无 HTML：1 次（仅 Chromium 正文）；有 HTML：3 次（正文 Chromium + HTML Chromium + Merge） |
+| **PDF/A 应用次数** | 1 次（OCRmyPDF/Ghostscript 输出阶段） | 1 次（LibreOffice 路由） | 无 HTML：1 次；有 HTML：3 次（每次 Gotenberg 调用独立应用） |
+| **失败回退机制** | Force OCR 重试、加密 PDF 跳过、元数据打标降级为普通 PDF、Ghostscript 软错误提示 | Tika 500 重试 buffer 模式；Gotenberg 失败直接 ParseError | 无特殊回退，Gotenberg 失败直接 ParseError；PDF/A-1 降级为 A2b |
 
 ---
 
