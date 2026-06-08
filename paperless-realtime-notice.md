@@ -888,7 +888,505 @@ ngOnInit() {
 
 ---
 
-## 五、完整数据流转图
+## 五、上传新版本场景下的端到端深度链路分析
+
+这是实时通知系统最复杂、最典型的场景：用户在文档详情页的版本下拉里上传一个新版本文件，后端 Celery 消费完成后，前端**两个组件**会**同时**收到两条独立的 WebSocket 消息并各自刷新。本章节从后端 API 入口到前端两个组件的 UI 刷新，进行逐行代码级别的追踪。
+
+### 5.1 后端 API 入口 → Celery 任务提交
+
+文件：[views.py](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/views.py#L1890-L1945)
+
+```
+HTTP POST /api/documents/{id}/update_version/   (multipart/form-data)
+    │
+    ├─ DocumentVersionSerializer 校验：document 文件、可选 version_label
+    ├─ get_root_document(request_doc) → 获取根文档（防止传入的是版本 id）
+    ├─ has_perms_owner_aware("change_document") → 权限校验
+    │
+    ├─ 将上传文件写入临时目录 SCRATCH_DIR，设置 mtime
+    │
+    ├─ 构造 ConsumableDocument(
+    │      source=ApiUpload,
+    │      original_file=临时文件路径,
+    │      root_document_id=root_doc.pk,  ← 关键：标记这是版本更新，不是新文档
+    │    )
+    │
+    ├─ 构造 DocumentMetadataOverrides（version_label + actor_id）
+    │
+    └─ consume_file.apply_async(
+           kwargs={"input_doc": ..., "overrides": ...},
+           headers={"trigger_source": WEB_UI},
+       )
+           │
+           └─ 返回 Response(async_task.id)  ← 前端收到 taskId
+```
+
+**关键差异**：新文档上传 vs 新版本上传的插件链不同。
+文件：[tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/tasks.py#L140-L155)
+
+```python
+plugins = (
+    # 新版本（有 root_document_id）：只跑 2 个插件
+    [ConsumerPreflightPlugin, ConsumerPlugin]
+    if input_doc.root_document_id is not None
+    # 新文档：跑 8 个插件（含条码拆分、工作流触发、ASN 检查等）
+    else [ConsumerPreflightPlugin, AsnCheckPlugin, CollatePlugin, BarcodePlugin,
+          AsnCheckPlugin, WorkflowTriggerPlugin, ConsumerPlugin]
+)
+```
+
+### 5.2 ConsumerPlugin.run() —— 两条消息的精确产生位置
+
+文件：[consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/consumer.py#L408-L784)
+
+整个方法的执行顺序和消息产生点如下：
+
+```
+ConsumerPlugin.run():
+│
+├─ ① 创建 working_copy 临时文件副本
+├─ ② MIME 类型检测 → 获取 Parser
+├─ ③ document_consumption_started.send()  ← 业务信号，不涉及 WebSocket
+├─ ④ run_pre_consume_script()
+│
+├─ ⑤ 解析文档 → _send_progress(20%, WORKING, PARSING_DOCUMENT)  ← status_update
+├─ ⑥ 生成缩略图 → _send_progress(70%, WORKING, GENERATING_THUMBNAIL)  ← status_update
+├─ ⑦ 提取日期 → _send_progress(90%, WORKING, PARSE_DATE)  ← status_update
+├─ ⑧ 加载分类器 classifier
+│
+├─ ⑨ _send_progress(95%, WORKING, SAVE_DOCUMENT)  ← status_update
+│
+│  ═══════════════════════ 事务块开始 transaction.atomic() ═══════════════════════
+│  │
+│  ├─ ⑩ 分支 A：root_document_id 存在（新版本场景）
+│  │     ├─ root_doc = Document.objects.get(pk=self.input_doc.root_document_id)
+│  │     ├─ version_doc = _create_version_from_root(root_doc, ...)
+│  │     │     ├─ select_for_update 锁行
+│  │     │     ├─ 计算下一个 version_index = Max(version_index) + 1
+│  │     │     └─ 构造新 Document(root_document=root_doc, version_index=N, ...)
+│  │     ├─ version_doc.save()  ← 写入数据库，同时记录审计日志（Version Added）
+│  │     └─ document = version_doc  ← 后续流程使用 version_doc
+│  │
+│  └─ ⑩ 分支 B：root_document_id 为空（新文档场景）
+│        └─ document = self._store(...)  ← 创建全新文档
+│
+│  ├─ ⑪ document_consumption_finished.send(document=document, ...)
+│  │     └─ 触发 add_inbox_tags / set_correspondent / run_workflows_consumption 等
+│  │
+│  ├─ ⑫ FileLock(MEDIA_LOCK) 内写入文件：
+│  │     ├─ generate_unique_filename(document)
+│  │     ├─ document.filename = ...  →  _write(源文件 → source_path)
+│  │     ├─ _write(thumbnail → thumbnail_path)
+│  │     └─ 如果有归档文件 → 写入 archive_path + 计算 archive_checksum
+│  │
+│  ├─ ⑬ document.save()  ← 第二次保存，写入 filename、archive_filename、archive_checksum
+│  │     │
+│  │     │  ═══════════════════════════════════════════════════════════════════
+│  │     │  ★ 第 1 条消息产生位置：document_updated (根文档)
+│  │     │  ═══════════════════════════════════════════════════════════════════
+│  │     └─ ⑭ if document.root_document_id:
+│  │            document_updated.send(
+│  │                sender=self.__class__,
+│  │                document=document.root_document,  ← 注意：发的是根文档，不是新版本
+│  │            )
+│  │               │
+│  │               └─ apps.py 信号绑定:
+│  │                  document_updated → send_websocket_document_updated()
+│  │                     └─ DocumentsStatusManager.send_document_updated(
+│  │                           document_id=根文档.id,
+│  │                           modified=根文档.modified,
+│  │                           owner_id=..., users_can_view=..., groups_can_view=...
+│  │                        )
+│  │                        └─ async_to_sync(channel_layer.group_send)(
+│  │                              "status_updates",
+│  │                              {"type": "document_updated", "data": {...}}
+│  │                           )
+│  │
+│  └─ ⑮ 删除原始输入文件
+│
+│  ═══════════════════════ 事务块结束 ═══════════════════════
+│
+├─ ⑯ run_post_consume_script(document)  ← post consume 脚本
+│
+│  ═══════════════════════════════════════════════════════════════════
+│  ★ 第 2 条消息产生位置：status_update (SUCCESS)
+│  ═══════════════════════════════════════════════════════════════════
+└─ ⑰ self._send_progress(
+        100, 100,
+        ProgressStatusOptions.SUCCESS,
+        ConsumerStatusShortMessage.FINISHED,
+        document.id,  ← 注意：这里的 document 是**新版本文档**的 id
+    )
+       │
+       └─ self.status_mgr.send_progress(
+              ProgressStatusOptions.SUCCESS, FINISHED, 100, 100,
+              document_id=新版本文档.id,
+              owner_id=..., users_can_view=..., groups_can_view=...
+          )
+          └─ async_to_sync(channel_layer.group_send)(
+                "status_updates",
+                {"type": "status_update", "data": {...}}
+             )
+
+└─ ⑱ document.refresh_from_db() → 返回 ConsumeFileSuccessResult(document_id=新版本id)
+```
+
+**两条消息的关键差异总结**：
+
+| 对比项 | status_update(SUCCESS) | document_updated(根文档) |
+|-------|------------------------|-------------------------|
+| 产生位置 | ConsumerPlugin.run() 末尾，事务外 | ConsumerPlugin.run() 事务内，document.save() 之后 |
+| `type` 字段 | `"status_update"` | `"document_updated"` |
+| `data.document_id` | **新版本文档**的 id | **根文档**的 id |
+| 触发路径 | `_send_progress()` → `ProgressManager.send_progress()` | `document_updated.send()` 信号 → `send_websocket_document_updated()` → `DocumentsStatusManager.send_document_updated()` |
+| 额外字段 | `status`, `message`, `current_progress`, `max_progress`, `task_id`, `filename` | `modified` (ISO 时间戳) |
+| 顺序 | 后发送 | 先发送 |
+
+两条消息分别通过 Redis Pub/Sub 广播到 `status_updates` 组，各自走 Consumer → WebSocket → 前端 Service 的独立链路。
+
+### 5.3 后端 WebSocket 分发 —— Consumer 侧
+
+文件：[consumers.py](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/paperless/consumers.py)
+
+两条消息到达 Consumer 后的处理路径：
+
+```
+Redis Pub/Sub → StatusConsumer (每个浏览器连接一个实例)
+    │
+    ├─ 收到 {"type": "document_updated", "data": {document_id: 根id, modified, owner_id, ...}}
+    │     └─ document_updated(event) 方法被 Channels 自动调度
+    │        ├─ _authenticated()? → 否则 close()
+    │        └─ _can_view(event["data"])?
+    │           └─ 是 → send(json.dumps(event))  ← 通过 WebSocket 发给浏览器
+    │
+    └─ 收到 {"type": "status_update", "data": {task_id, filename, status: SUCCESS, current_progress: 100, document_id: 新版本id, ...}}
+          └─ status_update(event) 方法被 Channels 自动调度
+             ├─ _authenticated()? → 否则 close()
+             └─ _can_view(event["data"])?
+                └─ 是 → send(json.dumps(event))  ← 通过 WebSocket 发给浏览器
+```
+
+> 注意：两条消息的 `_can_view` 权限检查各自独立，`status_update` 使用新版本的 owner/权限信息，`document_updated` 使用根文档的 owner/权限信息。通常两者一致，但如果版本创建时权限被覆盖可能出现差异。
+
+### 5.4 前端 WebsocketStatusService 分发
+
+文件：[websocket-status.service.ts](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/services/websocket-status.service.ts)
+
+```
+浏览器 WebSocket.onmessage → handleMessage(ev)
+    │
+    ├─ JSON.parse(ev.data) → { type, data }
+    │
+    ├─ switch(type)
+    │   │
+    │   ├─ case DOCUMENT_UPDATED:
+    │   │    └─ handleDocumentUpdated(messageData)
+    │   │       ├─ canViewMessage(messageData)? → 否: return
+    │   │       └─ documentUpdatedSubject.next(messageData)
+    │   │           └─ messageData = { document_id: 根id, modified: "2026-06-08T10:30:00Z", owner_id, users_can_view, groups_can_view }
+    │   │
+    │   └─ case STATUS_UPDATE:
+    │        └─ handleProgressUpdate(messageData)
+    │           ├─ canViewMessage(messageData)? → 否: return
+    │           ├─ this.get(task_id, filename) → 创建/查找 FileStatus 对象
+    │           ├─ status.updateProgress(WORKING, 100, 100)
+    │           ├─ status.message = FILE_STATUS_MESSAGES[FINISHED]
+    │           ├─ status.documentId = messageData.document_id  ← 新版本id
+    │           │
+    │           └─ messageData.status === SUCCESS →
+    │              ├─ status.phase = FileStatusPhase.SUCCESS
+    │              └─ documentConsumptionFinishedSubject.next(status)
+    │                  └─ status = FileStatus{ taskId, filename, phase: SUCCESS, documentId: 新版本id, ... }
+    │
+    └─ 两条消息通过不同 Subject 广播出去，互不干扰
+```
+
+### 5.5 前端组件订阅与界面刷新
+
+两条消息分别被不同的组件订阅，以下是两条链路的前端处理细节。
+
+---
+
+#### 链路 A：status_update(SUCCESS) → DocumentVersionDropdownComponent
+
+文件：[document-version-dropdown.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/components/document-detail/document-version-dropdown/document-version-dropdown.component.ts#L195-L275)
+
+这个组件**不直接订阅** `onDocumentConsumptionFinished()`，而是在用户点击上传时通过 RxJS `switchMap + merge` 在**局部作用域内**临时订阅对应 taskId 的完成事件：
+
+```
+用户选择文件 → onVersionFileSelected(event):
+    │
+    ├─ this.documentsService.uploadVersion(uploadDocumentId, file, label)
+    │   └─ HTTP POST → 返回 taskId (字符串)
+    │
+    ├─ tap(() => {
+    │     this.versionUploadState = UploadState.Processing  ← UI 显示"处理中"
+    │     this.toastService.showInfo("Uploading new version...")
+    │   })
+    │
+    ├─ switchMap(taskId → merge(
+    │     // 只取第一个匹配 taskId 的 SUCCESS 或 FAILED 事件
+    │     websocketStatusService.onDocumentConsumptionFinished()
+    │       .pipe(filter(s => s.taskId === taskId),
+    │             map(() => ({ state: 'success' }))),
+    │     websocketStatusService.onDocumentConsumptionFailed()
+    │       .pipe(filter(s => s.taskId === taskId),
+    │             map(s => ({ state: 'failed', message: s.message }))),
+    │   ).pipe(take(1)))
+    │
+    ├─ switchMap(result →
+    │     result.state === 'success'
+    │       ? this.documentsService.getVersions(uploadDocumentId)  ← HTTP GET 拉最新版本列表
+    │       : of(null))
+    │
+    └─ subscribe({
+         next: (doc) => {
+             if (doc?.versions) {
+                 this.versionsUpdated.emit(doc.versions)
+                 // 自动选中最新版本（最大 id）
+                 this.versionSelected.emit(Math.max(...doc.versions.map(v => v.id)))
+                 this.clearVersionUploadStatus()  // UI 恢复 Idle
+             }
+         },
+         error: (e) => {
+             this.versionUploadState = UploadState.Failed
+             this.versionUploadError = e.message
+             this.toastService.showError(...)
+         }
+       })
+```
+
+**父子组件事件通信**（模板绑定）：
+文件：[document-detail.component.html](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.html#L27-L34)
+
+```html
+<pngx-document-version-dropdown
+  [documentId]="documentId"
+  [versions]="document?.versions ?? []"
+  [selectedVersionId]="selectedVersionId"
+  [userIsOwner]="userIsOwner"
+  [userCanEdit]="userCanEdit"
+  (versionSelected)="onVersionSelected($event)"
+  (versionsUpdated)="onVersionsUpdated($event)"
+/>
+```
+
+父组件 DocumentDetailComponent 对事件的响应：
+
+文件：[document-detail.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L965-L974)
+
+```typescript
+onVersionSelected(versionId: number) {
+    this.selectVersion(versionId)
+}
+
+onVersionsUpdated(versions: DocumentVersionInfo[]) {
+    this.document.versions = versions
+    const openDoc = this.openDocumentService.getOpenDocument(this.documentId)
+    if (openDoc) {
+        openDoc.versions = versions
+        this.openDocumentService.save()  // 持久化到 OpenDocumentService
+    }
+}
+```
+
+`selectVersion()` 方法负责切换预览：
+文件：[document-detail.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L907-L963)
+
+```typescript
+selectVersion(versionId: number) {
+    this.selectedVersionId = versionId
+    this.previewLoaded = false
+    this.previewUrl = this.documentsService.getPreviewUrl(this.documentId, false, this.selectedVersionId)
+    this.updatePdfSource()   // PDF.js 重新加载 PDF
+    this.thumbUrl = this.documentsService.getThumbUrl(this.documentId, this.selectedVersionId)
+    this.loadMetadataForSelectedVersion()  // 刷新元数据
+    // 重新拉取预览文本
+    this.http.get(this.previewUrl, { responseType: 'text' }).subscribe({
+        next: (res) => (this.previewText = res.toString()),
+    })
+}
+```
+
+**链路 A 的最终 UI 刷新效果**：
+1. 版本下拉列表出现新上传的版本条目
+2. 自动选中最新版本（高亮）
+3. 右侧 PDF 预览区自动加载新版本 PDF
+4. 缩略图替换为新版本缩略图
+5. 预览文本区更新为新版本的 OCR 文本
+6. 上传状态从"Processing"变回"Idle"
+
+---
+
+#### 链路 B：document_updated(根文档) → DocumentDetailComponent
+
+文件：[document-detail.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L662-L695)
+
+这个组件在 `ngOnInit` 中**全局订阅** `onDocumentUpdated()`：
+
+```typescript
+this.websocketStatusService
+  .onDocumentUpdated()
+  .pipe(takeUntil(this.unsubscribeNotifier))
+  .subscribe((data) => this.handleIncomingDocumentUpdated(data))
+```
+
+`handleIncomingDocumentUpdated()` 的四级判定逻辑：
+
+```
+handleIncomingDocumentUpdated(data):
+    │
+    ├─ 第 1 关：data.document_id !== this.documentId  → 不是当前文档，直接 return
+    │   （上传新版本时 data.document_id = 根文档id，刚好匹配当前详情页的 documentId）
+    │
+    ├─ 第 2 关：this.networkActive === true
+    │   └─ 有 HTTP 请求在处理 → this.pendingIncomingUpdate = data（缓存），等网络空闲再处理
+    │
+    ├─ 第 3 关：data.modified === this.lastLocalSaveModified
+    │   └─ 时间戳对上了，是"自己刚刚保存产生的回声" → this.lastLocalSaveModified = null，return（忽略）
+    │
+    └─ 第 4 关：this.openDocumentService.isDirty(this.document)
+        │
+        ├─ 是（表单有未保存修改）：
+        │   └─ showIncomingUpdateModal(data.modified)
+        │      弹出对话框："This document has been modified elsewhere. Reload to see the latest changes?"
+        │      按钮：Reload document / Keep editing
+        │      点击 Reload → reloadRemoteVersion() → loadDocument(this.documentId, true)
+        │
+        └─ 否（表单干净）：
+            └─ this.loadDocument(this.documentId, true)
+               this.toastService.showInfo("Document reloaded with latest changes.")
+```
+
+**`loadDocument(documentId, forceRemote=true)` 的完整刷新流程**：
+文件：[document-detail.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src-ui/src/app/components/document-detail/document-detail.component.ts#L492-L610)
+
+```
+loadDocument(documentId, forceRemote):
+    │
+    ├─ this.selectedVersionId = documentId
+    ├─ this.previewUrl = documentsService.getPreviewUrl(selectedVersionId)
+    ├─ this.updatePdfSource()
+    ├─ HTTP GET previewUrl → 刷新 previewText
+    ├─ this.thumbUrl = documentsService.getThumbUrl(selectedVersionId)
+    │
+    ├─ HTTP GET documentsService.get(documentId) → 拿到 doc（含 versions[] 数组）
+    │   │
+    │   ├─ if openDocument && forceRemote:  Object.assign(openDocument, doc)  ← 覆盖本地编辑
+    │   ├─ else if openDocument: new Date(doc.modified) > new Date(openDocument.modified)
+    │   │    └─ if hasLocalEdits → showIncomingUpdateModal else Object.assign
+    │   └─ else openDocumentService.openDocument(doc)
+    │
+    ├─ this.updateComponent(useDoc)
+    │   ├─ this.document = useDoc
+    │   ├─ this.selectedVersionId = Math.max(...doc.versions.map(v => v.id)) || doc.id
+    │   ├─ this.loadMetadataForSelectedVersion()
+    │   ├─ this.title = documentTitlePipe.transform(doc.title)
+    │   └─ this.prepareForm(doc)  ← 所有表单字段（标题/标签/对应人/日期/ASN/自定义字段...）重置为最新值
+    │
+    └─ this.setupDirtyTracking(useDoc, doc)  ← 重建脏值追踪
+```
+
+**链路 B 的最终 UI 刷新效果**：
+1. 顶部标题栏显示最新标题
+2. 所有表单字段（标题、标签、对应人、文档类型、存储路径、日期、ASN、所有者、权限、自定义字段等）更新为最新值
+3. 元数据卡片重新加载
+4. 版本下拉（通过 `[versions]="document?.versions"` 输入属性绑定）自动拿到最新 versions 数组
+5. PDF 预览、缩略图、预览文本全部更新为最新版本内容
+6. Toast 显示 "Document reloaded with latest changes."
+
+---
+
+#### 两条链路的时序与协同
+
+由于 `document_updated` 在事务内发送，`status_update(SUCCESS)` 在事务外发送，且各自经过独立的 Redis Pub/Sub 通道和 WebSocket 消息，它们到达浏览器的顺序可能存在微小差异（通常 `document_updated` 先到）。两条链路刷新的内容也互补：
+
+- **链路 A（status_update）**：精确知道"当前上传操作成功了"，负责上传状态 UI 复位、精确触发 `getVersions()` 拉取版本列表并自动选中新版本。
+- **链路 B（document_updated）**：泛化的"文档有变化"通知，负责整个详情页所有元数据和预览内容的全量刷新。
+
+> 潜在的优化空间：链路 A 已经调用了 `getVersions()` 并 `emit(versionsUpdated)` 更新了 `document.versions`，随后链路 B 的 `loadDocument()` 又会通过 `documentsService.get(documentId)` 再次拉取完整文档（含 versions），存在一次重复请求。由于两条消息到达存在时差，通常不会被用户感知。
+
+### 5.6 上传新版本端到端完整时序图
+
+```
+ 用户点击上传新版本
+         │
+         ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  浏览器                                                              │
+│  DocumentVersionDropdownComponent.onVersionFileSelected()            │
+│    └─ HTTP POST /api/documents/{id}/update_version/ ───────────────┐│
+│       (multipart/form-data: file + label)                          ││
+└────────────────────────────────────────────────────────────────────┘│
+                                                                      │
+                              ▲                                       │
+                              │  Response: taskId                     │
+                              │                                       │
+┌─────────────────────────────┴──────────────────────────────────────┐│
+│  浏览器                                                              ││
+│    └─ versionUploadState = Processing                               ││
+│       tap: toast "Uploading new version..."                         ││
+│       switchMap: merge onSuccess/onFailed, filter by taskId         ││
+│       (RxJS 订阅临时建立，等待对应 taskId 的 SUCCESS/FAILED)          ││
+│                                                                     ││
+│  同时 DocumentDetailComponent 早已在 ngOnInit 订阅 onDocumentUpdated  ││
+└─────────────────────────────────────────────────────────────────────┘
+                                                                      │
+                              ▲                                       │
+                              │  Celery Worker 异步执行                │
+                              │                                       │
+┌─────────────────────────────┴──────────────────────────────────────┐│
+│  Django / Celery Worker                                              ││
+│                                                                     ││
+│  consume_file(taskId, input_doc={root_document_id: rootId})         ││
+│    └─ ConsumerPlugin.run()                                          ││
+│        ├─ 解析/缩略图/日期提取 → 多次 status_update(WORKING)        ││
+│        ├─ transaction.atomic():                                     ││
+│        │   ├─ _create_version_from_root() → version_doc.save()      ││
+│        │   ├─ document_consumption_finished.send()                  ││
+│        │   ├─ 文件写入 MEDIA 目录                                     ││
+│        │   ├─ document.save()                                        ││
+│        │   └─ ★ 消息① document_updated.send(root_document) ────────┼┼──→ Redis Pub/Sub
+│        │                                                             ││
+│        ├─ run_post_consume_script()                                  ││
+│        └─ ★ 消息② _send_progress(SUCCESS, document_id=版本id) ─────┼┼──→ Redis Pub/Sub
+│                                                                     ││
+└─────────────────────────────────────────────────────────────────────┘│
+                                                                      │
+                              ▲                                       │
+                              │  Redis Pub/Sub → Daphne → WebSocket   │
+                              │  两条消息各自独立传播                    │
+                              │                                       │
+┌─────────────────────────────┴──────────────────────────────────────┐│
+│  浏览器 (两条并发接收的消息)                                          ││
+│                                                                     ││
+│  ═══ 消息①到达：type=document_updated ══════════════════════════════││
+│  WebsocketStatusService.handleDocumentUpdated()                    ││
+│    └─ documentUpdatedSubject.next({document_id: rootId, modified}) ││
+│       └─ DocumentDetailComponent.handleIncomingDocumentUpdated()    ││
+│          ├─ 匹配当前 documentId ✓                                    ││
+│          ├─ isDirty? → 通常为 false（刚上传，用户没开始改）           ││
+│          └─ loadDocument(documentId, forceRemote=true)             ││
+│             ├─ HTTP GET /api/documents/{rootId}/ → 完整文档+版本    ││
+│             └─ updateComponent() → 全页 UI 刷新                     ││
+│                                                                     ││
+│  ═══ 消息②到达：type=status_update status=SUCCESS ═══════════════════││
+│  WebsocketStatusService.handleProgressUpdate()                      ││
+│    ├─ status.phase = SUCCESS                                        ││
+│    └─ documentConsumptionFinishedSubject.next(status)               ││
+│       └─ DocumentVersionDropdownComponent 内的 RxJS merge:          ││
+│          ├─ filter: status.taskId === 本地taskId ✓ (take(1) 完成)   ││
+│          ├─ switchMap: HTTP GET /api/documents/{rootId}/versions/   ││
+│          ├─ versionsUpdated.emit(versions) → 父组件更新 versions    ││
+│          ├─ versionSelected.emit(新版本id) → selectVersion()        ││
+│          └─ versionUploadState = Idle (上传状态清除)                ││
+│                                                                     ││
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 六、完整数据流转图
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────────┐
@@ -979,36 +1477,41 @@ ngOnInit() {
 
 ---
 
-## 六、关键设计要点
+## 七、关键设计要点
 
-### 6.1 前后端双权限校验
+### 7.1 前后端双权限校验
 - **后端**：StatusConsumer 在发送每条消息前检查权限，避免越权信息通过 WebSocket 泄漏
 - **前端**：WebsocketStatusService 收到消息后再次检查，作为防御性兜底
 - 权限判定逻辑完全一致，防止逻辑漂移
 
-### 6.2 统一 Group + Consumer 端过滤
+### 7.2 统一 Group + Consumer 端过滤
 - 所有客户端共享一个 `status_updates` 组，避免为每个用户创建独立 channel 造成 Redis 资源消耗
 - 过滤放在 Consumer 侧执行（异步 `aexists()` 查询用户组），权衡了实现复杂度与隔离性
 
-### 6.3 上下文管理器确保消息可靠发送
+### 7.3 上下文管理器确保消息可靠发送
 - `ProgressManager` 和 `DocumentsStatusManager` 均使用 `__enter__/__exit__` 管理 channel layer 生命周期
 - 退出时 flush channel layer，避免在 Celery worker 进程中消息卡在发送缓冲区
 
-### 6.4 异步 Consumer + 同步发送桥接
+### 7.4 异步 Consumer + 同步发送桥接
 - Consumer 继承 `AsyncWebsocketConsumer`，所有 I/O 均为 async（channel layer 操作、DB 查询）
 - 事件产生方（Celery、API）在同步上下文中运行，通过 `asgiref.sync.async_to_sync` 桥接调用
 
-### 6.5 `QuerySet.update()` 不触发信号的补偿机制
+### 7.5 `QuerySet.update()` 不触发信号的补偿机制
 - Django ORM 批量更新 (`qs.update()`) 不会触发 `post_save`，也不走 serializer 的 `save()`
 - Paperless-ngx 专门设计了 `bulk_update_documents` Celery 任务，在批量改 DB 后显式发送 `document_updated` 信号，保证 WebSocket 推送不丢失
 
-### 6.6 详情页的乐观并发控制
+### 7.6 详情页的乐观并发控制
 - DocumentDetailComponent 收到 `document_updated` 时，对比 `modified` 时间戳判断是否为"自己保存产生的回声"
 - 如果用户正在编辑 (form dirty)，弹确认对话框让用户决定是否覆盖本地修改，避免丢失编辑内容
 
-### 6.7 定时工作流的特殊处理
+### 7.7 定时工作流的特殊处理
 - 定时工作流 `check_scheduled_workflows()` **不通过** `document_updated` 信号发送通知，而是直接调用 `send_websocket_document_updated()`
 - 代码注释明确说明原因：SCHEDULED 类型的工作流执行后，内部不会自动触发 `document_updated` 信号，需兜底直接推送
 
-### 6.8 与 SSE 的区别
+### 7.8 上传新版本场景的双消息协同
+- `document_updated` 在事务内发送（根文档 id）→ DocumentDetailComponent 负责全页元数据刷新
+- `status_update(SUCCESS)` 在事务外发送（新版本 id）→ DocumentVersionDropdownComponent 负责版本列表刷新 + 状态复位
+- 两条消息互补但存在一次潜在重复请求（getVersions vs get 都拉 versions）
+
+### 7.9 与 SSE 的区别
 系统仅在 AI Chat 功能中使用 SSE 风格的 `StreamingHttpResponse`（[views.py](file:///d:/fz/0601/solo-dogfeeding/code/111-paperless-ngx/src/documents/views.py#L2181-L2185)），用于流式输出 LLM 回答。该实现与实时通知系统完全独立，不经过 WebSocket / Channels 层。
