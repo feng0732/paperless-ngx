@@ -103,7 +103,19 @@ if trigger.schedule_is_recurring and workflow_runs.exists() and (
     continue
 ```
 
-> **重要**：`run_workflows()` 在每次成功匹配并执行完所有动作后都会创建 WorkflowRun 记录（见 [signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/signals/handlers.py#L986-L990)），但 CONSUMPTION / DOCUMENT_ADDED / DOCUMENT_UPDATED 三种触发类型**并不查询** WorkflowRun 来去重，它们每次触发都会无条件执行匹配。
+> **重要**：`run_workflows()` 在每次成功匹配并执行完所有动作后都会创建 WorkflowRun 记录（见 [signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/signals/handlers.py#L986-L990)）。
+
+**四种触发类型下 WorkflowRun 的写入与查询对照**：
+
+| 触发类型 | 是否写入 WorkflowRun | WorkflowRun.document | 是否查询 WorkflowRun 去重 | 去重字段 |
+|----------|:-------------------:|:--------------------:|:------------------------:|---------|
+| CONSUMPTION | ✅ | `NULL`（文档未入库） | ❌ | — |
+| DOCUMENT_ADDED | ✅ | Document FK | ❌ | — |
+| DOCUMENT_UPDATED | ✅ | Document FK | ❌ | — |
+| SCHEDULED | ✅ | Document FK | ✅ | `(document_id, type=SCHEDULED, workflow_id)` 三元组 |
+
+- **只写不查（CONSUMPTION/ADDED/UPDATED）**：这三种由事件驱动，本身天然"一次性"，无需去重，WorkflowRun 仅作为审计记录存在
+- **又写又查（SCHEDULED）**：由 Celery Beat 周期性重复触发，必须靠 WorkflowRun 防止非周期工作流重复执行、以及控制周期工作流的触发间隔
 
 ---
 
@@ -380,9 +392,22 @@ run_workflows()
 定义于 [workflows/actions.py](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/workflows/actions.py#L190-L273) 与 [workflows/webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/workflows/webhooks.py)
 
 **关键事实：`send_webhook` 不在 `TRACKED_TASKS` 中**（见 [signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017) 的 TRACKED_TASKS 字典），因此：
-- ❌ 不会创建 `PaperlessTask` 记录
-- ❌ 前端任务列表里看不到
+- ❌ 不会创建独立的 `PaperlessTask` 记录
+- ❌ 前端任务列表里看不到其执行状态
 - ✅ 但有自己的 Celery 自动重试：`autoretry_for=(HTTPStatusError,), max_retries=3, retry_backoff=True`
+
+**所有动作类型与宿主任务 PaperlessTask 的归属关系**：
+
+| 动作类型 | 是否独立 Celery 任务 | 是否产生 PaperlessTask | 状态归属 |
+|----------|:-------------------:|:---------------------:|---------|
+| ASSIGNMENT | ❌（同步执行） | ❌ | 随宿主任务（CONSUME_FILE / BULK_UPDATE / CHECK_WORKFLOWS 等） |
+| REMOVAL | ❌（同步执行） | ❌ | 随宿主任务 |
+| EMAIL | ❌（同步执行，阻塞当前线程） | ❌ | 随宿主任务 |
+| **WEBHOOK** | ✅（`send_webhook.apply_async()`） | ❌（不在 TRACKED_TASKS） | 仅 Celery Broker/Worker 内部状态，3 次指数退避重试 |
+| PASSWORD_REMOVAL | ❌（同步 / 信号延迟执行） | ❌ | 随宿主任务 |
+| MOVE_TO_TRASH | ❌（同步但延迟到所有动作后） | ❌ | 随宿主任务 |
+
+> 注：Workflow 本身**不是** Celery 任务，其执行完全依附于触发它的宿主任务。因此 Workflow 动作的成功/失败直接反映在宿主任务的 PaperlessTask.status 上——若 ASSIGNMENT 抛异常，宿主任务会进入 FAILURE 状态，result_data 中记录 error_type、error_message、traceback。
 
 **Webhook 执行链路**：
 
@@ -635,7 +660,7 @@ document_consumption_finished.send(sender=ConsumerPlugin, document=doc, ...)
 - `documents.tasks.bulk_update_documents`（最常见，SYSTEM 来源）
 - 或直接在 views.py 处理 API 请求的线程（同步发送）
 
-`document_updated` 信号的发出点：
+`document_updated` 信号的发出点（SCHEDULED **不**发此信号，见 5.4 节说明）：
 
 | 发出位置 | 场景 |
 |---------|------|
@@ -643,7 +668,6 @@ document_consumption_finished.send(sender=ConsumerPlugin, document=doc, ...)
 | [views.py:1178](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L1178-L1181) | PATCH /api/documents/{id}/ 后 |
 | [views.py:2046](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L2046-L2049) | 删除版本后 |
 | [views.py:2119](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L2119-L2122) | 修改版本标签后 |
-| [tasks.py:570](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/tasks.py#L569-L573) | 定时工作流跑完后（SCHEDULED 场景的收尾） |
 
 执行流：
 ```
@@ -750,19 +774,44 @@ Celery Beat（按 cron "5 */1 * * *"）
                       │                    workflow_to_run=workflow,  // 跳过查询
                       │                    document=document)
                       │     └── existing_document_matches_workflow() 最终判定
-                      │         → 执行动作
+                      │         → 依次执行动作（ASSIGNMENT/REMOVAL/EMAIL/WEBHOOK/PASSWORD_REMOVAL）
+                      │         → document.save(update_fields=[6 个白名单字段])
                       │         → WorkflowRun.objects.create(workflow=workflow,
                       │                                       type=SCHEDULED,
                       │                                       document=document)
+                      │         → 若有 MOVE_TO_TRASH 则最后执行
                       │
                       └── ⑥ send_websocket_document_updated(sender=None, document=doc)
-                            （SCHEDULED 不发 document_updated 信号，这里手动推 WebSocket）
+                            （代码注释明确："Scheduled workflows dont send document_updated signal,
+                             so send a websocket update here to ensure clients are updated"
+                             —— 只做纯前端 WebSocket 通知，不触发任何后端逻辑，
+                             不会引发 DOCUMENT_UPDATED 工作流的二次执行）
 ```
 
 **关键去重逻辑说明**：
 - WorkflowRun 的过滤字段是 **`(document_id, type=SCHEDULED, workflow_id)` 三元组**，同一文档通过不同 workflow 的 SCHEDULED 触发互不影响
 - 非周期：只要历史上**有过任意一次**成功执行就永久跳过
 - 周期：上次成功执行的 `run_at` 距离现在小于 `schedule_recurring_interval_days` 才跳过；超过则再次执行（允许多次）
+
+**SCHEDULED 与 DOCUMENT_UPDATED 的边界**：
+SCHEDULED 工作流通过 `run_workflows(workflow_to_run=workflow)` 传入单条 workflow，不会调用 get_workflows_for_trigger 扫描其他类型工作流；收尾只调 send_websocket_document_updated 纯前端通知，不发 document_updated 信号——**两条链路完全隔离，不会因 SCHEDULED 的执行间接触发 DOCUMENT_UPDATED 工作流**。
+
+### 5.5 四种触发类型的统一总览
+
+| 维度 | CONSUMPTION | DOCUMENT_ADDED | DOCUMENT_UPDATED | SCHEDULED |
+|------|:-------------:|:--------------:|:-----------------:|:----------:|
+| **触发入口** | Consumer 插件 `WorkflowTriggerPlugin.run()` | `document_consumption_finished` 信号 | `document_updated` 信号 | Celery Beat `check_scheduled_workflows()` |
+| **宿主 PaperlessTask 类型** | `CONSUME_FILE` | `CONSUME_FILE`（同一任务同步执行） | `BULK_UPDATE` / 同步 API 线程 / 其他 | `CHECK_WORKFLOWS` |
+| **典型 TriggerSource** | `FOLDER_CONSUME`、`EMAIL_CONSUME`、`WEB_UI`、`API_UPLOAD` | 同上（与 CONSUMPTION 同一宿主） | `SYSTEM`（bulk_edit）或无 | `SCHEDULED` |
+| **匹配对象** | `ConsumableDocument`（未入库） | `Document`（已入库） | `Document`（已入库） | `Document`（已入库） |
+| **run_workflows 模式** | overrides 模式（写 DocumentMetadataOverrides） | 直接模式（改 Document + save()） | 直接模式 | 直接模式 |
+| **匹配函数** | `consumable_document_matches_workflow()` | `existing_document_matches_workflow()` | `existing_document_matches_workflow()` | `existing_document_matches_workflow()` |
+| **可过滤维度** | source / mailrule / filename / path | 全部（内容 + 所有元数据） | 全部（内容 + 所有元数据） | 全部（内容 + 所有元数据） |
+| **WorkflowRun.document** | `NULL` | Document FK | Document FK | Document FK |
+| **WorkflowRun 去重** | ❌（只写不查） | ❌（只写不查） | ❌（只写不查） | ✅（三元组去重 + 周期性间隔控制） |
+| **document.save() 白名单字段** | 不直接存 DB（存 overrides） | title / correspondent / document_type / storage_path / owner / modified | 同左 | 同左 |
+| **收尾是否发 document_updated** | 否（后续才会自然触发 DOCUMENT_ADDED） | 否（由 document_consumption_finished 触发） | 是（自身就是 signal handler） | **否**（只发 send_websocket_document_updated 纯前端通知） |
+| **间接触发下一工作流类型** | DOCUMENT_ADDED（后续在同一 consume_file 任务里） | 无 | 无 | 无（明确不触发） |
 
 ---
 
