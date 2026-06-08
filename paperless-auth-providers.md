@@ -84,11 +84,19 @@ path("2fa/authenticate/", allauth_mfa_views.authenticate, name="mfa_authenticate
 #### 2.1.3 社交账号入口
 
 ```python
+# 通用状态页面
 # /accounts/3rdparty/login/cancelled/  - 社交登录取消
 # /accounts/3rdparty/login/error/      - 社交登录错误
-# /accounts/3rdparty/signup/           - 社交登录后补全注册
-# *build_provider_urlpatterns()         - 各 OAuth 提供商的具体回调 URL
+# /accounts/3rdparty/signup/           - 社交登录后补全注册（若 AUTO_SIGNUP=False）
+
+# 各 OAuth 提供商的独立 URL（由 allauth 的 build_provider_urlpatterns() 动态生成）
+# 格式为：/accounts/<provider_id>/login/           → 发起 OAuth 授权（登录或绑定）
+#          /accounts/<provider_id>/login/callback/  → OAuth 回调地址
+# 例如：/accounts/keycloak-test/login/
+#       /accounts/keycloak-test/login/callback/
 ```
+
+**`build_provider_urlpatterns()` 的作用**：allauth 遍历 `SOCIALACCOUNT_PROVIDERS` 中配置的每个提供商，为其动态注册专属的登录发起和回调 URL。`provider_id` 来自 SocialApp 配置（如 OpenID Connect 的 `provider_id` 字段）。
 
 #### 2.1.4 Headless API 入口
 
@@ -119,9 +127,25 @@ re_path("^auth/headless/", include("allauth.headless.urls")),
    - OpenID 提供商额外遍历 brands
    - 若 `REDIRECT_LOGIN_TO_SSO=True` 且非登出状态，自动提交第一个社交登录表单
 
+#### 2.2.1 社交登录 URL 的 `process` 参数关键区别
+
+模板中通过 `{% provider_login_url provider process=process ... %}` 生成授权 URL。这里的 `process` 变量由 allauth 的登录视图注入模板上下文，在登录页面场景下默认为 `"login"`。
+
+`process` 参数是 allauth 区分「登录注册」与「账号绑定」的核心机制：
+
+| process 值 | 适用场景 | URL 示例 | 回调后的行为 |
+|-----------|---------|---------|------------|
+| `"login"` | 未登录用户访问 `/accounts/login/` 时点击社交登录按钮 | `/accounts/keycloak-test/login/?process=login` | 走登录/注册流程：查找已有 SocialAccount 或创建新 User |
+| `"connect"` | 已登录用户在用户资料页点击「绑定社交账号」 | `/accounts/keycloak-test/login/?process=connect` | 走绑定流程：将 SocialAccount 直接关联到当前登录用户 |
+
+**证据链**：
+- 登录模板 [login.html L57/L61](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/templates/account/login.html#L57-L61) 使用 `process=process`（来自 allauth 视图上下文，值为 `"login"`）
+- 后端 Profile API [views.py L501/L510-L512](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/views.py#L501-L512) 明确传入 `process="connect"` 生成绑定用 URL
+- 测试用例 [test_api_profile.py L49/L330](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/tests/test_api_profile.py#L49-L330) 验证返回的 URL 包含 `?process=connect`
+
 MFA 验证页面模板位于 [authenticate.html](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/templates/mfa/authenticate.html)，仅包含一个 TOTP 验证码输入框和取消按钮。
 
-社交登录确认页位于 [socialaccount/login.html](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/templates/socialaccount/login.html)，在绑定社交账号前让用户确认。
+社交登录确认页位于 [socialaccount/login.html](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/templates/socialaccount/login.html)，在绑定社交账号前让用户确认（当 `REDIRECT_LOGIN_TO_SSO=True` 时会自动提交该表单）。
 
 ---
 
@@ -351,39 +375,199 @@ SOCIAL_ACCOUNT_SYNC_GROUPS_CLAIM = "groups"  # 从哪个 claim 取组信息
 HEADLESS_TOKEN_STRATEGY = "paperless.adapter.DrfTokenStrategy"
 ```
 
-### 5.2 社交登录完整流程
+### 5.2 社交登录三种入口场景详解
+
+paperless-ngx 中发起社交授权共有 **三条不同的入口路径**，分别对应不同用户状态和业务场景：
+
+| 场景 | 用户状态 | 入口位置 | process 参数 | 目标 |
+|-----|---------|---------|-------------|-----|
+| **A. 登录页第三方登录** | 未登录 | `/accounts/login/` 页面底部按钮 | `process=login` | 登录或注册新用户 |
+| **B. 已登录用户绑定新账号** | 已登录 | 用户资料对话框「绑定社交账号」 | `process=connect` | 为当前用户添加新的 SocialAccount |
+| **C. SSO 自动跳转** | 未登录 | 访问任意受保护页面被重定向到登录页 | `process=login` | 同场景 A，但 `REDIRECT_LOGIN_TO_SSO=True` 时自动提交第一个提供商表单 |
+
+---
+
+#### 5.2.1 场景 A：登录页发起第三方授权（process=login）
+
+```
+  未登录用户
+     │
+     ▼
+  GET /accounts/login/  或  GET /api/auth/login/
+     │
+     ▼
+  allauth.account.views.login 视图
+  → 渲染 account/login.html 模板
+  → 注入上下文变量 process="login"
+     │
+     ▼
+  模板渲染社交按钮：
+  {% provider_login_url provider process=process scope=scope auth_params=auth_params as href %}
+  生成 URL: /accounts/<provider_id>/login/?process=login
+     │
+     ▼
+  用户点击按钮（POST 或 GET 跳转）
+     │
+     ▼
+  POST/GET /accounts/<provider_id>/login/?process=login
+     │
+     ▼
+  allauth.socialaccount 内部处理
+  1. 将 process="login" 存入 session
+  2. 构建 OAuth 授权 URL
+  3. 302 重定向至第三方授权页面
+```
+
+**证据**：登录模板 [login.html L61](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/templates/account/login.html#L61) 中 `process=process`，此处 `process` 由 allauth `LoginView` 上下文提供，值为 `"login"`。
+
+---
+
+#### 5.2.2 场景 B：已登录用户绑定社交账号（process=connect）
+
+```
+  已登录用户
+     │
+     ▼
+  打开前端 ProfileEditDialog 对话框
+     │
+     ▼
+  GET /api/profile/social_account_providers/
+     │
+     ▼
+  [SocialAccountProvidersView.get]  [views.py L497-L519]
+  - adapter.list_providers(request)
+  - 对每个 provider 调用 p.get_login_url(request, process="connect") ← 关键！
+  - 返回 [{name, login_url}]
+     │
+     ▼
+  返回的 URL 示例: /accounts/<provider_id>/login/?process=connect
+     │
+     ▼
+  用户点击前端「绑定」按钮 → window.location.href = login_url
+     │
+     ▼
+  GET /accounts/<provider_id>/login/?process=connect
+     │
+     ▼
+  allauth.socialaccount 内部处理
+  1. 将 process="connect" 存入 session
+  2. 构建 OAuth 授权 URL
+  3. 302 重定向至第三方授权页面
+```
+
+**证据**：后端明确使用 `process="connect"` —— [views.py L501](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/views.py#L501)：
+```python
+{"name": p.name, "login_url": p.get_login_url(request, process="connect")}
+```
+
+测试验证：[test_api_profile.py L329-L332](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/tests/test_api_profile.py#L329-L332) 断言返回的 URL 含 `"keycloak-test/login/?process=connect"`。
+
+---
+
+#### 5.2.3 场景 C：SSO 自动跳转
+
+当 `REDIRECT_LOGIN_TO_SSO=True`（环境变量 `PAPERLESS_REDIRECT_LOGIN_TO_SSO`）时，登录页渲染后会自动执行 JS 提交第一个社交登录表单：
+
+```javascript
+// login.html L68-L79
+if (REDIRECT_LOGIN_TO_SSO && forloop.counter0 == 0 && request.GET.loggedout != '1') {
+    const form = document.getElementById('social-login');
+    if (form) { form.submit(); }
+    else { document.getElementsByClassName('oidc-url')[0].click(); }
+}
+```
+
+行为同场景 A，只是由浏览器自动触发而无需用户点击。
+
+---
+
+### 5.3 OAuth 回调：allauth 内部如何根据 process 分流
+
+第三方 OAuth 完成后，浏览器被重定向回回调 URL：
+
+```
+  第三方授权成功
+     │
+     ▼
+  302 回跳 → GET /accounts/<provider_id>/login/callback/
+     │
+     ▼
+  allauth.socialaccount 回调视图
+  1. 校验 OAuth state，兑换 access_token
+  2. 获取用户信息（uid、email 等）
+  3. 从 session 中取出之前存入的 process 参数
+     │
+     ▼
+  ┌─────────────── process 值是？ ───────────────┐
+  │                                               │
+  │          "login"                     "connect" │
+  │             │                           │     │
+  │             ▼                           ▼     │
+  │    【登录/注册分支】            【绑定分支】    │
+  │             │                           │     │
+  │             ▼                           ▼     │
+  │   SocialAccount 已存在？         当前 request.user 已认证 │
+  │        │        │                    │     │
+  │       是        否                   │     │
+  │        │        │                    ▼     │
+  │        ▼        ▼           关联 SocialAccount │
+  │    直接登录   当前有用户登录？       到 request.user │
+  │             │        │             │     │
+  │            是        否             ▼     │
+  │             │        │        触发 social_account_updated │
+  │             ▼        ▼           信号 → 组同步 │
+  │         绑定账号  AUTO_SIGNUP?     │     │
+  │                    │    │          ▼     │
+  │                   是    否    跳转首页 │
+  │                    │    │                │
+  │                    ▼    ▼                │
+  │               自动创建  跳转             │
+  │               用户并登  /accounts/       │
+  │               录      3rdparty/signup/   │
+  │                    │                     │
+  │                    ▼                     │
+  │           CustomSocialAccountAdapter     │
+  │             .save_user()                 │
+  │                    │                     │
+  │                    ▼                     │
+  │           添加默认组 + 组同步             │
+  │                    │                     │
+  │                    ▼                     │
+  │                 登录成功                  │
+  └──────────────────────────────────────────┘
+```
+
+**process 参数的持久化**：allauth 在用户访问 `/accounts/<provider_id>/login/` 发起授权时，将 `process` 值存入 Django session；回调时从 session 中读取，因此即使在第三方站点跳转后也能记住最初的意图（登录 vs 绑定）。
+
+---
+
+### 5.4 社交登录完整端到端流程（场景 A：未登录用户 + process=login）
 
 ```
   前端                                  后端
   ───                                  ───
-  1. 获取可用提供商
-  GET /api/profile/social_account_providers/
+  1. 获取可用提供商（仅场景 B 需要，场景 A 直接从登录页按钮发起）
      │
      ▼
-  [SocialAccountProvidersView.get]
-  - adapter.list_providers(request)
-  - 过滤 openid 并展开 brands
-  - 返回 [{name, login_url}]
-     │
-     ▼
-  2. 用户点击某个社交登录按钮
-     → 跳转/提交到 provider.login_url
-     (如 /accounts/3rdparty/<provider>/login/)
+  2. 用户点击登录页的社交登录按钮
+     → POST /accounts/<provider_id>/login/?process=login
      │
      ▼
   allauth.socialaccount.views.login
+  → 将 process="login" 写入 session
   → 重定向至 OAuth 提供商授权页
      │
      ▼
   3. 用户在第三方完成授权
-     ← 提供商回调 /accounts/3rdparty/<provider>/login/callback/
+     ← 提供商回调 GET /accounts/<provider_id>/login/callback/
      │
      ▼
   allauth.socialaccount 内部回调处理
-  → 解析 OAuth token，获取用户信息
+  → 校验 OAuth state，兑换 access_token，获取用户信息
+  → 从 session 读取 process="login"
      │
      ▼
-  4. 判断账号关联情况
+  4. 判断账号关联情况（按 process="login" 分支处理）
      ┌──────────────────────────────┐
      │ SocialAccount 已存在？       │
      └──┬───────────────┬───────────┘
@@ -418,15 +602,15 @@ HEADLESS_TOKEN_STRATEGY = "paperless.adapter.DrfTokenStrategy"
                      登录成功，重定向到首页
 ```
 
-### 5.3 关键代码位置
+### 5.5 关键代码位置
 
-#### 5.3.1 社交登录入口与提供商列表
+#### 5.5.1 社交登录入口与提供商列表
 
 后端：[SocialAccountProvidersView](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/views.py#L490-L519)
 
 前端：[profile-edit-dialog.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/components/common/profile-edit-dialog/profile-edit-dialog.component.ts#L120-L126) → [ProfileService.getSocialAccountProviders](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/services/profile.service.ts#L46-L50)
 
-#### 5.3.2 社交账号保存与默认组
+#### 5.5.2 社交账号保存与默认组
 
 [CustomSocialAccountAdapter.save_user](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/adapter.py#L126-L142)：
 
@@ -444,7 +628,7 @@ def save_user(self, request, sociallogin, form=None):
 
 注意：父类 `save_user` 也会调用 `CustomAccountAdapter.save_user`，后者会设置 `ACCOUNT_DEFAULT_GROUPS`。最终用户会获得两组默认组的并集。
 
-#### 5.3.3 社交账号组同步信号
+#### 5.5.3 社交账号组同步信号
 
 信号注册在 [apps.py](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/apps.py#L18-L20)：
 
@@ -458,7 +642,7 @@ social_account_updated.connect(handle_social_account_updated)
 - 兼容两种结构：直接的 `groups` 字段，或嵌套在 `userinfo`/`id_token` 下
 - 若 `SOCIAL_ACCOUNT_SYNC_GROUPS=True`，用 `groups.set(clear=True)` 覆盖用户组
 
-#### 5.3.4 Headless Token 策略
+#### 5.5.4 Headless Token 策略
 
 [DrfTokenStrategy](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/adapter.py#L167-L172) 供 allauth headless 模式使用，登录后自动返回 DRF Token：
 
@@ -490,53 +674,145 @@ User (django.contrib.auth)
         - last_login
 ```
 
-### 6.2 绑定（Connect）流程
+### 6.2 绑定（Connect）流程详解
 
-已登录用户绑定新社交账号：
+绑定社交账号的完整前后端链路（对应第五章场景 B）：
 
 ```
-已登录用户
-   │
-   ▼
-GET /api/profile/social_account_providers/
-→ 获取 provider 的 connect URL
-(process="connect" 而非 "login")
-   │
-   ▼
-用户跳转至 provider.login_url (connect)
-   │
-   ▼
-OAuth 授权完成，回调返回
-   │
-   ▼
-allauth 将 SocialAccount 关联到当前 request.user
-   │
-   ▼
-[CustomSocialAccountAdapter.get_connect_redirect_url]
-→ 返回 reverse("base") (即首页)
+  前端 (Angular)                            后端 (Django)
+  ────────────────                          ──────────────
+  1. 用户点击头像 → 「Edit Profile」
+     │
+     ▼
+  ProfileEditDialog 打开
+     │
+     ▼
+  2. 调用 ProfileService.getProfile()
+     GET /api/profile/
+     │                                    [ProfileView.get]
+     │                                    返回 UserProfile（含已绑定 social_accounts）
+     │◄───────────────────────────────────
+     │
+     ▼
+  渲染「Social Accounts」区域
+  - 列出已绑定账号（含「Disconnect」按钮）
+  - 渲染「Connect」按钮区域
+     │
+     ▼
+  3. 用户点击「Connect」按钮 ────────────────┐
+                                              │
+  4. ProfileService.getSocialAccountProviders() │
+     GET /api/profile/social_account_providers/ │
+                                              │
+                                              ▼
+                                    [SocialAccountProvidersView.get]
+                                    - adapter.list_providers(request)
+                                    - p.get_login_url(request, process="connect")
+                                    返回 [{name, login_url}]
+     │◄───────────────────────────────────────┘
+     │
+     ▼
+  前端显示可用提供商列表下拉框
+     │
+     ▼
+  5. 用户选择某个提供商（如 Keycloak）
+     │
+     ▼
+  window.location.href = provider.login_url
+  （浏览器离开 Angular，跳转到 Django 社交登录 URL）
+     │
+     ▼
+  GET /accounts/<provider_id>/login/?process=connect
+     │
+     ▼
+  allauth.socialaccount 内部处理
+  - session 存入 process="connect"
+  - 302 重定向到第三方 OAuth 授权页
+     │
+     ▼
+  6. 用户在第三方完成授权
+     │
+     ▼
+  第三方 302 重定向回 Django
+  GET /accounts/<provider_id>/login/callback/
+     │
+     ▼
+  allauth.socialaccount 回调视图
+  - 校验 state，兑换 access_token
+  - 从 session 读取 process="connect"
+  - 确认 request.user.is_authenticated（必须已登录）
+  - 创建 SocialAccount 记录，关联到 request.user
+  - 触发 social_account_updated 信号 → 组同步
+     │
+     ▼
+  [CustomSocialAccountAdapter.get_connect_redirect_url]
+  → 返回 reverse("base")（即 SPA 首页 /）
+     │
+     ▼
+  302 重定向回 Angular 首页
+  前端重新加载，用户已绑定新社交账号
 ```
 
-`get_connect_redirect_url` 实现在 [adapter.py](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/adapter.py#L118-L124)。
-
-### 6.3 解绑（Disconnect）流程
-
-解绑 API：`POST /api/profile/disconnect_social_account/`，Body `{id: <social_account_id>}`
-
-后端实现 [DisconnectSocialAccountView](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/views.py#L464-L480)：
+**后端绑定重定向**实现见 [adapter.py L118-L124](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/adapter.py#L118-L124)：
 
 ```python
-def post(self, request, *args, **kwargs):
-    user = self.request.user
-    try:
-        account = user.socialaccount_set.get(pk=request.data["id"])
-        account_id = account.id
-        account.delete()
-        return Response(account_id)
-    except SocialAccount.DoesNotExist:
-        return HttpResponseBadRequest("Social account not found")
+def get_connect_redirect_url(self, request, socialaccount):
+    assert is_authenticated(request.user)
+    return redirect_by_name("base")
 ```
 
-前端调用在 [profile-edit-dialog.component.ts](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/components/common/profile-edit-dialog/profile-edit-dialog.component.ts#L245-L260) 的 `disconnectSocialAccount()`。
+---
+
+### 6.3 解绑（Disconnect）流程详解
+
+解绑不经过 OAuth，完全通过 DRF API 完成：
+
+```
+  前端 (Angular)                            后端 (Django)
+  ────────────────                          ──────────────
+  1. ProfileEditDialog 已打开
+     显示当前已绑定的 social_accounts
+     │
+     ▼
+  2. 用户点击某个账号的「Disconnect」按钮
+     │
+     ▼
+  3. ProfileService.disconnectSocialAccount(id)
+     POST /api/profile/disconnect_social_account/
+     Body: { "id": <social_account_id> }
+                                              │
+                                              ▼
+                                    [DisconnectSocialAccountView.post]
+                                    1. user = self.request.user
+                                    2. account = user.socialaccount_set.get(pk=id)
+                                       (通过 user 过滤，防止越权删除他人账号)
+                                    3. account.delete()
+                                    4. return Response(account_id)
+     │◄───────────────────────────────────────┘
+     │
+     ▼
+  4. 前端收到 200，从 social_accounts 数组中移除该 id
+     UI 立即更新，无需刷新页面
+     │
+     ▼
+  5. 调用 ProfileService.getSocialAccountProviders()
+     刷新可用提供商列表（解绑后可能可再次绑定）
+```
+
+后端实现 [DisconnectSocialAccountView](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/views.py#L464-L480) 的安全设计：
+- 使用 `user.socialaccount_set.get(pk=...)` 而不是 `SocialAccount.objects.get(pk=...)`
+- 这确保用户只能删除属于自己的社交账号，防止 IDOR（不安全直接对象引用）攻击
+
+前端调用在 [profile-edit-dialog.component.ts L245-L260](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/components/common/profile-edit-dialog/profile-edit-dialog.component.ts#L245-L260) 的 `disconnectSocialAccount()`。
+
+---
+
+### 6.3.1 绑定/解绑路径对比总结
+
+| 操作 | 是否需要 OAuth | 入口 API | 核心参数 | 调用方 |
+|-----|--------------|---------|---------|-------|
+| **绑定 (Connect)** | 是 | 先 `GET /api/profile/social_account_providers/` 获取 URL，再浏览器跳转 `process=connect` 的社交登录 URL | `process="connect"` | 浏览器（离开 SPA → Django → 第三方 → Django → SPA） |
+| **解绑 (Disconnect)** | 否 | `POST /api/profile/disconnect_social_account/` | `{ id: <social_account_id> }` | Angular HTTP 客户端（纯 AJAX） |
 
 ### 6.4 用户资料中的账号绑定信息展示
 
