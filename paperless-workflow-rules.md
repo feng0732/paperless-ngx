@@ -107,16 +107,16 @@ if trigger.schedule_is_recurring and workflow_runs.exists() and (
 
 **四种触发类型下 WorkflowRun 的写入与查询对照**：
 
-| 触发类型 | 成功时是否写入 WorkflowRun | 失败时是否写入 WorkflowRun | WorkflowRun.document | 是否查询 WorkflowRun 去重 | 去重字段 |
-|----------|:-------------------------:|:-------------------------:|:--------------------:|:------------------------:|---------|
-| CONSUMPTION | ✅ | ❌（动作循环异常先于 create() 抛出） | `NULL`（文档未入库） | ❌ | — |
-| DOCUMENT_ADDED | ✅ | ❌（同上） | Document FK | ❌ | — |
-| DOCUMENT_UPDATED | ✅ | ❌（同上） | Document FK | ❌ | — |
-| SCHEDULED | ✅ | ❌（同上） | Document FK | ✅ | `(document_id, type=SCHEDULED, workflow_id)` 三元组 |
+| 触发类型 | 动作全部成功时是否写入 WorkflowRun | 仅 EMAIL/WEBHOOK/PASSWORD 失败（被内部吞掉） | ASSIGNMENT/REMOVAL/MOVE_TO_TRASH 异常向上抛出时 | WorkflowRun.document | 是否查询 WorkflowRun 去重 | 去重字段 |
+|----------|:---------------------------------:|:------------------------------------------:|:---------------------------------------------:|:--------------------:|:------------------------:|---------|
+| CONSUMPTION | ✅ | ✅（有审计记录，但日志有错误） | ❌ | `NULL`（文档未入库） | ❌ | — |
+| DOCUMENT_ADDED | ✅ | ✅ | ❌ | Document FK | ❌ | — |
+| DOCUMENT_UPDATED | ✅ | ✅ | ❌ | Document FK | ❌ | — |
+| SCHEDULED | ✅ | ✅ | ❌ | Document FK | ✅ | `(document_id, type=SCHEDULED, workflow_id)` 三元组 |
 
 - **只写不查（CONSUMPTION/ADDED/UPDATED）**：这三种由事件驱动，本身天然"一次性"，无需去重，WorkflowRun 仅作为审计记录存在
 - **又写又查（SCHEDULED）**：由 Celery Beat 周期性重复触发，必须靠 WorkflowRun 防止非周期工作流重复执行、以及控制周期工作流的触发间隔
-- **失败即无痕**：由于 `run_workflows()` 动作循环没有 try/catch，而 `WorkflowRun.objects.create()` 位于动作循环完成之后（[signals/handlers.py:L986-L990](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/signals/handlers.py#L986-L990)），任一动作抛异常都会让本次执行**完全没有 WorkflowRun 审计记录**
+- **EMAIL/WEBHOOK/PASSWORD_REMOVAL 失败 = 部分失败但仍算"成功完成"**：因为这些动作的异常被内部 try/except 吞掉，run_workflows() 动作循环继续、document.save() 正常执行、WorkflowRun 正常创建——只有 WorkflowRun **不创建**的唯一情况是 ASSIGNMENT（非标题部分）、REMOVAL、MOVE_TO_TRASH 这三类动作抛出了未捕获异常
 
 ---
 
@@ -388,82 +388,119 @@ run_workflows()
 
 邮件通过 `documents.mail.send_email()` **同步**发送（阻塞当前工作流执行线程）。
 
-### 3.6 WEBHOOK 动作（异步 Celery 任务）与动作失败传播
+### 3.6 动作异常处理与失败传播、WEBHOOK 异步任务
+
+#### 核心事实：每个动作函数内部的 try/except 差异
+
+`run_workflows()` 的动作循环本身**没有 try/catch**（见 [signals/handlers.py:L918-L993](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/signals/handlers.py#L918-L993)），但**各动作函数内部的异常处理策略完全不同**，这决定了哪些动作失败会中止工作流、哪些只会静默写日志：
+
+| 动作类型 | 内部是否有 try/except | 异常是否向上抛出 | 对 run_workflows() 的影响 |
+|----------|:---------------------:|:---------------:|--------------------------|
+| ASSIGNMENT | 仅标题解析处有（mutations.py:L42-L60） | **部分抛出** | 标题解析异常只写日志；标签/联系人/权限/自定义字段等 DB 操作异常会向上抛出 |
+| REMOVAL | 无 | ✅ 全部向上抛出 | 任一部分异常都会中止工作流 |
+| EMAIL | **整体有 try/except**（actions.py:L141-L187） | ❌ **只写 logger.exception，不抛出** | 失败不影响后续动作，不中止工作流 |
+| WEBHOOK（同步阶段） | **整体有 try/except**（actions.py:L197-L273） | ❌ **只写 logger.exception，不抛出** | params/headers/读文件/Broker 入队失败全不影响宿主 |
+| PASSWORD_REMOVAL | 每个密码 try/except ValueError；全部失败只 logger.error | ❌ 不抛出 | 失败不影响后续动作 |
+| MOVE_TO_TRASH | 无；对 ConsumableDocument 明确 `raise StopConsumeTaskError` | ✅ 全部向上抛出 | 执行必然中止（软删 or 抛异常中断消费） |
+
+> **代码证据**：
+> - EMAIL 顶层 [actions.py:L141-L187](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/workflows/actions.py#L141-L187)：`try: ... except Exception as e: logger.exception(...)` —— 吞掉所有异常
+> - WEBHOOK 顶层 [actions.py:L197-L273](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/workflows/actions.py#L197-L273)：同样结构，含 params 解析（L201-L220）和 headers 解析（L237-L243）的内层 try/except
+> - PASSWORD_REMOVAL [actions.py:L318-L345](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/workflows/actions.py#L318-L345)：只 warning/error 日志，从不 raise
+
+#### 对工作流整体状态的影响矩阵
+
+只有 **ASSIGNMENT（非标题部分）、REMOVAL、MOVE_TO_TRASH** 三类动作的失败会触发以下连锁反应：
+
+```
+动作异常抛出
+    ├── run_workflows() 动作循环立即中止，后续动作不再执行
+    ├── document.save(update_fields=[6 个白名单])  ← 若已执行到此处之前则已落库，否则不执行
+    ├── WorkflowRun.objects.create()  ← 永远不执行（位于动作循环之后）→ 本次执行无审计记录
+    └── 异常向上抛到调用者：
+          ├── Celery 宿主 → task_failure 信号 → PaperlessTask.status=FAILURE，result_data 记录 traceback
+          └── 同步 API 线程 → Django 中间件捕获 → HTTP 500（无 PaperlessTask）
+```
+
+而 **EMAIL / WEBHOOK（同步阶段）/ PASSWORD_REMOVAL** 三类动作失败：
+
+```
+动作异常被内部 try/except 捕获
+    ├── logger.exception() / logger.error() 写日志
+    ├── run_workflows() 动作循环继续，后续动作正常执行
+    ├── document.save() 正常执行
+    ├── WorkflowRun.objects.create() 正常创建 → 有审计记录，但日志里能看到错误
+    └── 宿主 PaperlessTask 状态完全不受影响（仍为 SUCCESS）
+```
+
+#### WEBHOOK 动作定义与异步执行链路
 
 定义于 [workflows/actions.py](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/workflows/actions.py#L190-L273) 与 [workflows/webhooks.py](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/workflows/webhooks.py)
 
-**核心前提：`run_workflows()` 对动作循环没有任何 try/catch**（见 [signals/handlers.py:L918-L993](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/signals/handlers.py#L918-L993)）。只要任一动作抛出未捕获异常，以下三件事会同步发生：
-1. 动作循环立即中止，后续 action 不再执行
-2. `WorkflowRun.objects.create()`（位于第 986 行，动作循环之后）**永远不会被调用**——该文档与该 workflow 的本次执行**没有审计记录**
-3. 异常**原封不动向上抛出**到 `run_workflows()` 的调用者
+`send_webhook` Celery 任务配置：
+```python
+@shared_task(
+    retry_backoff=True,
+    autoretry_for=(httpx.HTTPStatusError,),  # 仅对 HTTP 状态码错误自动重试（4xx/5xx）
+    max_retries=3,
+    throws=(httpx.HTTPError,),               # HTTPError 标记为"预期异常"，Celery 不记 FAILURE
+)
+```
 
-#### 所有动作类型的状态归属与失败传播
-
-| 动作类型 | 是否独立 Celery 任务 | 是否产生 PaperlessTask | 同步阶段失败传播 |
-|----------|:-------------------:|:---------------------:|----------------|
-| ASSIGNMENT | ❌（同步执行） | ❌ | 异常向上抛出：Celery 宿主 → PaperlessTask.FAILURE；同步 API → HTTP 500 |
-| REMOVAL | ❌（同步执行） | ❌ | 同上 |
-| EMAIL | ❌（同步阻塞） | ❌ | 同上 |
-| **WEBHOOK** | ✅（`send_webhook.apply_async()`） | ❌（不在 TRACKED_TASKS） | ① 同步入队阶段失败：同上向上抛出；② 异步投递阶段失败：**独立于宿主，不影响宿主 PaperlessTask** |
-| PASSWORD_REMOVAL | ❌（同步 / 信号延迟执行） | ❌ | 同上 |
-| MOVE_TO_TRASH | ❌（同步但延迟到所有动作后） | ❌ | 同上 |
-
-#### 三种执行上下文的失败可见性
-
-**场景 A：运行在 Celery 宿主任务中（最常见）**
-- 宿主任务：`consume_file`（CONSUMPTION / DOCUMENT_ADDED）、`bulk_update_documents`（DOCUMENT_UPDATED 的 SYSTEM 来源）、`check_scheduled_workflows`（SCHEDULED）
-- 同步动作（ASSIGNMENT/EMAIL 等）抛异常 → Celery `task_failure` 信号触发 → PaperlessTask.status 变为 `FAILURE`，result_data 记录 `error_type / error_message / traceback[:5000]`
-- **WorkflowRun 不创建**（异常先于 WorkflowRun.objects.create() 抛出）
-- 宿主任务已完成的 DB 写入（如 ASSIGNMENT 已修改 document.save()）不会回滚（Django 不自动事务包裹整个 Celery 任务）
-
-**场景 B：运行在同步 Django 请求线程中（DOCUMENT_UPDATED 的 API 来源）**
-- 触发点：[views.py:L1178](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L1178-L1181)、[views.py:L2046](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L2046-L2049)、[views.py:L2119](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L2119-L2122) —— `document_updated.send()` 在 HTTP 请求线程里同步执行
-- **没有 PaperlessTask**：因为 PaperlessTask 只通过 Celery `before_task_publish` 信号创建，而同步线程根本不走 Celery
-- 同步动作抛异常 → Django 中间件捕获 → HTTP 500 返回给客户端，`paperless.*` logger 写日志
-- **WorkflowRun 同样不创建**（同场景 A）
-
-**场景 C：Webhook 的异步投递阶段（独立于宿主）**
-- `send_webhook.apply_async()` 只是把任务放入 Celery Broker，返回后宿主任务继续前进——宿主 PaperlessTask 的 SUCCESS/FAILURE 与 webhook 后续是否成功**完全解耦**
-- `send_webhook` 任务的 Celery 配置：
-  ```python
-  @shared_task(
-      retry_backoff=True,
-      autoretry_for=(httpx.HTTPStatusError,),  # 仅对 HTTP 状态码错误自动重试
-      max_retries=3,
-      throws=(httpx.HTTPError,),               # HTTPError 被标记为"预期异常"，Celery 不记为 FAILURE 状态
-  )
-  ```
-- 3 次指数退避重试全部用尽后：
-  - 仍抛异常 → Celery `task_failure` 信号触发，但因 **`send_webhook` 不在 `TRACKED_TASKS`**（[signals/handlers.py:L1005-L1017](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/signals/handlers.py#L1005-L1017)）→ **不会创建/更新任何 PaperlessTask**
-  - 错误只记录在 `paperless.workflows.webhooks` logger 中，前端任务列表**完全不可见**
-
-#### Webhook 执行链路（含两个失败阶段）
+**WEBHOOK 完整执行链路（三个阶段，各阶段失败归属完全独立）**：
 
 ```
   ┌───────────────────────────────────────────────────────────────────────┐
-  │  同步阶段（在 run_workflows() 内部，宿主任务线程内）                      │
-  │  execute_webhook_action()                                                │
-  │    ├── 解析 params / body / headers 占位符（Jinja2 错误 → 抛异常向上）     │
-  │    ├── include_document=True 时读取文件（IO 错误 → 抛异常向上）            │
-  │    └── send_webhook.apply_async(kwargs={...})                            │
-  │          └── 若 Broker 不可用等 → 抛异常向上（宿主任务 FAILURE）            │
-  │          └── 成功入队 → 宿主继续，与 webhook 后续状态完全解耦               │
+  │  阶段 1：同步准备阶段（在 run_workflows() 内部，宿主任务线程内）           │
+  │  execute_webhook_action() [顶层 try/except 吞掉所有异常]                  │
+  │    ├── params 占位符解析 → 内层 try/except → logger.error                │
+  │    ├── body 占位符解析 → 外层 try/except → logger.exception              │
+  │    ├── headers 解析 → 内层 try/except → logger.error                     │
+  │    ├── include_document 时 original_file.open("rb") 读文件                │
+  │    │                                    → 外层 try/except → logger.exception
+  │    └── send_webhook.apply_async(...) 入队                                │
+  │         └── Broker 不可用等 → 外层 try/except → logger.exception         │
+  │                                                                           │
+  │  ✅ 本阶段**所有异常只写日志，不向上抛出**                                   │
+  │  ✅ 不影响宿主 PaperlessTask 状态，不中止后续动作                            │
+  │  ✅ WorkflowRun 正常创建                                                   │
   └───────────────────────────────┬───────────────────────────────────────┘
                                   │
-                                  ▼ (Celery Worker 独立线程)
+                                  ▼ (入队成功，异步到独立 Worker 线程)
   ┌───────────────────────────────────────────────────────────────────────┐
-  │  异步阶段（独立 send_webhook 任务，与宿主无状态关联）                       │
+  │  阶段 2：异步投递阶段（独立 send_webhook 任务，与宿主完全解耦）             │
   │  send_webhook()                                                           │
   │    ├── validate_outbound_http_url() → URL 不合法 → logger.warning + raise │
-  │    ├── WebhookTransport.handle_request() → DNS 解析/公网 IP 校验           │
+  │    ├── WebhookTransport → DNS 解析/公网 IP 校验 → ConnectError → raise    │
   │    ├── httpx.Client(timeout=5s).post(...).raise_for_status()              │
   │    │     ├── HTTPStatusError (4xx/5xx) → autoretry_for 触发，最多 3 次     │
   │    │     ├── 其他 httpx.HTTPError → throws= 指定，Celery 不记 FAILURE      │
   │    │     └── 其他异常 → task_failure 信号，但因不在 TRACKED_TASKS          │
   │    │                           → 无 PaperlessTask 记录                     │
   │    └── 所有错误只写入 paperless.workflows.webhooks logger                  │
+  │                                                                           │
+  │  ❌ 不在 TRACKED_TASKS → 不创建独立 PaperlessTask                          │
+  │  ❌ 与宿主 PaperlessTask 状态完全无关（宿主早已继续前进）                    │
+  │  ❌ 前端任务列表不可见                                                      │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  阶段 3：对 WorkflowRun / PaperlessTask 的最终影响                        │
+  │  ┌─────────────────────────────────────────────────────────────────┐   │
+  │  │ 失败阶段            WorkflowRun?   宿主 PaperlessTask?   独立Task?│   │
+  │  ├─────────────────────────────────────────────────────────────────┤   │
+  │  │ 阶段 1 同步准备         ✅ 创建         不受影响(SUCCESS)     ❌    │   │
+  │  │ 阶段 2 异步投递失败     ✅ 创建(已在阶段1后)  完全无关         ❌    │   │
+  │  │ 全部成功               ✅ 创建         ✅ SUCCESS           ❌    │   │
+  │  └─────────────────────────────────────────────────────────────────┘   │
   └───────────────────────────────────────────────────────────────────────┘
 ```
+
+> **关键事实修正**：之前认为"WEBHOOK 同步阶段异常会让宿主 PaperlessTask FAILURE"是错误的——`execute_webhook_action()` 顶层 try/except 吞掉所有异常，宿主任务完全感知不到 webhook 同步阶段的失败。
+>
+> 同样，EMAIL 发送失败、PASSWORD_REMOVAL 密码不对也只会写日志，不影响宿主任务状态。
+>
+> **唯一能让宿主任务 FAILURE 的工作流动作异常来源**：ASSIGNMENT 的标签/权限/自定义字段 DB 操作失败、REMOVAL 的任意失败、MOVE_TO_TRASH 对消费阶段抛 StopConsumeTaskError。
 
 ### 3.7 PASSWORD_REMOVAL 动作
 
@@ -585,11 +622,12 @@ PaperlessTask 的创建完全依赖 Celery 信号链（`before_task_publish → 
 
 - ❌ 没有 `before_task_publish` 信号 → **没有 PaperlessTask 行被创建**
 - ❌ 没有 `task_prerun` / `task_postrun` / `task_failure`
-- 同步动作抛异常 → Django 中间件捕获 → HTTP 500 + Django `paperless.*` logger
+- **ASSIGNMENT（非标题部分）/ REMOVAL / MOVE_TO_TRASH 抛异常** → Django 中间件捕获 → HTTP 500 + Django `paperless.*` logger
+- **EMAIL / WEBHOOK（同步阶段）/ PASSWORD_REMOVAL / ASSIGNMENT 标题解析失败** → 被内部 try/except 吞掉只写日志，HTTP 返回正常（通常 200）
 - 前端任务列表**完全看不到这次工作流执行的任何痕迹**（无论成功还是失败）
-- 唯一的成功证据：只有动作全部成功时才创建的 WorkflowRun 记录（失败时也不创建）
+- 工作流执行成功或"部分失败但异常被吞"的唯一证据：WorkflowRun 记录
 
-> 这是系统的一处可观测性空白：同步 API 线程触发的工作流执行成功/失败，均无独立 PaperlessTask 记录，需通过 WorkflowRun 表或应用日志排查。
+> 同步 API 线程的工作流执行可观测性是系统的一处空白：无论成功/部分失败，都无独立 PaperlessTask 记录，需结合 WorkflowRun 表与应用日志（`paperless.workflows.actions` / `paperless.workflows.mutations` / `paperless.workflows.webhooks`）综合排查。
 
 ---
 
@@ -849,19 +887,18 @@ SCHEDULED 工作流通过 `run_workflows(workflow_to_run=workflow)` 传入单条
 | 维度 | CONSUMPTION | DOCUMENT_ADDED | DOCUMENT_UPDATED (Celery 宿主) | DOCUMENT_UPDATED (同步 API 线程) | SCHEDULED |
 |------|:-----------:|:--------------:|:-------------------------------:|:--------------------------------:|:---------:|
 | **触发入口** | Consumer 插件 `WorkflowTriggerPlugin.run()` | `document_consumption_finished` 信号 | `bulk_update_documents` 任务内 `document_updated.send()` | views.py PATCH/删版本/改版本标签内 `document_updated.send()` | Celery Beat `check_scheduled_workflows()` |
-| **执行线程/宿主** | Celery Worker | Celery Worker（同一 consume_file 任务内同步执行） | Celery Worker（bulk_update_documents 任务内同步执行） | Django 请求/响应线程（与 HTTP 请求同生命周期） | Celery Worker |
-| **宿主 PaperlessTask 类型** | `CONSUME_FILE` | `CONSUME_FILE` | `BULK_UPDATE` | **无**（不走 Celery，不触发 before_task_publish） | `CHECK_WORKFLOWS` |
-| **典型 TriggerSource** | `FOLDER_CONSUME`、`EMAIL_CONSUME`、`WEB_UI`、`API_UPLOAD` | 同上（与 CONSUMPTION 同一宿主） | `SYSTEM` | 无（同步线程没有 headers） | `SCHEDULED` |
-| **匹配对象** | `ConsumableDocument`（未入库） | `Document`（已入库） | `Document`（已入库） | `Document`（已入库） | `Document`（已入库） |
+| **执行线程/宿主** | Celery Worker | Celery Worker（同一 consume_file 任务内同步执行） | Celery Worker（bulk_update_documents 任务内同步执行） | Django 请求/响应线程 | Celery Worker |
+| **宿主 PaperlessTask 类型** | `CONSUME_FILE` | `CONSUME_FILE` | `BULK_UPDATE` | **无**（不走 Celery） | `CHECK_WORKFLOWS` |
+| **典型 TriggerSource** | `FOLDER_CONSUME`、`EMAIL_CONSUME`、`WEB_UI`、`API_UPLOAD` | 同上 | `SYSTEM` | 无 | `SCHEDULED` |
+| **匹配对象** | `ConsumableDocument` | `Document` | `Document` | `Document` | `Document` |
 | **run_workflows 模式** | overrides 模式 | 直接模式 | 直接模式 | 直接模式 | 直接模式 |
-| **匹配函数** | `consumable_document_matches_workflow()` | `existing_document_matches_workflow()` | 同左 | 同左 | 同左 |
-| **可过滤维度** | source / mailrule / filename / path | 全部（内容 + 所有元数据） | 同左 | 同左 | 同左 |
 | **WorkflowRun.document** | `NULL` | Document FK | Document FK | Document FK | Document FK |
-| **WorkflowRun 去重** | ❌（只写不查） | ❌（只写不查） | ❌（只写不查） | ❌（只写不查） | ✅（三元组去重 + 周期性间隔） |
-| **document.save() 白名单字段** | 不直接存 DB（存 overrides） | 6 个字段白名单 | 同左 | 同左 | 同左 |
-| **同步动作失败时的可见性** | PaperlessTask.FAILURE + result_data | 同左 | 同左 | **HTTP 500** + Django 日志（无 PaperlessTask） | PaperlessTask.FAILURE + result_data |
-| **WorkflowRun 是否创建（失败时）** | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **WEBHOOK 异步失败的可见性** | logger only（不影响宿主） | 同左 | 同左 | 同左（宿主已返回 HTTP 200/500，与 webhook 无关） | 同左 |
+| **WorkflowRun 去重** | ❌ | ❌ | ❌ | ❌ | ✅（三元组去重 + 周期性间隔） |
+| **ASSIGNMENT(非标题)/REMOVAL/MOVE 异常** | 宿主 FAILURE + result_data | 同左 | 同左 | HTTP 500 + Django 日志 | 宿主 FAILURE + result_data |
+| **WorkflowRun 是否创建（上述异常时）** | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **EMAIL/WEBHOOK(同步)/PASSWORD/标题解析失败** | ✅ 宿主 SUCCESS（异常被吞只写日志） | 同左 | 同左 | ✅ HTTP 正常返回（异常被吞只写日志） | 同左 |
+| **WorkflowRun 是否创建（上述失败时）** | ✅（有审计记录） | ✅ | ✅ | ✅ | ✅ |
+| **WEBHOOK 异步投递阶段失败** | logger only（不影响宿主，无独立 PaperlessTask） | 同左 | 同左 | 同左（宿主早已返回响应） | 同左 |
 | **收尾是否发 document_updated** | 否 | 否 | 否（自身就是触发源） | 否（自身就是触发源） | **否**（只发 send_websocket_document_updated 纯前端通知） |
 | **间接触发下一工作流类型** | DOCUMENT_ADDED | 无 | 无 | 无 | 无（明确不触发） |
 
@@ -869,8 +906,8 @@ SCHEDULED 工作流通过 `run_workflows(workflow_to_run=workflow)` 传入单条
 
 DOCUMENT_UPDATED 工作流的唯一触发入口是 `document_updated` 信号，但该信号有两大类发出点，执行上下文完全不同：
 
-- **Celery 宿主（SYSTEM 来源）**：所有 `bulk_edit.*` 函数（set_correspondent / set_tags / rotate / merge / split 等）先 `QuerySet.update()` 直写 DB，再 `bulk_update_documents.apply_async(headers={"trigger_source": SYSTEM})`，Worker 收到任务后在 `bulk_update_documents()` 内部对每篇文档 `document_updated.send()`。此时工作流运行在 Celery Worker 线程，失败会写 PaperlessTask.FAILURE。
-- **同步 API 线程（用户操作）**：[views.py:L1178](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L1178-L1181) 单文档 PATCH、[views.py:L2046](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L2046-L2049) 删版本、[views.py:L2119](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L2119-L2122) 改版本标签。此时工作流运行在 Django 请求/响应线程，失败直接导致 HTTP 500，**不会创建任何 PaperlessTask**。
+- **Celery 宿主（SYSTEM 来源）**：所有 `bulk_edit.*` 函数（set_correspondent / set_tags / rotate / merge / split 等）先 `QuerySet.update()` 直写 DB，再 `bulk_update_documents.apply_async(headers={"trigger_source": SYSTEM})`，Worker 收到任务后在 `bulk_update_documents()` 内部对每篇文档 `document_updated.send()`。此时工作流运行在 Celery Worker 线程，ASSIGNMENT/REMOVAL/MOVE 失败会写 PaperlessTask.FAILURE；EMAIL/WEBHOOK/PASSWORD 失败只写日志，宿主仍为 SUCCESS。
+- **同步 API 线程（用户操作）**：[views.py:L1178](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L1178-L1181) 单文档 PATCH、[views.py:L2046](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L2046-L2049) 删版本、[views.py:L2119](file:///d:/fz/0601/solo-dogfeeding/code/112-paperless-ngx/src/documents/views.py#L2119-L2122) 改版本标签。此时工作流运行在 Django 请求/响应线程，ASSIGNMENT/REMOVAL/MOVE 失败导致 HTTP 500，**不会创建任何 PaperlessTask**；EMAIL/WEBHOOK/PASSWORD 失败被内部吞掉，HTTP 正常返回。
 
 ---
 
