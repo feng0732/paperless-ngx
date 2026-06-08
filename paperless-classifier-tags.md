@@ -229,21 +229,61 @@ if num_tags == 1:
 
 **路径二：服务端建议缓存（`src/documents/caching.py`）**
 
-建议结果以 `SuggestionCacheData(classifier_version, classifier_hash, suggestions)` 结构存入缓存，Key 为 `doc_{document_id}_suggest`。
+建议结果以 `SuggestionCacheData(classifier_version, classifier_hash, suggestions)` 结构存入缓存，**传统 `suggestions` 与 LLM `ai_suggestions` 共用同一个缓存 Key**：`doc_{document_id}_suggest`，后写入的结果会**覆盖**先写入的结果。
 
-- **写入**（`set_suggestions_cache()`）：保存时记录当前分类器的 version 和 hash。传统分类器和 LLM 建议**共用同一个缓存 Key**，通过 version/hash 区分：
-  - 传统分类器：`classifier_version = FORMAT_VERSION`，`classifier_hash = hexlify(last_auto_type_hash)`
-  - LLM 建议：`classifier_version = LLM_CACHE_CLASSIFIER_VERSION (= 1000)`，`classifier_hash = backend` 名称（如 `"ollama:llama3"`）
+- **写入**：
+  - 传统分类器（`set_suggestions_cache()`）：
+    ```python
+    SuggestionCacheData(
+        classifier_version = FORMAT_VERSION,          # 当前 = 10
+        classifier_hash   = hexlify(last_auto_type_hash).decode(),  # 训练数据 hash
+        suggestions       = {...},
+    )
+    ```
+  - LLM 建议（`set_llm_suggestions_cache()`）：
+    ```python
+    SuggestionCacheData(
+        classifier_version = LLM_CACHE_CLASSIFIER_VERSION,  # = 1000，仅写入标记
+        classifier_hash   = backend,                         # 后端名称，如 "ollama:llama3"
+        suggestions       = {...},
+    )
+    ```
+    `LLM_CACHE_CLASSIFIER_VERSION = 1000` **仅用于写入时标识来源，读取时不参与校验**。
 
-- **读取**（`get_suggestion_cache()`）：必须同时满足才返回缓存结果：
+- **读取（传统分类器 `get_suggestion_cache()`）**：三层校验，**任一条件不满足则删除整个缓存**：
   ```
-  当前缓存的 CLASSIFIER_VERSION_KEY == FORMAT_VERSION
-                    &&
-  当前缓存的 CLASSIFIER_VERSION_KEY == doc_suggestions.classifier_version
-                    &&
-  当前缓存的 CLASSIFIER_HASH_KEY == doc_suggestions.classifier_hash
+  ① 全局缓存中的 CLASSIFIER_VERSION_KEY == DocumentClassifier.FORMAT_VERSION
+                       &&
+  ② 全局缓存中的 CLASSIFIER_VERSION_KEY == 已缓存建议的 .classifier_version
+                       &&
+  ③ 全局缓存中的 CLASSIFIER_HASH_KEY    == 已缓存建议的 .classifier_hash
   ```
-  任一条件不满足 → 删除该文档的建议缓存，下次请求重算。
+  不满足 → `cache.delete(doc_key)`，将该文档的建议缓存整条删除（包括可能存在的 LLM 结果）。
+
+- **读取（LLM 建议 `get_llm_suggestion_cache()`）**：仅校验 backend 名称：
+  ```python
+  if data and data.classifier_hash == backend:
+      return data
+  return None
+  ```
+  **完全不校验 `classifier_version`**。只要 `classifier_hash` 等于传入的 backend 字符串即命中。
+
+**两类缓存的相互影响：**
+
+```
+场景 1：先请求 suggestions（传统） → 后请求 ai_suggestions（LLM）
+  → LLM 结果覆盖传统结果
+
+场景 2：先请求 ai_suggestions（LLM） → 后请求 suggestions（传统）
+  → 传统结果覆盖 LLM 结果
+
+场景 3：请求 ai_suggestions 后，分类器重新训练
+  → 下次请求 suggestions 时，传统 get_suggestion_cache() 校验 hash 不匹配
+  → 整条 doc_{id}_suggest 缓存被删除（LLM 缓存也随之丢失）
+
+场景 4：请求 suggestions 后，分类器重新训练
+  → 同上，整条缓存被删除
+```
 
 **失效链路总结**：
 ```
@@ -252,7 +292,8 @@ train_classifier 重训（或检测到变化）
 更新 CLASSIFIER_VERSION_KEY / CLASSIFIER_HASH_KEY / CLASSIFIER_MODIFIED_KEY
   ↓
 ├─ conditionals.py：ETag / Last-Modified 变化 → 浏览器缓存失效（304 不再命中）
-└─ get_suggestion_cache()：version / hash 不匹配 → 服务端缓存被删除，重算
+└─ get_suggestion_cache()：version / hash 不匹配 → 整条 doc_{id}_suggest 缓存被删除
+                                                          （传统和 LLM 建议一并失效）
 ```
 
 ---
@@ -491,8 +532,8 @@ resp_data = {
 - [x] **增量训练检测**：`last_doc_change_time`（文档修改时间）+ `last_auto_type_hash`（逐文档逐标签 ID 累积的 SHA256）双重校验 — `src/documents/classifier.py` L285-L303
 - [x] **原子持久化**：`.pickle.part` 临时文件 + `rename` + HMAC-SHA256 签名 — `src/documents/classifier.py` L196-L219
 - [x] **多级缓存**：向量化结果缓存 5 分钟（`_vectorize`）、词干提取 LRU 缓存 10000 条（`StoredLRUCache`）— `src/documents/classifier.py` L518-L534
-- [x] **建议缓存失效链路**：`train_classifier` 更新 `CLASSIFIER_VERSION_KEY / HASH_KEY / MODIFIED_KEY`，同时驱动 conditionals.py 的浏览器协商缓存和 caching.py 的服务端建议缓存失效 — `src/documents/caching.py` L132-L184, `src/documents/conditionals.py` L19-L68
-- [x] **传统分类器与 LLM 建议共享缓存 Key**：同一 `doc_{id}_suggest` Key 通过 `classifier_version`（FORMAT_VERSION vs LLM_CACHE_CLASSIFIER_VERSION=1000）区分，互不干扰 — `src/documents/caching.py` L34-L44, L200-L233
+- [x] **建议缓存失效链路**：`train_classifier` 更新 `CLASSIFIER_VERSION_KEY / HASH_KEY / MODIFIED_KEY`，同时驱动 conditionals.py 的浏览器协商缓存和 caching.py 的服务端建议缓存失效；传统分类器校验不通过时整条 `doc_{id}_suggest` 被删除（含 LLM 缓存） — `src/documents/caching.py` L132-L184, `src/documents/conditionals.py` L19-L68
+- [x] **建议缓存共用 Key 且相互覆盖**：传统 `suggestions` 与 LLM `ai_suggestions` 写入同一个 `doc_{id}_suggest`，后写覆盖先写；传统读取三层校验（version/hash 不匹配则删整条缓存），LLM 读取仅校验 `classifier_hash == backend`，`LLM_CACHE_CLASSIFIER_VERSION` 仅写入时作标记 — `src/documents/caching.py` L34-L44, L132-L233
 - [x] **规则 + ML 双轨并行**：MATCH_AUTO 走分类器，其余走规则匹配，结果取并集 — `src/documents/matching.py` L110-L134
 - [x] **信号解耦**：消费流程通过 `document_consumption_finished` 分发，共 8 个处理器 — `src/documents/apps.py` L24-L31
 - [x] **软删除保护**：收件箱标签和纯手动标签（`match=""` 且非 MATCH_AUTO）不会被自动系统删除 — `src/documents/signals/handlers.py` L248-L264
