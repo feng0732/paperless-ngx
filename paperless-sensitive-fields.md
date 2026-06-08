@@ -65,12 +65,14 @@ API 掩码通过 `ObfuscatedPasswordField` 序列化字段实现，**仅作用�
 
 **掩码提交时的跳过逻辑（防止星号覆盖真实值）**：
 
-| 序列化器 | 跳过逻辑实现 | 证据位置 |
-|----------|-------------|----------|
-| `MailAccountSerializer` | `update()` 中检测 `replace("*", "") == ""` 为真时 `pop("password")` | [src/paperless_mail/serialisers.py](src/paperless_mail/serialisers.py#L51-L58) |
-| `UserSerializer` | `update()` 中通过 `PasswordValidationMixin._has_real_password()` 判断，非真实值时不调用 `set_password()` | [src/paperless/serialisers.py](src/paperless/serialisers.py#L30-L44), [L114-L121](src/paperless/serialisers.py#L114-L121) |
-| `ProfileSerializer` | 同上，继承 `PasswordValidationMixin` | [src/paperless/serialisers.py](src/paperless/serialisers.py#L179) |
-| `ApplicationConfigurationSerializer` | `run_validation()` 中检测 `replace("*", "")` 长度为 0 时 `del data["llm_api_key"]` | [src/paperless/serialisers.py](src/paperless/serialisers.py#L222-L235) |
+四种掩码字段采用了三种不同的跳过策略，其中 `ProfileSerializer` 实际上由**视图层**直接处理而非序列化器自身：
+
+| 字段所属 | 跳过逻辑实现 | 处理位置 | 证据位置 |
+|------|-------------|----------|----------|
+| `MailAccountSerializer.password` | `update()` 中检测 `replace("*", "") == ""` 为真时 `pop("password")` | 序列化器 `update()` 方法 | [src/paperless_mail/serialisers.py](src/paperless_mail/serialisers.py#L51-L58) |
+| `UserSerializer.password` | `update()` 中通过 `PasswordValidationMixin._has_real_password()` 判断，非真实值时不调用 `set_password()` | 序列化器 `update()` 方法 | [src/paperless/serialisers.py](src/paperless/serialisers.py#L30-L44), [L114-L121](src/paperless/serialisers.py#L114-L121) |
+| `ProfileSerializer.password` | `ProfileView.patch()` 从 `validated_data` 取出 password 后，检测 `password.replace("*", "")` 非空才调用 `set_password()`；序列化器**不处理**密码更新 | 视图 `patch()` 方法 | [src/paperless/views.py](src/paperless/views.py#L258-L272) |
+| `ApplicationConfigurationSerializer.llm_api_key` | `run_validation()` 中检测 `replace("*", "")` 长度为 0 时 `del data["llm_api_key"]` | 序列化器 `run_validation()` 方法 | [src/paperless/serialisers.py](src/paperless/serialisers.py#L222-L235) |
 
 ### 1.3 边界三：导出文件加密
 
@@ -170,6 +172,8 @@ metadata.json 中恢复的 salt（hex）
 
 ### 4.1 场景一：API 写入（数据进入数据库）
 
+通用链路（MailAccount、User、AppConfig）：
+
 ```
 用户请求 (明文密码/密钥)
     │
@@ -185,6 +189,8 @@ Django ORM save()
     ▼
 数据库 ──► 明文存储（User.password 除外，由 Django set_password() 哈希）
 ```
+
+> **例外**：Profile 密码更新不走通用链路，视图层直接接管。详见「4.6 补充：Profile 密码更新的独立链路」。
 
 ### 4.2 场景二：导出加密（数据进入导出包）
 
@@ -277,6 +283,70 @@ OpenAILike(api_key=self.settings.llm_api_key, ...)  # 明文直接传入 LLM SDK
 - [src/paperless_mail/mail.py](src/paperless_mail/mail.py#L211-L237)：IMAP 登录读取明文密码
 - [src/paperless_ai/client.py](src/paperless_ai/client.py#L50-L56)：LLM 调用读取明文 API Key
 
+### 4.6 补充：Profile 密码更新的独立链路
+
+Profile 密码更新链路与其他掩码字段完全不同——**视图层直接接管了密码写入，ProfileSerializer 和 PasswordValidationMixin 均不负责处理密码的星号跳过逻辑**。三者职责严格分离：
+
+#### 4.6.1 三层职责边界
+
+| 组件 | 职责 | 是否处理星号跳过 | 证据位置 |
+|------|------|:----------------:|----------|
+| `ProfileView.patch()` | 从 `validated_data` 中取出 password，检测非全星号后调用 `user.set_password()` | ✅ **唯一真正处理星号跳过** | [src/paperless/views.py](src/paperless/views.py#L258-L272) |
+| `ProfileSerializer` | 仅声明 password 字段使用 `ObfuscatedPasswordField`，**未重写 `update()`/`create()`**，不处理密码写入 | ❌ 不处理 | [src/paperless/serialisers.py](src/paperless/serialisers.py#L179-L209) |
+| `PasswordValidationMixin` | 仅提供字段级密码强度校验（Django `validate_password`），对全星号值直接跳过校验 | ⚠️ 仅判断是否"真实密码"以决定是否做强度校验，不参与写入决策 | [src/paperless/serialisers.py](src/paperless/serialisers.py#L30-L44) |
+
+#### 4.6.2 完整调用时序
+
+```
+PATCH /api/profile/  {"password": "**********", "email": "..."}
+    │
+    ▼
+ProfileView.patch(request)
+    │
+    ├─> serializer = ProfileSerializer(data=request.data)          [L259]
+    │    │
+    │    ├─> ObfuscatedPasswordField.to_internal_value("**********")
+    │    │    return "**********"  （原样返回）
+    │    │
+    │    ├─> DRF 自动调用字段级校验器 validate_password()
+    │    │    └─> PasswordValidationMixin.validate_password("**********")
+    │    │         ├─> _has_real_password("**********") → False
+    │    │         └─> 直接 return "**********"  （不做 Django 强度校验）
+    │    │
+    │    └─> serializer.is_valid(raise_exception=True)            [L260]
+    │         validated_data = {"password": "**********", "email": "..."}
+    │
+    ├─> password = serializer.validated_data.pop("password", None)  [L263]
+    │    password = "**********"
+    │
+    ├─> if password and password.replace("*", ""):                [L264]
+    │    "**********".replace("*", "") → ""  → 条件为 False
+    │    └─> 不调用 set_password()  （星号密码被成功跳过）
+    │
+    ├─> for key, value in serializer.validated_data.items():      [L268]
+    │    （此时 validated_data 中 password 已被 pop，仅处理 email 等其他字段）
+    │    setattr(user, key, value)
+    │
+    ├─> user.save()                                                [L270]
+    │
+    └─> Response(serializer.to_representation(user))               [L272]
+         └─> ObfuscatedPasswordField.to_representation()
+              → return "**********"  （响应仍返回星号掩码）
+```
+
+#### 4.6.3 与 `UserSerializer.update()` 的对比
+
+两者虽然都复用了 `PasswordValidationMixin._has_real_password()` 的判断逻辑，但处理位置完全不同：
+
+| 对比维度 | `UserSerializer.update()` | `ProfileView.patch()` |
+|----------|--------------------------|----------------------|
+| 密码处理位置 | 序列化器 `update()` 方法内 | 视图 `patch()` 方法内 |
+| 判断函数 | `self._has_real_password(password)`（mixin 方法） | `password.replace("*", "")`（内联代码，未调用 mixin） |
+| 其他字段更新 | `super().update(instance, validated_data)` 统一处理 | 手动 `setattr` 遍历处理 |
+| 密码是否 pop | 是，`validated_data.pop("password")` | 是，`serializer.validated_data.pop("password")` |
+
+**关键差异**：`ProfileView.patch()` 中判断星号的代码使用了内联的 `password.replace("*", "")`，**并未调用** `PasswordValidationMixin._has_real_password()`，说明这是一处独立实现，而非复用 mixin 方法。
+
 ---
 
 ## 五、保护架构图（精确标注各边界状态）
@@ -362,6 +432,8 @@ OpenAILike(api_key=self.settings.llm_api_key, ...)  # 明文直接传入 LLM SDK
 
 5. **掩码复用不等于保护一致**：`ObfuscatedPasswordField` 跨模块复用只说明 API 显示层统一使用了星号策略，不代表这些字段在导出层也有同等保护（`llm_api_key` 即为反例）。
 
+6. **"ProfileSerializer 继承 PasswordValidationMixin ≠ 由序列化器处理密码更新"**：`ProfileSerializer` 虽然继承了 `PasswordValidationMixin`，但 Mixin 仅提供字段级强度校验。Profile 密码的星号跳过和 `set_password()` 写入完全由 `ProfileView.patch()` 视图层直接完成，`ProfileSerializer` 未重写任何 `update()`/`create()` 方法处理密码。判断星号的代码在视图层是内联实现的 `password.replace("*", "")`，也未调用 Mixin 的 `_has_real_password()` 方法。
+
 ---
 
 ## 八、邮件内容 GPG 解密（独立链路补充）
@@ -386,6 +458,7 @@ OpenAILike(api_key=self.settings.llm_api_key, ...)  # 明文直接传入 LLM SDK
 | `src/paperless_mail/serialisers.py` | `ObfuscatedPasswordField` 定义，`MailAccountSerializer`（仅 password 在 fields 中） |
 | `src/paperless_mail/models.py` | `MailAccount` 模型，`password` 与 `refresh_token` 均为明文 TextField |
 | `src/paperless/serialisers.py` | 跨模块复用 `ObfuscatedPasswordField`：User / Profile / AppConfig 序列化器，`PasswordValidationMixin`，`SocialAccountSerializer`（不暴露 SocialToken 字段） |
+| `src/paperless/views.py` | `ProfileView.patch()`：Profile 密码更新的视图层实现，唯一真正处理星号跳过并调用 `set_password()` 的位置 |
 | `src/paperless/models.py` | `ApplicationConfiguration` 模型，`llm_api_key` 为明文 CharField |
 | `src/paperless_mail/mail.py` | IMAP 登录逻辑，运行时直接读取 DB 明文密码 |
 | `src/paperless_mail/preprocessor.py` | 邮件内容 GPG 解密预处理器（独立链路） |
