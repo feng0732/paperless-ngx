@@ -336,16 +336,17 @@ ProfileView.patch(request)
 
 #### 4.6.3 与 `UserSerializer.update()` 的对比
 
-两者虽然都复用了 `PasswordValidationMixin._has_real_password()` 的判断逻辑，但处理位置完全不同：
+两者在密码跳过逻辑的语义上相近，但实现方式完全不同——`UserSerializer` 通过继承 Mixin 调用方法，`ProfileView` 则是视图层独立内联实现，**未复用任何 Mixin 方法**：
 
 | 对比维度 | `UserSerializer.update()` | `ProfileView.patch()` |
 |----------|--------------------------|----------------------|
 | 密码处理位置 | 序列化器 `update()` 方法内 | 视图 `patch()` 方法内 |
-| 判断函数 | `self._has_real_password(password)`（mixin 方法） | `password.replace("*", "")`（内联代码，未调用 mixin） |
+| 判断实现 | `self._has_real_password(password)`（调用 Mixin 方法） | `password.replace("*", "")`（独立内联代码，未调用 Mixin） |
+| 与 Mixin 关系 | 继承 `PasswordValidationMixin`，直接使用其方法 | 未继承 Mixin，与 Mixin 无代码复用关系，仅判断语义相近 |
 | 其他字段更新 | `super().update(instance, validated_data)` 统一处理 | 手动 `setattr` 遍历处理 |
 | 密码是否 pop | 是，`validated_data.pop("password")` | 是，`serializer.validated_data.pop("password")` |
 
-**关键差异**：`ProfileView.patch()` 中判断星号的代码使用了内联的 `password.replace("*", "")`，**并未调用** `PasswordValidationMixin._has_real_password()`，说明这是一处独立实现，而非复用 mixin 方法。
+**关键差异**：`ProfileView.patch()` 中判断星号的代码使用了内联的 `password.replace("*", "")`，**并未调用** `PasswordValidationMixin._has_real_password()`，说明这是一处完全独立的实现，仅语义上与 Mixin 方法的判断逻辑相近，不存在代码层面的复用关系。
 
 ---
 
