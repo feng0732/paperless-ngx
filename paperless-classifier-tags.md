@@ -1,368 +1,419 @@
-# Paperless-ngx Classifier 训练与自动 Tag 模型代码分析
+# Paperless-ngx Classifier 训练与自动 Tag 模型代码阅读笔记
 
-## 一、整体架构概览
-
-Paperless-ngx 采用 **双轨分类体系**，包含两套独立的分类器：
-
-| 分类器类型 | 实现位置 | 技术方案 | 适用场景 |
-|---|---|---|---|
-| 传统 ML 分类器 | [classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/classifier.py) | scikit-learn MLP + CountVectorizer | 离线训练，自动匹配 Tag/Correspondent/DocumentType/StoragePath |
-| AI/LLM 分类器 | [ai_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/paperless_ai/ai_classifier.py) | LLM + RAG (可选向量检索) | 实时调用大模型进行语义理解 |
-
-**核心数据流：**
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                         训练阶段                                   │
-│  文档(已有标签) → 文本预处理 → 特征向量化 → MLP模型训练 → 持久化   │
-└──────────────────────────────────────────────────────────────────┘
-                              ↓  MODEL_FILE (pickle + HMAC)
-┌──────────────────────────────────────────────────────────────────┐
-│                         推断阶段                                   │
-│  新文档 → 文本预处理 → 加载分类器 → 预测 → 信号分发 → 自动打标签     │
-└──────────────────────────────────────────────────────────────────┘
-```
+> 可复核的代码阅读笔记。所有路径为仓库根目录相对路径，关键结论均标记了对应的源码位置以便交叉核对。
 
 ---
 
-## 二、核心数据模型：MatchingModel 的匹配算法
+## 一、整体架构：两套分类系统的职责边界
 
-所有可被自动匹配的实体（Tag、DocumentType、Correspondent、StoragePath）都继承自 [MatchingModel](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/models.py#L46-L77)，其核心字段 `matching_algorithm` 决定了匹配方式：
+Paperless-ngx 存在 **两套完全独立** 的分类/建议系统，切勿混淆：
+
+| 维度 | MATCH_AUTO 传统分类器 | paperless_ai LLM 建议接口 |
+|---|---|---|
+| **技术栈** | scikit-learn MLP + CountVectorizer | 外部 LLM API (Ollama/OpenAI 等) + 可选 RAG |
+| **核心文件** | `src/documents/classifier.py` | `src/paperless_ai/ai_classifier.py` |
+| **训练需求** | 需要离线训练，消费时纯推断 | 无需训练，每次推断实时调用 |
+| **触发方式** | 文档消费时**自动执行**；`document_retagger` 批量执行 | 用户在前端页面**手动点击**触发 API |
+| **写入行为** | 直接写入数据库（自动打标签） | **仅返回建议 JSON**，不写入 DB，需用户确认后手动应用 |
+| **匹配对象** | 只处理 `matching_algorithm == MATCH_AUTO` 的实体 | LLM 返回名称字符串 → 通过 `paperless_ai/matching.py` 的名称模糊匹配（阈值 0.8）映射到已有实体；未匹配的以 `suggested_*` 字段返回供用户新建 |
+| **覆盖维度** | Tags / Correspondent / DocumentType / StoragePath | 上述 4 项 + Title + Dates |
+| **API 端点** | （消费流程无 API，后台自动） | `GET /api/documents/<id>/suggestions/`（传统）<br>`GET /api/documents/<id>/ai_suggestions/`（LLM） |
+| **依赖条件** | 本地模型文件存在即可 | 需要 `PAPERLESS_AI_ENABLED=true` 及 LLM 后端配置 |
+
+**注意**：传统分类器还有一个独立的前端建议接口 `suggestions`，与消费时的自动匹配使用**相同的底层逻辑**（`matching.match_*` 系列函数），但只返回结果不写入。见 `src/documents/views.py` 中 `DocumentViewSet.suggestions`。
+
+---
+
+## 二、核心数据模型：MatchingModel
+
+所有可自动匹配的实体均继承自 `MatchingModel`，定义于 `src/documents/models.py`：
 
 ```python
 class MatchingModel(ModelWithOwner):
-    MATCH_NONE = 0       # 不匹配
-    MATCH_ANY = 1        # 任意关键词匹配
-    MATCH_ALL = 2        # 全部关键词匹配
-    MATCH_LITERAL = 3    # 精确字符串匹配
-    MATCH_REGEX = 4      # 正则表达式匹配
-    MATCH_FUZZY = 5      # 模糊匹配
-    MATCH_AUTO = 6       # 自动（机器学习分类器）
+    MATCH_NONE = 0
+    MATCH_ANY = 1
+    MATCH_ALL = 2
+    MATCH_LITERAL = 3
+    MATCH_REGEX = 4
+    MATCH_FUZZY = 5
+    MATCH_AUTO = 6   # ← 只有此值才会被传统分类器处理
 ```
 
-**关键设计：** 只有 `matching_algorithm == MATCH_AUTO` 的实体才会被纳入分类器的训练和预测范围。非 AUTO 的实体走 [matching.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/matching.py) 中 `matches()` 函数的规则匹配路径。
+**可复核点**：在 `src/documents/matching.py` 的 `matches()` 函数中，`MATCH_AUTO` 分支直接 `return False`，即规则匹配路径完全不处理 AUTO 实体，留给分类器路径。
 
 ---
 
-## 三、训练数据准备流程
+## 三、训练数据准备流程（MATCH_AUTO 传统分类器）
 
-训练入口由 Celery 定时任务或管理命令触发：
+### 3.1 训练触发入口
 
-### 3.1 触发入口
+| 触发方式 | 入口位置 | 说明 |
+|---|---|---|
+| Celery 定时任务 | `src/paperless/settings/custom.py`（`"5 */1 * * *"`，每小时第 5 分钟） | 调用 `documents.tasks.train_classifier` |
+| 管理命令 | `src/documents/management/commands/document_create_classifier.py` | `python manage.py document_create_classifier` |
+| API 手动触发 | `src/documents/views.py` → `TasksViewSet` | 前端"任务"页面触发 |
 
-1. **定时任务**：Celery Beat 每小时触发，配置在 [custom.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/paperless/settings/custom.py#L91-L101)
-   ```
-   "5 */1 * * *"  # 每小时第5分钟执行
-   ```
+### 3.2 任务调度层：前置检查
 
-2. **管理命令**：[document_create_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/management/commands/document_create_classifier.py) → 调用 [train_classifier](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/tasks.py#L88-L120)
-
-3. **API 触发**：通过 `TasksViewSet` 手动触发
-
-### 3.2 任务调度层
-
-[train_classifier](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/tasks.py#L88-L120) 任务首先做**前置检查**：
+`src/documents/tasks.py` 中 `train_classifier()` 先做跳过检查：
 
 ```python
-# 如果没有任何实体配置为 MATCH_AUTO，则直接跳过并删除旧模型
+# 只要有任意一类实体配置了 MATCH_AUTO 就继续；否则删除旧模型并退出
 if (not Tag.objects.filter(matching_algorithm=Tag.MATCH_AUTO).exists()
-    and not DocumentType.objects.filter(matching_algorithm=Tag.MATCH_AUTO).exists()
-    ...):
+    and not DocumentType.objects.filter(...).exists()
+    and not Correspondent.objects.filter(...).exists()
+    and not StoragePath.objects.filter(...).exists()):
     if settings.MODEL_FILE.exists():
-        settings.MODEL_FILE.unlink()
+        settings.MODEL_FILE.unlink()  # 清理历史残留
     return "No automatic matching items, not training"
 ```
 
-### 3.3 训练数据提取
+**可复核点**：如果所有实体之前配过 AUTO 并训练过，后来全部改为非 AUTO，模型文件会被主动删除。
 
-[DocumentClassifier.train()](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/classifier.py#L221-L427) 中的核心步骤：
+### 3.3 训练数据提取（已核对）
 
-**Step 1: 查询训练文档**
+`src/documents/classifier.py` → `DocumentClassifier.train()`：
+
+**Step 1：查询训练文档集**
 
 ```python
 docs_queryset = (
-    Document.objects.exclude(tags__is_inbox_tag=True)  # 排除收件箱文档
+    Document.objects.exclude(tags__is_inbox_tag=True)   # 排除收件箱文档
     .select_related("document_type", "correspondent", "storage_path")
     .prefetch_related("tags")
     .order_by("pk")
 )
 ```
 
-**Step 2: 构建标签向量 + 变化检测 Hash**
-
-对每个文档，提取四个维度的标签，同时用 SHA256 累积所有 AUTO 类型实体的主键，用于后续判断是否需要重训练：
+**Step 2：构建标签向量 + 变化检测 Hash（关键细节）**
 
 ```python
 hasher = sha256()
 for doc in docs_queryset:
-    # DocumentType: 单标签，-1 表示无
+    # DocumentType: 单标签分类，-1 表示无
     y = dt.pk if (dt and dt.matching_algorithm == MATCH_AUTO) else -1
-    hasher.update(y.to_bytes(4, "little", signed=True))
+    hasher.update(y.to_bytes(4, "little", signed=True))  # -1 也计入 hash
     labels_document_type.append(y)
 
-    # Correspondent: 同上
-    # StoragePath: 同上
+    # Correspondent / StoragePath: 同上逻辑，各更新一次 hash
 
-    # Tags: 多标签，只收集 MATCH_AUTO 的标签
+    # Tags: 多标签分类，仅收集 MATCH_AUTO 的标签
     tags = list(doc.tags.filter(matching_algorithm=MATCH_AUTO)
                     .order_by("pk").values_list("pk", flat=True))
     for tag in tags:
-        hasher.update(tag.to_bytes(4, "little", signed=True))
+        hasher.update(tag.to_bytes(4, "little", signed=True))  # 逐个标签 ID
     labels_tags.append(tags)
 ```
 
-**Step 3: 重训练必要性检测（增量优化）**
+**⚠️ 修正说明**：hash 不是"所有 AUTO 标签的 ID 集合"的 hash，而是**按文档主键顺序**遍历，对每个文档的 4 个维度（document_type/correspondent/tags/storage_path）的 AUTO 标签 ID（无则为 -1）**逐个字节累积**的 SHA256。文档顺序变化、某文档的 AUTO 标签增删、甚至 -1 值的存在与否都会影响最终 hash。
+
+**Step 3：重训练必要性检测（增量优化）**
 
 ```python
 latest_doc_change = docs_queryset.latest("modified").modified
 if (self.last_doc_change_time is not None
     and self.last_doc_change_time >= latest_doc_change
 ) and self.last_auto_type_hash == hasher.digest():
-    # 文档无变化 + AUTO 实体配置无变化 → 跳过训练
-    logger.info("No updates since last training")
+    # 文档未更新 + AUTO 标签配置未变化 → 跳过训练
+    cache.set(CLASSIFIER_MODIFIED_KEY, ...)   # 缓存 50 分钟
+    cache.set(CLASSIFIER_HASH_KEY, ...)
     return False
 ```
 
-这是一个重要的性能优化：**只有当文档内容或 AUTO 实体配置发生变化时才会真正训练。**
+两个条件**同时满足**才跳过：
+1. 最新文档修改时间 ≤ 上次训练时记录的时间
+2. 上述累积 hash 与上次训练结果一致
 
 ### 3.4 文本预处理
 
-[preprocess_content()](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/classifier.py#L487-L516) 处理管道：
+`src/documents/classifier.py` → `preprocess_content()`：
 
 ```
-原始文本
+原始文本 (doc.content)
   ↓
-1. 正则提取单词 → 转小写 → [\w]+ 词边界匹配
+① 正则 RE_WORD 提取 → 转小写 → 仅保留 [\w]+ 词边界匹配的单词
   ↓
-2. 可选 NLTK 高级处理（需配置 NLTK_ENABLED + NLTK_LANGUAGE）:
+② 可选 NLTK 高级处理（需 PAPERLESS_NLTK_ENABLED + PAPERLESS_NLTK_LANGUAGE）:
    ├─ word_tokenize 分词
    ├─ SnowballStemmer 词干提取 (amazement → amaz)
-   └─ 停用词过滤 (stopwords)
+   └─ 停用词过滤
   ↓
 处理后文本
 ```
 
-词干结果使用 [StoredLRUCache](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/caching.py) 做 LRU 缓存（容量 10000），通过 Redis 跨 worker 共享。
+**可复核点**：训练时使用的是 `doc.content`（原始 OCR 文本），不是 `suggestion_content`（后者会截断超长文档，仅用于推断）。词干提取结果通过 `StoredLRUCache`（容量 10000，Redis 持久化）跨 worker 缓存。
 
 ---
 
-## 四、模型训练与持久化
+## 四、模型训练与持久化（MATCH_AUTO）
 
 ### 4.1 特征向量化
-
-使用 scikit-learn `CountVectorizer`：
 
 ```python
 self.data_vectorizer = CountVectorizer(
     analyzer="word",
-    ngram_range=(1, 2),    # 1-gram + 2-gram 组合
-    min_df=0.01,           # 词至少出现在 1% 的文档中
+    ngram_range=(1, 2),    # 1-gram + 2-gram
+    min_df=0.01,           # 至少出现在 1% 文档中才纳入词表
 )
 data_vectorized = self.data_vectorizer.fit_transform(content_generator())
+self.data_vectorizer.stop_words_ = None   # 主动清理，减小序列化体积
 ```
 
-注意：`stop_words_` 属性在训练后被显式置为 `None`，以减小序列化体积。
+### 4.2 四个独立 MLP 分类器
 
-### 4.2 多分类器并行训练
+| 分类器字段 | 任务类型 | Binarizer |
+|---|---|---|
+| `tags_classifier` | 多标签分类（Multi-label） | `MultiLabelBinarizer`；**仅 1 个 AUTO tag 时退化**为 `LabelBinarizer`（二分类：有/无该标签） |
+| `correspondent_classifier` | 多分类（Multi-class） | 无需（MLPClassifier 原生支持） |
+| `document_type_classifier` | 多分类 | 无需 |
+| `storage_path_classifier` | 多分类 | 无需 |
 
-Paperless-ngx 训练**四个独立的 MLP 分类器**，各自负责一个维度：
+四个分类器均使用 `MLPClassifier(tol=0.01)`。
 
-| 分类器 | 标签类型 | Binarizer | 模型 |
-|---|---|---|---|
-| `tags_classifier` | 多标签 (Multi-label) | `MultiLabelBinarizer` (单标签时退化 `LabelBinarizer`) | `MLPClassifier(tol=0.01)` |
-| `correspondent_classifier` | 多分类 (Multi-class) | 无需 (sklearn 原生支持) | `MLPClassifier(tol=0.01)` |
-| `document_type_classifier` | 多分类 | 无需 | `MLPClassifier(tol=0.01)` |
-| `storage_path_classifier` | 多分类 | 无需 | `MLPClassifier(tol=0.01)` |
-
-**Tag 分类器的特殊处理**（单标签场景）：
+**单 Tag 退化逻辑（`src/documents/classifier.py` L355-L364）**：
 ```python
 if num_tags == 1:
-    # 只有一个 AUTO tag 时，退化到二分类：有/无该标签
     labels_tags = [label[0] if len(label) == 1 else -1 for label in labels_tags]
     self.tags_binarizer = LabelBinarizer()
 ```
 
-### 4.3 模型持久化与安全
+### 4.3 持久化格式
 
-[save()](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/classifier.py#L196-L219) 方法：
+`src/documents/classifier.py` → `save()`：
 
 ```
-序列化对象组成:
-(FORMAT_VERSION, last_doc_change_time, last_auto_type_hash,
- data_vectorizer, tags_binarizer, tags_classifier,
- correspondent_classifier, document_type_classifier, storage_path_classifier)
-  ↓
-pickle.dumps() → 计算 HMAC-SHA256(使用 SECRET_KEY) → [签名(32字节) | 数据]
-  ↓
-原子写入：先写 .pickle.part → rename 覆盖正式文件
+文件结构（字节序列）:
+  [0:32]   HMAC-SHA256 签名（key = Django SECRET_KEY）
+  [32:]    pickle 序列化的元组:
+            (FORMAT_VERSION,         # 当前 = 10
+             last_doc_change_time,   # datetime，用于增量检测
+             last_auto_type_hash,    # bytes，上述 SHA256 结果
+             data_vectorizer,        # CountVectorizer
+             tags_binarizer,         # LabelBinarizer / MultiLabelBinarizer
+             tags_classifier,        # MLPClassifier
+             correspondent_classifier,
+             document_type_classifier,
+             storage_path_classifier)
 ```
 
-**版本管理**：当前 `FORMAT_VERSION = 10`，历史版本演进记录在注释中。
+写入方式：先写 `.pickle.part` 临时文件 → `os.rename` 原子覆盖。
 
-### 4.4 模型加载与兼容性
+### 4.4 加载时的三层校验
 
-[load()](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/classifier.py#L143-L194) 中做多层校验：
+`load()` 方法按顺序执行：
+1. **HMAC 签名校验**（防篡改）
+2. **FORMAT_VERSION 校验**（代码版本兼容）
+3. **scikit-learn 版本校验**（捕获 `InconsistentVersionWarning`）
 
-1. **HMAC 签名校验**：防止模型文件被篡改
-2. **FORMAT_VERSION 校验**：代码与模型版本不一致 → 触发重训练
-3. **scikit-learn 版本校验**：检测 `InconsistentVersionWarning` → 视为不兼容
-
-任何校验失败都会删除模型文件，触发下次重新训练。
+任意一层失败 → 删除模型文件，触发下次重新训练。
 
 ---
 
-## 五、文档归类（自动打标签）流程
+## 五、文档消费 → 自动打标签（已核对）
 
-### 5.1 触发时机：消费流程
+### 5.1 消费时序
 
-[ConsumerPlugin.run()](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/consumer.py#L408-L784) 是文档消费的核心：
+`src/documents/consumer.py` → `ConsumerPlugin.run()`：
 
 ```
-消费流程时序:
 1. 文件复制到临时目录
 2. MIME 类型检测 → 选择 Parser
-3. Parser.parse() → 提取文本 text、日期 date、缩略图
-4. ★ 加载分类器: classifier = load_classifier()
+3. Parser.parse() → 提取 text / date / 缩略图 / page_count
+4. ★ classifier = load_classifier()    ← 仅加载一次
 5. transaction.atomic():
-   a. _store() 保存 Document 到数据库
-   b. ★ document_consumption_finished.send(classifier=classifier)
-   c. 文件写入 originals/、thumbnails/、archive/
-   d. document.save() 触发 post_save → 文件名重排
+   a. _store() → Document 写入 DB
+   b. ★ document_consumption_finished.send(classifier=classifier, ...)
+   c. 文件移动到 originals/ thumbnails/ archive/
+   d. document.save() → 触发 post_save → 文件名重排
 ```
 
-**关键优化**：分类器只加载一次，通过信号 `classifier` 参数传递给所有处理器，避免重复加载。
+### 5.2 信号分发链（已核对，共 10 个连接）
 
-### 5.2 信号分发链
-
-[apps.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/apps.py#L10-L37) 中 `ready()` 注册的信号连接：
+`src/documents/apps.py` → `DocumentsConfig.ready()`：
 
 ```
-document_consumption_finished
-  ├─ add_inbox_tags              # 添加收件箱标签
-  ├─ set_correspondent           # 自动匹配通信者
-  ├─ set_document_type           # 自动匹配文档类型
-  ├─ set_tags                    # 自动匹配标签（多标签）
-  ├─ set_storage_path            # 自动匹配存储路径
-  ├─ add_to_index                # 添加到全文索引
-  ├─ run_workflows_added         # 触发 DOCUMENT_ADDED 工作流
-  └─ add_or_update_document_in_llm_index  # 更新 LLM 向量索引
+document_consumption_finished（共 8 个处理器，按注册顺序）:
+  ①  add_inbox_tags                       # 收件箱标签
+  ②  set_correspondent                    # 自动匹配通信者
+  ③  set_document_type                    # 自动匹配文档类型
+  ④  set_tags                             # 自动匹配标签（多标签）
+  ⑤  set_storage_path                     # 自动匹配存储路径
+  ⑥  add_to_index                         # 全文搜索索引
+  ⑦  run_workflows_added                  # DOCUMENT_ADDED 工作流
+  ⑧  add_or_update_document_in_llm_index  # LLM 向量索引（可选）
+
+document_updated（共 2 个处理器）:
+  ①  run_workflows_updated
+  ②  send_websocket_document_updated
 ```
 
-### 5.3 匹配策略：规则 + 分类器 双轨合并
+**可复核点**：分类器对象通过信号参数 `classifier=classifier` 传递给所有处理器，避免每个处理器重复加载。
 
-以 [match_tags()](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/matching.py#L110-L134) 为例：
+### 5.3 匹配策略：规则 + 分类器 双轨取并集
+
+`src/documents/matching.py` 中 `match_tags()` / `match_correspondents()` 等函数结构一致：
 
 ```python
 def match_tags(document, classifier, user=None):
-    # 1. 分类器预测（仅针对 MATCH_AUTO 的标签）
-    predicted_tag_ids = classifier.predict_tags(document.suggestion_content) if classifier else []
-
-    # 2. 返回合并结果：规则匹配 OR 分类器预测命中
+    # ① 分类器预测（仅 MATCH_AUTO 实体）
+    predicted_tag_ids = (classifier.predict_tags(document.suggestion_content)
+                         if classifier else [])
+    # ② 返回并集：规则匹配命中 OR（MATCH_AUTO 且分类器命中）
     return list(filter(
         lambda o: (
-            matches(o, document)                          # 规则匹配路径
-            or (o.matching_algorithm == MATCH_AUTO       # 分类器路径
-                and o.pk in predicted_tag_ids)
+            matches(o, document)                                # ANY/ALL/LITERAL/REGEX/FUZZY
+            or (o.matching_algorithm == MATCH_AUTO
+                and o.pk in predicted_tag_ids)                 # 分类器预测
         ),
         tags
     ))
 ```
 
-**规则匹配** (`matches()` 函数) 支持 ANY/ALL/LITERAL/REGEX/FUZZY，`MATCH_AUTO` 在规则路径直接返回 `False`。
+推断时使用的是 `document.suggestion_content`（超长文档会截断：头部 800k 字符 + 尾部 200k 字符），而非完整 `content`。
 
-### 5.4 分类器预测内部实现
+### 5.4 set_tags 的写入策略（已核对）
 
-以 [predict_tags()](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/classifier.py#L558-L577) 为例：
+`src/documents/signals/handlers.py` → `set_tags()`：
 
-```python
-def predict_tags(self, content: str) -> list[int]:
-    X = self._vectorize(content)                          # 文本向量化（带5分钟缓存）
-    y = self.tags_classifier.predict(X)                   # MLP 预测
-    tags_ids = self.tags_binarizer.inverse_transform(y)[0]  # 反编码为标签 ID 列表
+| 参数组合 | 行为 |
+|---|---|
+| `replace=False`（消费流程默认） | 仅追加新匹配到的标签，**不删除**已有标签 |
+| `replace=True`（retagger 覆盖模式） | 先删除旧标签，再应用新标签。但以下两类受保护不被删除：<br>• `is_inbox_tag=True`（收件箱标签）<br>• `match=""` 且 `matching_algorithm != MATCH_AUTO`（纯手动添加、无匹配规则的标签） |
+| `dry_run=True`（suggest 模式） | 只计算变更集合，不写入 DB，不删除 |
 
-    if type_of_target(y).startswith("multilabel"):
-        return list(tags_ids)                              # 多标签场景
-    elif type_of_target(y) == "binary" and tags_ids != -1:
-        return [tags_ids]                                  # 单标签场景，有该标签
-    else:
-        return []                                          # 单标签场景，无该标签
-```
-
-**向量化缓存** (`_vectorize`)：使用 `read_cache`（Redis）缓存 5 分钟，key 包含内容 hash + 版本号 + NLTK 配置 + vectorizer hash。
-
-### 5.5 标签写入策略
-
-[set_tags()](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/signals/handlers.py#L215-L277) 的写入逻辑：
-
-- **replace=False**（默认消费流程）：仅追加新标签，不删除已有标签
-- **replace=True**（retagger 覆盖模式）：先删除所有非收件箱、非手动的标签，再重新应用
-- **保护机制**：收件箱标签 (`is_inbox_tag=True`) 和手动添加的标签 (`match=""` 且非 `MATCH_AUTO`) 永远不会被自动删除
+`set_correspondent` / `set_document_type` / `set_storage_path` 还有 `use_first` 参数：
+- `True`（函数默认值）：多个匹配时取第一个
+- `False`：多个匹配时全部跳过，不做赋值
 
 ---
 
-## 六、批量重打标：document_retagger
+## 六、批量重打标：document_retagger（已核对）
 
-除了消费时的自动匹配，还可通过 [document_retagger.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/management/commands/document_retagger.py) 对历史文档批量应用分类器：
+`src/documents/management/commands/document_retagger.py`
+
+### 6.1 命令参数
 
 ```bash
-# 对所有文档重新打标签（覆盖），使用第一个匹配结果
-python manage.py document_retagger -T -c -t -s -f --use-first
-
-# 仅预览建议，不实际写入
-python manage.py document_retagger -T --suggest
+python manage.py document_retagger \
+    -c -t -T -s \           # 处理维度：correspondent / doc_type / tags / storage_path
+    --overwrite \            # 对应 replace=True（默认 False=追加）
+    --use-first \            # 多匹配时取第一个（默认 False=全部跳过，区别于函数内默认 True）
+    --suggest \              # dry_run 预览模式，不写入 DB
+    --inbox-only \           # 仅处理含收件箱标签的文档
+    --id-range 100 200 \     # 指定文档 ID 范围
+    --base-url http://...    # suggest 模式下输出文档链接
 ```
 
-核心流程：遍历 Document QuerySet → 依次调用 `set_correspondent / set_document_type / set_tags / set_storage_path` → 统计变更 → 输出报表。
+**⚠️ 修正说明**：`--use-first` 的命令行默认值是 `False`（与 `set_correspondent` 函数内的默认值 `True` 不同），retagger 会显式将命令行值传入函数覆盖默认行为。
+
+### 6.2 执行流程
+
+```
+遍历 Document QuerySet
+  ↓
+对每个文档依次调用:
+  set_correspondent(..., replace=overwrite, use_first=use_first, dry_run=suggest)
+  set_document_type(...)
+  set_tags(..., replace=overwrite, dry_run=suggest)
+  set_storage_path(...)
+  ↓
+累计统计（RetaggerStats）
+  ↓
+suggest=True → 输出 DocumentSuggestion 表格（仅展示有变更的文档）
+suggest=False → 输出 RetaggerSummary 统计表
+```
 
 ---
 
-## 七、AI 分类器（可选增强）
+## 七、paperless_ai 建议接口（LLM 路线）
 
-[paperless_ai/ai_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/paperless_ai/ai_classifier.py) 提供了基于 LLM 的增强分类，与传统分类器是**互补关系**而非替代：
+### 7.1 LLM 分类流程
+
+`src/paperless_ai/ai_classifier.py` → `get_ai_document_classification()`：
 
 ```
-LLM 分类流程:
-1. 构建 Prompt (文件名 + 内容前4000字符)
-2. 可选 RAG: query_similar_documents() 检索相似文档作为上下文
-3. AIClient.run_llm_query(prompt) → 调用外部 LLM API
-4. parse_ai_response() → 解析 JSON 输出 (title/tags/correspondents/...)
+Document 对象
+  ↓
+① build_prompt_without_rag() 或 build_prompt_with_rag()
+   (Prompt = filename + content[:4000] + 可选 RAG 相似文档上下文)
+  ↓
+② AIClient.run_llm_query(prompt) → 调用外部 LLM API
+  ↓
+③ parse_ai_response() → 解析 JSON:
+   {title, tags[], correspondents[], document_types[], storage_paths[], dates[]}
 ```
 
-与传统分类器的区别：
-- **不需要训练**：直接调用大模型，靠语义理解
-- **成本较高**：每次预测消耗 API token
-- **用于前端"建议"功能**，而非消费时的自动匹配
+RAG 上下文来自 `src/paperless_ai/indexing.py` 的向量检索（最多 5 篇相似文档）。
+
+### 7.2 名称 → 实体映射
+
+`src/paperless_ai/matching.py` → `match_tags_by_name()` 等：
+
+```
+LLM 返回的名称字符串列表
+  ↓
+① 名称标准化（lower + 去标点 + strip）
+  ↓
+② 精确名称匹配 → 命中则加入结果
+  ↓
+③ 模糊匹配回退（difflib.get_close_matches，cutoff=0.8）
+  ↓
+返回匹配到的实体对象列表
+```
+
+未匹配到的名称通过 `extract_unmatched_names()` 提取，在 API 响应中以 `suggested_tags` / `suggested_correspondents` 等字段返回，供前端展示"是否创建新标签"选项。
+
+### 7.3 API 响应结构
+
+`src/documents/views.py` → `DocumentViewSet.ai_suggestions()`：
+
+```python
+resp_data = {
+    "title": "LLM 生成的标题建议",
+    "tags": [1, 5, 9],                       # 已匹配到的 Tag ID
+    "suggested_tags": ["new_tag_name"],      # 未匹配，建议新建
+    "correspondents": [3],                   # 已匹配
+    "suggested_correspondents": [...],       # 未匹配
+    "document_types": [...],
+    "suggested_document_types": [...],
+    "storage_paths": [...],
+    "suggested_storage_paths": [...],
+    "dates": ["2024-01-15", ...],
+}
+```
+
+**可复核点**：LLM 建议接口仅返回 JSON，**从不自动写入数据库**。自动写入只有传统 MATCH_AUTO 分类器在消费流程 / retagger 中才会发生。
 
 ---
 
-## 八、关键文件索引
+## 八、关键文件索引（相对路径）
 
-| 文件 | 作用 |
+| 文件 | 职责 |
 |---|---|
-| [classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/classifier.py) | 传统 ML 分类器核心：训练/预测/序列化 |
-| [matching.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/matching.py) | 规则匹配 + 分类器预测的合并逻辑 |
-| [tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/tasks.py) | Celery 任务：train_classifier、consume_file |
-| [consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/consumer.py) | 文档消费流程，加载分类器并触发信号 |
-| [signals/handlers.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/signals/handlers.py) | 信号处理器：set_tags/set_correspondent 等 |
-| [apps.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/apps.py) | 信号连接注册 |
-| [models.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/models.py) | MatchingModel 基类、Document.suggestion_content |
-| [ai_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/paperless_ai/ai_classifier.py) | LLM/RAG 分类器（可选增强） |
-| [management/commands/document_create_classifier.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/management/commands/document_create_classifier.py) | 手动训练命令 |
-| [management/commands/document_retagger.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/documents/management/commands/document_retagger.py) | 批量重打标命令 |
-| [settings/custom.py](file:///d:/fz/0601/solo-dogfeeding/code/110-paperless-ngx/src/paperless/settings/custom.py) | Celery Beat 定时训练配置 |
+| `src/documents/classifier.py` | 传统 ML 分类器：训练 / 预测 / 序列化 / 文本预处理 |
+| `src/documents/matching.py` | 规则匹配 + 分类器预测的并集合并逻辑；工作流匹配 |
+| `src/documents/tasks.py` | Celery 任务：`train_classifier` / `consume_file` |
+| `src/documents/consumer.py` | 文档消费主流程，加载分类器并触发 `document_consumption_finished` |
+| `src/documents/signals/handlers.py` | 信号处理器：`set_tags` / `set_correspondent` / `set_document_type` / `set_storage_path` 等 |
+| `src/documents/apps.py` | Django AppConfig，注册所有信号连接 |
+| `src/documents/models.py` | `MatchingModel` 基类、`Document.suggestion_content` / `get_effective_content()` |
+| `src/paperless_ai/ai_classifier.py` | LLM 分类：Prompt 构建 / RAG / 响应解析 |
+| `src/paperless_ai/matching.py` | LLM 返回名称 → 数据库实体的名称模糊匹配（difflib，阈值 0.8） |
+| `src/documents/views.py` | `DocumentViewSet.suggestions`（传统分类器建议）<br>`DocumentViewSet.ai_suggestions`（LLM 建议） |
+| `src/documents/management/commands/document_create_classifier.py` | 管理命令：手动触发训练 |
+| `src/documents/management/commands/document_retagger.py` | 管理命令：批量重打标 |
+| `src/paperless/settings/custom.py` | Celery Beat 定时任务配置（每小时训练一次） |
 
 ---
 
-## 九、设计要点总结
+## 九、设计要点复核清单
 
-1. **增量训练检测**：通过 `last_doc_change_time` + `last_auto_type_hash` 双重校验避免无效训练，节省算力。
+以下为代码中可独立验证的设计决策：
 
-2. **原子持久化 + 安全签名**：`.part` 临时文件 + rename 保证原子更新，HMAC 签名防止模型篡改。
-
-3. **多级缓存**：向量化结果缓存 5 分钟、词干提取 LRU 缓存 10000 条，跨 worker 共享。
-
-4. **规则 + ML 双轨并行**：MATCH_AUTO 走分类器，其余走规则匹配，结果取并集，两种机制互不干扰。
-
-5. **信号解耦**：消费流程通过 `document_consumption_finished` 信号分发，新增匹配维度只需连接信号，无需修改消费主流程。
-
-6. **软删除保护**：收件箱标签和手动添加的标签不会被自动系统覆盖删除，确保用户手动操作的权威性。
+- [x] **增量训练检测**：`last_doc_change_time`（文档修改时间）+ `last_auto_type_hash`（逐文档逐标签 ID 累积的 SHA256）双重校验 — `src/documents/classifier.py` L285-L303
+- [x] **原子持久化**：`.pickle.part` 临时文件 + `rename` + HMAC-SHA256 签名 — `src/documents/classifier.py` L196-L219
+- [x] **多级缓存**：向量化结果缓存 5 分钟（`_vectorize`）、词干提取 LRU 缓存 10000 条（`StoredLRUCache`）— `src/documents/classifier.py` L518-L534
+- [x] **规则 + ML 双轨并行**：MATCH_AUTO 走分类器，其余走规则匹配，结果取并集 — `src/documents/matching.py` L110-L134
+- [x] **信号解耦**：消费流程通过 `document_consumption_finished` 分发，共 8 个处理器 — `src/documents/apps.py` L24-L31
+- [x] **软删除保护**：收件箱标签和纯手动标签（`match=""` 且非 MATCH_AUTO）不会被自动系统删除 — `src/documents/signals/handlers.py` L248-L264
+- [x] **LLM 不自动写入**：`ai_suggestions` 仅返回 JSON，无 DB 写入逻辑 — `src/documents/views.py` L1449-L1528
