@@ -84,19 +84,24 @@ path("2fa/authenticate/", allauth_mfa_views.authenticate, name="mfa_authenticate
 #### 2.1.3 社交账号入口
 
 ```python
-# 通用状态页面
-# /accounts/3rdparty/login/cancelled/  - 社交登录取消
-# /accounts/3rdparty/login/error/      - 社交登录错误
-# /accounts/3rdparty/signup/           - 社交登录后补全注册（若 AUTO_SIGNUP=False）
+# ┌─ 通用状态页面（固定在 /accounts/3rdparty/ 下） ──────────────────────┐
+# │ /accounts/3rdparty/login/cancelled/  - 社交登录取消                  │
+# │ /accounts/3rdparty/login/error/      - 社交登录错误                   │
+# │ /accounts/3rdparty/signup/           - 社交登录后补全注册              │
+# └──────────────────────────────────────────────────────────────────────┘
 
-# 各 OAuth 提供商的独立 URL（由 allauth 的 build_provider_urlpatterns() 动态生成）
-# 格式为：/accounts/<provider_id>/login/           → 发起 OAuth 授权（登录或绑定）
-#          /accounts/<provider_id>/login/callback/  → OAuth 回调地址
-# 例如：/accounts/keycloak-test/login/
-#       /accounts/keycloak-test/login/callback/
+# ┌─ 各 OAuth 提供商的独立 URL（由 build_provider_urlpatterns() 动态生成） ─┐
+# │ 直接挂载在 /accounts/ 下，NOT under /accounts/3rdparty/               │
+# │ 格式：/accounts/<provider_id>/login/           → 发起 OAuth 授权       │
+# │       /accounts/<provider_id>/login/callback/  → OAuth 回调地址        │
+# │ 例：  /accounts/keycloak-test/login/?process=login                     │
+# │       /accounts/keycloak-test/login/callback/                          │
+# └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**`build_provider_urlpatterns()` 的作用**：allauth 遍历 `SOCIALACCOUNT_PROVIDERS` 中配置的每个提供商，为其动态注册专属的登录发起和回调 URL。`provider_id` 来自 SocialApp 配置（如 OpenID Connect 的 `provider_id` 字段）。
+**`build_provider_urlpatterns()` 的作用**：allauth 遍历已配置的每个 provider，注册其专属 URL。`provider_id` 来自 SocialApp 配置（如 OpenID Connect 的 `provider_id` 字段）。
+
+**证据**：测试 Mock 返回的格式为 `f"{self.app.provider_id}/login/?process=connect"`，断言包含 `"keycloak-test/login/?process=connect"` —— 见 [test_api_profile.py L49/L330](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/tests/test_api_profile.py#L49-L330)。路由结构见 [urls.py L378-L401](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/urls.py#L378-L401)。
 
 #### 2.1.4 Headless API 入口
 
@@ -428,22 +433,31 @@ paperless-ngx 中发起社交授权共有 **三条不同的入口路径**，分�
   已登录用户
      │
      ▼
-  打开前端 ProfileEditDialog 对话框
+  点击头像 → 打开 ProfileEditDialog 对话框
      │
      ▼
-  GET /api/profile/social_account_providers/
+  ngOnInit() 并行发起两个请求：
+  ├─ GET /api/profile/                       → 取回已绑定 social_accounts
+  └─ GET /api/profile/social_account_providers/ → 取回可绑定 providers
      │
      ▼
   [SocialAccountProvidersView.get]  [views.py L497-L519]
   - adapter.list_providers(request)
   - 对每个 provider 调用 p.get_login_url(request, process="connect") ← 关键！
-  - 返回 [{name, login_url}]
+  - 返回 [{name, login_url: "/accounts/<provider_id>/login/?process=connect"}]
      │
      ▼
-  返回的 URL 示例: /accounts/<provider_id>/login/?process=connect
+  前端渲染「Connect new social account」区域
+  （HTML 模板 L87-L98：直接用 *ngFor 渲染 <a> 超链接列表）
+  ┌─────────────────────────────────────────┐
+  │ <a href="{{ provider.login_url }}"       │
+  │    class="list-group-item-action ...">    │
+  │   {{provider.name}}                       │
+  │ </a>                                      │
+  └─────────────────────────────────────────┘
      │
      ▼
-  用户点击前端「绑定」按钮 → window.location.href = login_url
+  用户点击某个提供商的超链接 → 浏览器整页跳转（离开 Angular SPA）
      │
      ▼
   GET /accounts/<provider_id>/login/?process=connect
@@ -455,12 +469,10 @@ paperless-ngx 中发起社交授权共有 **三条不同的入口路径**，分�
   3. 302 重定向至第三方授权页面
 ```
 
-**证据**：后端明确使用 `process="connect"` —— [views.py L501](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/views.py#L501)：
-```python
-{"name": p.name, "login_url": p.get_login_url(request, process="connect")}
-```
-
-测试验证：[test_api_profile.py L329-L332](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/tests/test_api_profile.py#L329-L332) 断言返回的 URL 含 `"keycloak-test/login/?process=connect"`。
+**证据**：
+- 后端使用 `process="connect"` 生成 URL —— [views.py L501](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/views.py#L501)
+- 测试断言 URL 含 `"keycloak-test/login/?process=connect"` —— [test_api_profile.py L329-L332](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/documents/tests/test_api_profile.py#L329-L332)
+- 前端模板渲染 `<a href="{{ provider.login_url }}"` —— [profile-edit-dialog.component.html L91-L94](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/components/common/profile-edit-dialog/profile-edit-dialog.component.html#L91-L94)
 
 ---
 
@@ -687,42 +699,37 @@ User (django.contrib.auth)
   ProfileEditDialog 打开
      │
      ▼
-  2. 调用 ProfileService.getProfile()
-     GET /api/profile/
-     │                                    [ProfileView.get]
-     │                                    返回 UserProfile（含已绑定 social_accounts）
-     │◄───────────────────────────────────
+  2. ngOnInit() 并行发起两个请求：
+     ├─ ProfileService.get()
+     │   GET /api/profile/
+     │                                  [ProfileView.get]
+     │                                  返回 UserProfile（含已绑定 social_accounts）
+     │◄─────────────────────────────────
+     │
+     └─ ProfileService.getSocialAccountProviders()
+         GET /api/profile/social_account_providers/
+                                            │
+                                            ▼
+                                  [SocialAccountProvidersView.get]
+                                  - adapter.list_providers(request)
+                                  - p.get_login_url(request, process="connect")
+                                  返回 [{name, login_url}]
+     │◄─────────────────────────────────────
      │
      ▼
-  渲染「Social Accounts」区域
-  - 列出已绑定账号（含「Disconnect」按钮）
-  - 渲染「Connect」按钮区域
+  3. 渲染 HTML 模板
+     - 已绑定区域：socialAccounts 列表 + Disconnect 按钮
+     - 可绑定区域：*ngFor 渲染 <a> 超链接列表
+       <a href="{{ provider.login_url }}" class="list-group-item-action ...">
+         {{provider.name}}
+       </a>
      │
      ▼
-  3. 用户点击「Connect」按钮 ────────────────┐
-                                              │
-  4. ProfileService.getSocialAccountProviders() │
-     GET /api/profile/social_account_providers/ │
-                                              │
-                                              ▼
-                                    [SocialAccountProvidersView.get]
-                                    - adapter.list_providers(request)
-                                    - p.get_login_url(request, process="connect")
-                                    返回 [{name, login_url}]
-     │◄───────────────────────────────────────┘
+  4. 用户点击某个提供商 <a> 链接
+     → 浏览器整页导航，离开 Angular SPA
      │
      ▼
-  前端显示可用提供商列表下拉框
-     │
-     ▼
-  5. 用户选择某个提供商（如 Keycloak）
-     │
-     ▼
-  window.location.href = provider.login_url
-  （浏览器离开 Angular，跳转到 Django 社交登录 URL）
-     │
-     ▼
-  GET /accounts/<provider_id>/login/?process=connect
+  5. GET /accounts/<provider_id>/login/?process=connect
      │
      ▼
   allauth.socialaccount 内部处理
@@ -733,48 +740,83 @@ User (django.contrib.auth)
   6. 用户在第三方完成授权
      │
      ▼
-  第三方 302 重定向回 Django
-  GET /accounts/<provider_id>/login/callback/
+  第三方 302 回跳 → GET /accounts/<provider_id>/login/callback/
      │
      ▼
   allauth.socialaccount 回调视图
-  - 校验 state，兑换 access_token
+  - 校验 OAuth state，兑换 access_token
   - 从 session 读取 process="connect"
-  - 确认 request.user.is_authenticated（必须已登录）
-  - 创建 SocialAccount 记录，关联到 request.user
+  - 以 request.user 为当前登录用户创建 SocialAccount
   - 触发 social_account_updated 信号 → 组同步
      │
      ▼
-  [CustomSocialAccountAdapter.get_connect_redirect_url]
-  → 返回 reverse("base")（即 SPA 首页 /）
+  7. allauth 调用 get_connect_redirect_url(request, socialaccount)
      │
      ▼
-  302 重定向回 Angular 首页
+  [CustomSocialAccountAdapter.get_connect_redirect_url]
+  → url = reverse("base")  → return url  → 返回字符串 "/"
+     │
+     ▼
+  allauth 基于该 URL 返回 302 重定向
+     │
+     ▼
+  浏览器重定向到 /（SPA 首页）
   前端重新加载，用户已绑定新社交账号
 ```
 
-**后端绑定重定向**实现见 [adapter.py L118-L124](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/adapter.py#L118-L124)：
+**后端绑定重定向**实现见 [adapter.py L118-L124](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/adapter.py#L118-L124)（注意：返回 URL 字符串，不含 assert，也不调用 redirect_by_name）：
 
 ```python
 def get_connect_redirect_url(self, request, socialaccount):
-    assert is_authenticated(request.user)
-    return redirect_by_name("base")
+    """
+    Returns the default URL to redirect to after successfully
+    connecting a social account.
+    """
+    url = reverse("base")
+    return url
+```
+
+**前端绑定 UI** 见 [profile-edit-dialog.component.html L87-L98](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/components/common/profile-edit-dialog/profile-edit-dialog.component.html#L87-L98)：
+
+```html
+@if (socialAccountProviders?.length > 0) {
+  <div class="mb-3">
+    <p>Connect new social account</p>
+    <div class="list-group">
+      @for (provider of socialAccountProviders; track provider.name) {
+        <a class="list-group-item list-group-item-action ..." 
+           href="{{ provider.login_url }}" rel="noopener noreferrer">
+          {{provider.name}}
+        </a>
+      }
+    </div>
+  </div>
+}
 ```
 
 ---
 
 ### 6.3 解绑（Disconnect）流程详解
 
-解绑不经过 OAuth，完全通过 DRF API 完成：
+解绑不经过 OAuth，完全通过 DRF API 完成。
+
+**重要前置条件**：用户必须有可用密码（`hasUsablePassword = true`），否则解绑按钮禁用并弹出提示"Set a password before disconnecting social account." —— 防止用户解绑后无法登录。
 
 ```
   前端 (Angular)                            后端 (Django)
   ────────────────                          ──────────────
   1. ProfileEditDialog 已打开
-     显示当前已绑定的 social_accounts
+     渲染 socialAccounts 列表：
+     <pngx-confirm-button
+       label="Disconnect"
+       [disabled]="!hasUsablePassword"   ← 必须有密码才能解绑
+       ngbPopover="Set a password before disconnecting..."
+       (confirm)="disconnectSocialAccount(account.id)">
+     </pngx-confirm-button>
      │
      ▼
-  2. 用户点击某个账号的「Disconnect」按钮
+  2. 用户点击 Disconnect → confirm 确认后调用：
+     disconnectSocialAccount(account.id)
      │
      ▼
   3. ProfileService.disconnectSocialAccount(id)
@@ -791,19 +833,48 @@ def get_connect_redirect_url(self, request, socialaccount):
      │◄───────────────────────────────────────┘
      │
      ▼
-  4. 前端收到 200，从 social_accounts 数组中移除该 id
-     UI 立即更新，无需刷新页面
-     │
-     ▼
-  5. 调用 ProfileService.getSocialAccountProviders()
-     刷新可用提供商列表（解绑后可能可再次绑定）
+  4. 前端收到 200，本地 filter 更新 UI：
+     this.socialAccounts = this.socialAccounts.filter(
+       (a) => a.id != id
+     )
+     （不重新请求任何 API，无 providers 刷新步骤）
 ```
 
 后端实现 [DisconnectSocialAccountView](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src/paperless/views.py#L464-L480) 的安全设计：
 - 使用 `user.socialaccount_set.get(pk=...)` 而不是 `SocialAccount.objects.get(pk=...)`
-- 这确保用户只能删除属于自己的社交账号，防止 IDOR（不安全直接对象引用）攻击
+- 通过 user 过滤确保用户只能删除属于自己的社交账号，防止 IDOR 攻击
 
-前端调用在 [profile-edit-dialog.component.ts L245-L260](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/components/common/profile-edit-dialog/profile-edit-dialog.component.ts#L245-L260) 的 `disconnectSocialAccount()`。
+前端解绑按钮禁用逻辑见 [profile-edit-dialog.component.html L66-L80](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/components/common/profile-edit-dialog/profile-edit-dialog.component.html#L66-L80)：
+
+```html
+<li class="list-group-item"
+  ngbPopover="Set a password before disconnecting social account."
+  [disablePopover]="hasUsablePassword"
+  triggers="mouseenter:mouseleave">
+  {{account.name}} ({{account.provider}})
+  <pngx-confirm-button
+    label="Disconnect"
+    [disabled]="!hasUsablePassword"
+    (confirm)="disconnectSocialAccount(account.id)">
+  </pngx-confirm-button>
+</li>
+```
+
+前端 `disconnectSocialAccount` 方法见 [profile-edit-dialog.component.ts L245-L260](file:///d:/fz/0601/solo-dogfeeding/code/113-paperless-ngx/src-ui/src/app/components/common/profile-edit-dialog/profile-edit-dialog.component.ts#L245-L260) —— 注意解绑成功后只做本地数组 filter，不重新调用 API：
+
+```typescript
+disconnectSocialAccount(id: number): void {
+  this.profileService
+    .disconnectSocialAccount(id)
+    .subscribe({
+      next: (id: number) => {
+        // 仅本地 filter，不刷新 providers
+        this.socialAccounts = this.socialAccounts.filter((a) => a.id != id)
+      },
+      error: (error) => { /* toast */ },
+    })
+}
+```
 
 ---
 
