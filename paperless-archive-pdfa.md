@@ -165,13 +165,145 @@ OCRmyPDF 负责最复杂的场景：扫描件 OCR + 生成 PDF/A。
 - 含 Alpha 通道的图片（RGBA/LA）先用 ImageMagick `-alpha off` 移除透明度（img2pdf 不支持）
 - DPI 不足时抛出 `ParseError`，要求用户配置 `OCR_IMAGE_DPI`
 
+### 3.5 路径四：Office 文档（Tika + Gotenberg）
+
+处理 DOCX/ODT/XLSX/PPTX/RTF 等格式，由 `TikaDocumentParser` 实现。
+
+代码位置：[paperless/parsers/tika.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tika.py)
+
+**前置条件**：
+- `PAPERLESS_TIKA_ENABLED=true`（否则 `score()` 返回 `None`，该解析器不注册）
+- 需要同时运行 **Apache Tika**（文本提取）和 **Gotenberg**（PDF 转换）两个外部服务
+
+**Parser 能力声明**：
+```
+can_produce_archive  = False   ← 不认为是"可选的 OCR 归档"
+requires_pdf_rendition = True  ← 浏览器无法直接显示 Office 格式，必须生成 PDF
+```
+因此 `should_produce_archive()` 永远返回 `True`，`produce_archive` 参数在 `parse()` 中被**完全忽略**——PDF 总是生成。
+
+**完整流程**：
+
+```
+parse(document_path, mime_type, produce_archive=...)
+  │
+  ├─ 1. Tika 文本提取（HTTP 请求 TIKA_ENDPOINT）
+  │    ├─ 优先: multipart/form 上传文件
+  │    └─ 500 错误回退: 以二进制 buffer 方式重新提交（Tika TIKA-4110 缺陷的 workaround）
+  │    ├─ 失败 → ParseError 终止
+  │    └─ 得到 self._text + self._date（文档创建日期）
+  │
+  └─ 2. Gotenberg PDF 转换（_convert_to_pdf()）
+       │
+       ├─ 读取 OutputTypeConfig().output_type
+       │
+       ├─ 映射到 Gotenberg PdfAFormat：
+       │    ├─ pdfa / pdfa-2  → PdfAFormat.A2b
+       │    ├─ pdfa-1         → 不支持！日志警告，降级为 A2b
+       │    ├─ pdfa-3         → PdfAFormat.A3b
+       │    └─ pdf           → 不调用 route.pdf_format()，输出普通 PDF
+       │
+       └─ Gotenberg LibreOffice 路由 (libre_office.to_pdf())
+            └─ 返回 convert.pdf
+```
+
+**关键方法**：
+- [_convert_to_pdf()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tika.py#L400-L452) — LibreOffice 转 PDF + PDF/A 版本映射
+
+### 3.6 路径五：邮件 EML（Mail Parser + Gotenberg）
+
+处理 `message/rfc822`（.eml）邮件文件，由 `MailDocumentParser` 实现。
+
+代码位置：[paperless/parsers/mail.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py)
+
+**Parser 能力声明**（与 Tika 完全相同）：
+```
+can_produce_archive  = False
+requires_pdf_rendition = True
+```
+PDF 始终生成，与 `produce_archive` 无关。
+
+**完整流程**：
+
+```
+parse(document_path, mime_type)
+  │
+  ├─ 1. imap_tools 解析 EML → MailMessage 对象
+  │    └─ parse_file_to_message()，缺少 From 头则 ParseError
+  │
+  ├─ 2. 组装格式化文本（Subject/From/To/CC/BCC/附件列表 + HTML 文本 + 纯文本）
+  │    └─ HTML 内容经 Tika 服务器提取纯文本（tika_parse()）
+  │
+  ├─ 3. 生成 PDF — generate_pdf()
+  │    │
+  │    ├─ A. 邮件正文 → HTML 模板渲染 (mail_to_html())
+  │    │    └─ Gotenberg Chromium HTML→PDF（chromium.html_to_pdf()）
+  │    │         └─ 应用 A4 纸张、0.1 英寸页边距、email_msg_template.html + output.css
+  │    │
+  │    ├─ B. 邮件 HTML 正文（如果有）→ generate_pdf_from_html()
+  │    │    ├─ <script> 标签替换为 <div hidden>（安全清洗）
+  │    │    ├─ 附件以 cid: 引用写入临时文件并注册为资源
+  │    │    └─ Gotenberg Chromium HTML→PDF
+  │    │
+  │    └─ C. 按 MailRule.PdfLayout 合并（Gotenberg merge 路由）
+  │         ├─ TEXT_HTML（默认）: [正文PDF, HTML内容PDF]
+  │         ├─ HTML_TEXT:         [HTML内容PDF, 正文PDF]
+  │         ├─ HTML_ONLY:         仅 HTML 内容
+  │         └─ TEXT_ONLY:         仅正文
+  │
+  └─ 4. 每一步 Gotenberg 调用都应用 PDF/A 格式化（_settings_to_gotenberg_pdfa()）
+```
+
+**PDF/A 版本映射**（[_settings_to_gotenberg_pdfa()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L452-L466)，与 Tika 逻辑一致）：
+
+| `OCR_OUTPUT_TYPE` | Gotenberg `PdfAFormat` | 说明 |
+|-------------------|------------------------|------|
+| `pdfa` / `pdfa-2` | `A2b` | 默认 PDF/A-2b |
+| `pdfa-1` | `A2b` | Gotenberg 不支持 A1，日志警告后降级 |
+| `pdfa-3` | `A3b` | PDF/A-3b |
+| `pdf` | `None` | 不设置 `pdf_format()`，输出普通 PDF |
+
+**注意**：邮件解析器在三处独立调用 Gotenberg（正文 HTML→PDF、邮件 HTML→PDF、合并），每处都会单独应用一次 PDF/A 设置。
+
+### 3.7 Gotenberg PDF/A 版本映射与能力限制
+
+Gotenberg 的 `PdfAFormat` 枚举仅支持 `A2b` 和 `A3b`，**不支持 PDF/A-1**。
+
+这导致一个重要的"静默降级"行为：当用户将 `PAPERLESS_OCR_OUTPUT_TYPE` 设为 `pdfa-1`（PDF/A-1b）时：
+
+- **Tesseract 路径**：OCRmyPDF/Ghostscript 原生支持 pdfa-1，正常输出 PDF/A-1b
+- **Tika/Mail 路径**：Gotenberg 不支持，日志打印警告：
+  ```
+  Gotenberg does not support PDF/A-1a, choosing PDF/A-2b instead
+  ```
+  实际输出 **PDF/A-2b**，与用户配置不一致
+
 ---
 
-## 4. 失败回退（Fallback）机制
+## 4. 三条归档路径的核心差异对比
+
+| 维度 | Tesseract（OCR） | Tika（Office） | Mail（EML） |
+|------|------------------|----------------|-------------|
+| **适用格式** | PDF, JPEG, PNG, TIFF, GIF, BMP, WebP, HEIC | DOCX, ODT, XLSX, PPTX, RTF 等 | `.eml` (message/rfc822) |
+| **能力声明** | `can_produce_archive=True`, `requires_pdf_rendition=False` | `can_produce_archive=False`, `requires_pdf_rendition=True` | 同 Tika |
+| **`should_produce_archive()` 影响** | 完全服从（受 auto/always/never 控制） | 总是 True（`requires_pdf_rendition` 强制） | 总是 True |
+| **`produce_archive` 参数** | 被遵守：False 时不生成归档 PDF | 被忽略：PDF 始终生成 | 被忽略 |
+| **PDF 转换引擎** | OCRmyPDF（底层 Ghostscript + Tesseract） | Gotenberg → LibreOffice | Gotenberg → Chromium（HTML→PDF）+ Merge |
+| **OCR 文本层** | 有（Tesseract 识别 + 嵌入） | 无（Office 文本由 Tika 单独提取，不嵌入 PDF） | 无（邮件文本组装后不嵌入 PDF） |
+| **是否需要外部服务** | 否（全部本地二进制） | 是（Tika + Gotenberg，两个 HTTP 服务） | 是（Gotenberg，可选 Tika 用于 HTML 文本提取） |
+| **PDF/A-1 支持** | 是（Ghostscript 原生） | **否**（降级为 A2b + 警告） | **否**（降级为 A2b + 警告） |
+| **PDF/A 版本来源** | `output_type` → pdfa_part 字符串（`pdfa→2` 等） | `OutputTypeConfig().output_type` → `PdfAFormat` 枚举 | `settings.OCR_OUTPUT_TYPE` → `PdfAFormat` 枚举 |
+| **失败回退机制** | Force OCR 重试、加密 PDF 跳过、元数据打标降级为普通 PDF | Tika 500 重试 buffer 模式；Gotenberg 失败直接 ParseError | 无特殊回退，Gotenberg 失败直接 ParseError |
+| **文本来源** | OCR 识别结果（嵌入 PDF 文本层 + sidecar.txt） | Tika 服务器提取结果（仅存 DB，不嵌入 PDF） | 邮件头 + 正文 + HTML 经 Tika 提取的拼接文本（仅存 DB） |
+| **配置命名空间** | `OcrConfig`（含 mode/language/deskew 等 OCR 选项） | `OutputTypeConfig`（仅 output_type） | 直接读 `settings.OCR_OUTPUT_TYPE` |
+
+---
+
+## 5. 失败回退（Fallback）机制
 
 系统在多处设计了降级回退策略，确保「尽量产出可用结果」而不是直接失败。
 
-### 4.1 PDF/A 元数据打标失败回退
+### 5.1 Tesseract：PDF/A 元数据打标失败回退
 
 位置：[_convert_image_to_pdfa()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tesseract.py#L429-L433)
 
@@ -185,7 +317,7 @@ except Exception as e:
 
 **行为**：pikepdf 注入 PDF/A 元数据失败时，直接使用 img2pdf 输出的普通 PDF。**结果仍然是可用的 PDF，只是不是 PDF/A 标准格式。**
 
-### 4.2 OCR 主流程失败 → Force OCR 回退
+### 5.2 Tesseract：OCR 主流程失败 → Force OCR 回退
 
 位置：[RasterisedDocumentParser.parse()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tesseract.py#L619-L646)
 
@@ -200,7 +332,7 @@ except Exception as e:
 3. 再次调用 `ocrmypdf.ocr()`
 4. 若仍失败，抛出 `ParseError` 终止
 
-### 4.3 加密/签名 PDF 回退
+### 5.3 Tesseract：加密/签名 PDF 回退
 
 位置：[tesseract.py:610-616](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tesseract.py#L610-L616)
 
@@ -209,7 +341,7 @@ except Exception as e:
 - 不生成归档件
 - 如果原文件已有文本，直接使用原文本内容（用户仍可搜索）
 
-### 4.4 Ghostscript PDF/A 渲染失败提示
+### 5.4 Tesseract：Ghostscript PDF/A 渲染失败提示
 
 位置：[_handle_subprocess_output_error()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tesseract.py#L478-L492)
 
@@ -217,7 +349,26 @@ except Exception as e:
 - 日志提示用户可配置 `PAPERLESS_OCR_USER_ARGS: {"continue_on_soft_render_error": true}`
 - 让 OCRmyPDF 忽略 Ghostscript 的软渲染错误，继续产出 PDF
 
-### 4.5 缩略图生成回退链
+### 5.5 Tika：Tika 服务器 500 错误回退
+
+位置：[TikaDocumentParser.parse()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tika.py#L247-L261)
+
+当 Tika 服务器返回 HTTP 500（Apache TIKA-4110 缺陷：某些文件以 multipart/form 上传会失败）时：
+- 自动以二进制 buffer 方式（`from_buffer`）重新提交请求
+- 这是特定已知缺陷的专门 workaround，不处理其他 HTTP 错误
+
+### 5.6 Tika/Mail：PDF/A-1 请求降级为 A-2b
+
+位置：
+- Tika: [tika.py:436-439](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tika.py#L436-L439)
+- Mail: [mail.py:459-463](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py#L459-L463)
+
+当 `OCR_OUTPUT_TYPE=pdfa-1` 时，Gotenberg 不支持该格式：
+- 记录 WARNING 级别日志
+- 静默降级输出 PDF/A-2b
+- 整个流程不报错，用户只有查看日志才能发现不一致
+
+### 5.7 通用：缩略图生成回退链
 
 位置：[documents/parsers.py:130-198](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/parsers.py#L130-L198)
 
@@ -239,7 +390,7 @@ make_thumbnail_from_pdf()
 
 三级回退：ImageMagick → Ghostscript → 内置默认图，保证 100% 能拿到缩略图。
 
-### 4.6 文件名过长回退
+### 5.8 通用：文件名过长回退
 
 位置：[consumer.py:672-714](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/consumer.py#L672-L714)
 
@@ -249,9 +400,9 @@ make_thumbnail_from_pdf()
 
 ---
 
-## 5. 归档文件的存储与命名
+## 6. 归档文件的存储与命名
 
-### 5.1 文件名生成
+### 6.1 文件名生成
 
 代码位置：[documents/file_handling.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/file_handling.py)
 
@@ -264,7 +415,7 @@ make_thumbnail_from_pdf()
 
 版本文档额外追加 `_v{version_index}` 后缀。
 
-### 5.2 归档件落盘流程
+### 6.2 归档件落盘流程
 
 位置：[consumer.py:698-724](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/consumer.py#L698-L724)
 
@@ -281,13 +432,13 @@ make_thumbnail_from_pdf()
 
 ---
 
-## 6. 触发归档的入口点
+## 7. 触发归档的入口点
 
-### 6.1 文档消费时自动生成
+### 7.1 文档消费时自动生成
 
 主消费流程 [ConsumerPlugin.run()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/consumer.py#L408-L784) 在文档首次入库时生成归档件。
 
-### 6.2 `document_archiver` 管理命令
+### 7.2 `document_archiver` 管理命令
 
 位置：[documents/management/commands/document_archiver.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/management/commands/document_archiver.py)
 
@@ -304,7 +455,7 @@ python manage.py document_archiver -d <document_id>
 
 命令内部调用 [update_document_content_maybe_archive_file()](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/tasks.py#L279-L396)，支持多进程并行处理。
 
-### 6.3 Parser 能力声明
+### 7.3 Parser 能力声明
 
 每个 Parser 通过两个属性声明归档能力：
 
@@ -317,51 +468,69 @@ python manage.py document_archiver -d <document_id>
 
 ---
 
-## 7. 完整行为流程图
+## 8. 完整行为流程图
 
 ```
 文档进入消费流程
+       │
+       ▼
+  确定 MIME 类型 → 选择对应 Parser
        │
        ▼
   should_produce_archive()?
        │
        ├─ No → 只提取文本 + 缩略图，结束
        │
-       └─ Yes
+       └─ Yes（或 requires_pdf_rendition=True 强制）
             │
             ▼
-    RasterisedDocumentParser.parse(produce_archive=True)
-            │
-            ├─ OCR_MODE=off?
-            │    ├─ image → img2pdf + pikepdf(_convert_image_to_pdfa)
-            │    │           └─ 失败: 退回普通 PDF
-            │    └─ pdf   → Ghostscript(_convert_pdf_to_pdfa)
-            │
-            ├─ OCR_MODE=auto + 已有文本 + 不需归档?
-            │    └─ 直接返回 pdftotext 文本
-            │
-            └─ OCRmyPDF.ocr() 主流程
-                 │
-                 ├─ 加密/签名 PDF → 不生成归档，只用原文文本
-                 │
-                 ├─ 成功 → 提取文本 + 归档件
-                 │
-                 └─ 失败 (NoTextFound/InputFileError/PriorOcrFound)
-                      │
-                      └─ Force OCR 回退
-                           ├─ 成功 → 提取文本 + 归档件
-                           └─ 失败 → 抛出 ParseError 终止
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    按 Parser 分流                            │
+  ├─────────────────────────────────────────────────────────────┤
+  │                                                             │
+  │  Tesseract（PDF / 图片）                                    │
+  │    ├─ OCR_MODE=off + 图片 → img2pdf + pikepdf                │
+  │    │                       └─ 失败: 退回普通 PDF              │
+  │    ├─ OCR_MODE=off + PDF  → Ghostscript 直接转 PDF/A          │
+  │    ├─ auto + 已有文本 + 不需归档 → 仅 pdftotext              │
+  │    └─ OCRmyPDF.ocr() 主流程                                   │
+  │         ├─ 加密/签名 → 不生成归档，只用原文文本                │
+  │         ├─ 成功 → 文本 + 归档件                                │
+  │         └─ 失败 → Force OCR 回退                              │
+  │              ├─ 成功 → 文本 + 归档件                           │
+  │              └─ 失败 → ParseError 终止                        │
+  │                                                             │
+  │  Tika（Office: DOCX/XLSX/PPTX/ODT/RTF…）                    │
+  │    ├─ Tika 文本提取                                           │
+  │    │    └─ 500 错误: from_buffer 重试                          │
+  │    └─ Gotenberg LibreOffice → PDF                             │
+  │         └─ PDF/A-1 请求 → 静默降级为 A2b + 警告日志            │
+  │                                                             │
+  │  Mail（.eml / message/rfc822）                               │
+  │    ├─ imap_tools 解析 EML                                     │
+  │    ├─ 邮件正文 HTML 模板 → Gotenberg Chromium HTML→PDF         │
+  │    ├─ 邮件 HTML 正文（如有）→ Gotenberg Chromium HTML→PDF      │
+  │    ├─ Gotenberg Merge 按布局合并（TEXT_HTML/HTML_ONLY…）       │
+  │    └─ 每步均应用 PDF/A 格式化（A-1 降级为 A2b）                 │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
+       │
+       ▼
+  落盘到 ARCHIVE_DIR + 写入 DB（archive_filename + archive_checksum）
 ```
 
 ---
 
-## 8. 关键文件索引
+## 9. 关键文件索引
 
 | 文件 | 职责 |
 |------|------|
 | [documents/consumer.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/consumer.py) | `should_produce_archive()` 决策、消费主流程、文件落盘 |
 | [paperless/parsers/tesseract.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tesseract.py) | `RasterisedDocumentParser`：OCR、PDF/A 转换、Force OCR 回退 |
+| [paperless/parsers/tika.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/tika.py) | `TikaDocumentParser`：Office 文档，Tika 文本提取 + Gotenberg LibreOffice 转 PDF |
+| [paperless/parsers/mail.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/mail.py) | `MailDocumentParser`：EML 邮件，Gotenberg Chromium HTML→PDF + Merge |
 | [paperless/parsers/utils.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/parsers/utils.py) | `is_tagged_pdf()`、`extract_pdf_text()`、PDF 文本阈值 |
+| [paperless/config.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/paperless/config.py) | `OutputTypeConfig`、`OcrConfig`：各解析器读取配置的入口 |
 | [documents/tasks.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/tasks.py) | `update_document_content_maybe_archive_file()` 异步任务 |
 | [documents/file_handling.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/file_handling.py) | 归档文件名生成、唯一性保证 |
 | [documents/parsers.py](file:///d:/fz/0601/solo-dogfeeding/code/115-paperless-ngx/src/documents/parsers.py) | 缩略图三级回退、`ParseError` 定义 |
