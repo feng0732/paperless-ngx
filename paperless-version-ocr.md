@@ -137,12 +137,25 @@ consume_file.apply_async(
 #### 2.3.1 合并（merge）
 
 `ConsumableDocument` 构造时**不设置 `root_document_id`**，产生一个与原文档完全独立的新 Document。
-如果设置了 `delete_originals=True`，Celery canvas 的 `link` 会在消费成功后删除原文档（chord 保证等所有消费任务完成后才删）。
+如果设置了 `delete_originals=True`，使用 Celery 的 `link=[delete.si(affected_docs)]`——因为合并只有**单个**输出文档，`consume_task` 是单个 signature，消费成功后直接链式执行删除。
 
 #### 2.3.2 分割（split）
 
 每个切片都生成独立的新 Document（`title` 自动追加 `(split N)`），同样不设 `root_document_id`。
-`delete_originals=True` 时使用 Celery `chord`：所有分割任务完成后才执行删除。
+`delete_originals=True` 时使用 Celery `chord(header=consume_tasks, body=delete.si([doc.id]))`——因为分割会产生**多个**消费任务，需要等待所有切片消费完成后才执行删除。
+
+#### 2.3.3 各操作删除原文档的 Celery 原语对比
+
+判断原则：**输出只有 1 个文档用 `link`，输出多个文档用 `chord`**。
+
+| 操作 | delete_original=True 时的 Celery 原语 | 原因 |
+|------|-------------------------------------|------|
+| 合并（merge） | `consume_task.apply_async(link=[delete.si(...)])` | 只有 1 个合并输出文档 |
+| 分割（split） | `chord(header=consume_tasks, body=delete.si(...))` | N 个切片输出，需全部成功后再删 |
+| 编辑 PDF（edit_pdf，`update_document=False`） | `chord(header=consume_tasks, body=delete.si(...))` | 可输出多个文档，需全部成功后再删 |
+| 移除密码（remove_password，`update_document=False`） | `chord(header=consume_tasks, body=delete.si(...))` | 代码结构复用多任务模式（即使只有 1 个输出） |
+
+所有删除原文档的场景均配置了 `link_error=[restore_archive_serial_numbers_task.s(backup)]`，消费失败时会将已释放的 ASN 还原。
 
 ---
 
@@ -439,9 +452,9 @@ update_document_content_maybe_archive_file(document_id)
                 │   入口：clear_document_caches(document.pk)
                 │   文件：caching.py
                 └── 删除三个 cache key：
-                    ├── doc_{id}_suggestions   （LLM 自动建议缓存）
-                    ├── doc_{id}_metadata      （元数据缓存）
-                    └── doc_{id}_thumbnail_modified （缩略图时间戳缓存）
+                    ├── doc_{id}_suggest          （LLM 自动建议缓存，对应 get_suggestion_cache_key()）
+                    ├── doc_{id}_metadata         （元数据缓存，对应 get_metadata_cache_key()）
+                    └── doc_{id}_thumbnail_modified （缩略图时间戳缓存，对应 get_thumbnail_modified_key()）
 ```
 
 #### 4.4.3 哪些链路**没有**被触发？
