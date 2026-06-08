@@ -149,30 +149,141 @@ OCR_MODE=auto + 原文有文本 + 不生成归档:
 
 **safe_fallback 实际保留/修改的配置详解**（`construct_ocrmypdf_parameters()` L266-L383）：
 
-`safe_fallback` 的代码影响只有 **一行**（L293）：
+**核心机制**：`safe_fallback=True` 仅在 `ocrmypdf_args` 字典中新增 `force_ocr=True`，**`self.settings.mode` 的值完全不变**。这是理解所有后续交互的关键——所有依赖 `self.settings.mode` 的条件判断仍然使用**原始 mode 值**（AUTO / REDO / OFF），不会被替换为 FORCE。
+
+`safe_fallback` 的代码影响只有这一处（L293-L294）：
 ```python
 if safe_fallback or self.settings.mode == ModeChoices.FORCE:
     ocrmypdf_args["force_ocr"] = True
 ```
 
-也就是说，`safe_fallback=True` **等价于强制 OCR 模式为 FORCE**，其他所有配置**不做任何简化或屏蔽**，**完整保留**：
+**逐项分析每个配置在 safe_fallback 下的实际行为**：
 
-| 配置项 | safe_fallback 时是否保留 | 说明 |
+---
+
+#### A. 模式分支（L293-L302）— if-elif 链的排他性
+
+```python
+if safe_fallback or self.settings.mode == ModeChoices.FORCE:
+    ocrmypdf_args["force_ocr"] = True          # ← safe_fallback 进入此分支
+elif self.settings.mode == ModeChoices.REDO:
+    ocrmypdf_args["redo_ocr"] = True           # ← 不会进入
+elif skip_text or self.settings.mode == ModeChoices.OFF:
+    ocrmypdf_args["skip_text"] = True          # ← 不会进入
+elif self.settings.mode == ModeChoices.AUTO:
+    pass                                       # ← 不会进入
+```
+
+由于是 **if-elif 链**，safe_fallback 命中第一个分支后，其余分支**全部被跳过**。具体影响：
+
+| 原 mode | 第一次调用设置的参数 | safe_fallback 调用设置的参数 |
+|---------|-------------------|----------------------------|
+| AUTO | 无特殊标记（默认 OCR）+ 可能 `skip_text=True` | `force_ocr=True`，**不设 `skip_text`**（即使 skip_text=True 也被跳过） |
+| REDO | `redo_ocr=True` | `force_ocr=True`，**不设 `redo_ocr`** |
+| OFF | `skip_text=True` | `force_ocr=True`，**不设 `skip_text`** |
+| FORCE | `force_ocr=True` | `force_ocr=True`（无变化） |
+
+> 补充：safe_fallback 调用处（L628-L634）**显式不传 `skip_text` 参数**（只用默认值 `skip_text=False`），进一步确保 fallback 时不会跳过文本提取。
+
+---
+
+#### B. `clean_final`（L304-L311）— 仍判断原始 mode
+
+```python
+if self.settings.clean == CleanChoices.CLEAN:
+    ocrmypdf_args["clean"] = True
+elif self.settings.clean == CleanChoices.FINAL:
+    if self.settings.mode == ModeChoices.REDO:   # ← 判断的是 self.settings.mode，没变！
+        ocrmypdf_args["clean"] = True             #   REDO 与 clean_final 不兼容，降级
+    else:
+        ocrmypdf_args["clean_final"] = True       #   其他 mode 使用 clean_final
+```
+
+| 原 mode | clean=FINAL 时的行为 | safe_fallback 下是否变化 |
+|---------|---------------------|-------------------------|
+| AUTO | 设置 `clean_final=True` | ❌ **不变** — 仍设置 `clean_final=True`（self.settings.mode 仍是 AUTO ≠ REDO） |
+| REDO | 降级为 `clean=True` | ❌ **不变** — 仍降级为 `clean=True`（self.settings.mode 仍是 REDO，代码判断逻辑完全不变） |
+| OFF | 设置 `clean_final=True` | ❌ **不变** |
+
+> 注意：ocrmypdf 中 `--clean-final` 与 `--redo-ocr` 确实不兼容，但与 `--force-ocr` 是兼容的。由于代码判断的是 `self.settings.mode == REDO`（而不是判断 `redo_ocr` 参数是否被设置），所以即使 safe_fallback 已经把 redo_ocr 替换成了 force_ocr，只要原 mode 是 REDO，clean_final 仍然会被降级。这是一个**逻辑上的保守选择**，宁可降级也不冒险触发参数冲突。
+
+---
+
+#### C. `deskew`（L313-L315）— 仍判断原始 mode
+
+```python
+if self.settings.deskew and self.settings.mode != ModeChoices.REDO:
+    ocrmypdf_args["deskew"] = True
+```
+
+| 原 mode | deskew 启用状态 | safe_fallback 下是否变化 |
+|---------|---------------|-------------------------|
+| AUTO（deskew=True） | ✅ 启用 | ❌ **不变，仍启用**（self.settings.mode 仍是 AUTO ≠ REDO） |
+| REDO（deskew=True） | ❌ 不启用 | ❌ **不变，仍不启用**（self.settings.mode 仍是 REDO） |
+| OFF（deskew=True） | ✅ 启用 | ❌ **不变，仍启用** |
+
+> 同样，ocrmypdf 中 `--deskew` 与 `--redo-ocr` 不兼容，但与 `--force-ocr` 兼容。由于代码判断的是 mode 值而非实际参数，原 mode=REDO 时即使 fallback 用了 force_ocr，deskew 依然被禁用。
+
+---
+
+#### D. `pages` / `sidecar`（L321-L325）— 与 mode 完全无关
+
+```python
+if self.settings.pages is not None and self.settings.pages > 0:
+    ocrmypdf_args["pages"] = f"1-{self.settings.pages}"
+else:
+    ocrmypdf_args["sidecar"] = sidecar_file
+```
+
+safe_fallback **无任何影响**。两者互斥，完全由 `settings.pages` 独立控制。
+
+---
+
+#### E. `user_args`（L360-L367）— 合并在最后，可以覆盖 force_ocr
+
+```python
+if self.settings.user_args is not None:
+    try:
+        ocrmypdf_args = {**ocrmypdf_args, **self.settings.user_args}  # ← 合并顺序：user_args 在右侧
+    except Exception as e:
+        ...
+```
+
+**关键**：字典展开合并时 `user_args` 在**右侧**，因此 user_args 中的同名键**会覆盖**之前 safe_fallback 设置的所有参数。
+
+| user_args 内容 | 对 safe_fallback 的影响 |
+|----------------|-----------------------|
+| `{"force_ocr": False}` | ❌ **覆盖** — safe_fallback 设置的 `force_ocr=True` 被 user_args 覆盖为 False |
+| `{"redo_ocr": True}` | ✅ 新增 — 最终同时存在 `force_ocr=True` 和 `redo_ocr=True`（ocrmypdf 会报错或忽略冲突） |
+| `{"deskew": True}` | ✅ 叠加 — 可强制启用原 mode=REDO 时被禁用的 deskew |
+| `{"skip_text": True}` | ✅ 叠加 — 可强制跳过文本（抵消 safe_fallback 的效果） |
+
+> user_args 是**最顶层的覆盖层**，优先级高于 safe_fallback 的所有逻辑。
+
+---
+
+#### F. 其他配置 — 无 mode 依赖，均保留
+
+| 配置项 | safe_fallback 下是否保留 | 说明 |
 |--------|-------------------------|------|
-| `force_ocr` | ✅ **被强制设为 True** | 覆盖 redo_ocr/skip_text/auto 的模式判断 |
-| `use_threads` / `jobs` | ✅ 保留 | 线程配置不变 |
-| `language` | ✅ 保留 | OCR 语言不变 |
-| `output_type` | ✅ 保留 | pdfa / pdf / pdfa-1/2/3 不变 |
+| `use_threads` / `jobs` | ✅ 保留 | 线程配置 |
+| `language` | ✅ 保留 | OCR 语言 |
+| `output_type` | ✅ 保留 | pdfa / pdf / pdfa-1/2/3 |
 | `color_conversion_strategy` | ✅ 保留 | 仅在含 "pdfa" 的 output_type 时生效 |
-| `clean` / `clean_final` | ✅ 保留 | 图像去斑点预处理不变 |
-| `deskew` | ✅ 保留 | 校正倾斜不变（注意 `mode != REDO` 的条件仍有效，但 safe_fallback 下 mode 实际被强制为 FORCE，所以仍保留） |
-| `rotate_pages` / `rotate_pages_threshold` | ✅ 保留 | 自动旋转不变 |
-| `pages` / `sidecar` | ✅ 保留 | 只处理前 N 页 / 生成 sidecar 文本不变 |
-| `image_dpi` / alpha 移除 | ✅ 保留 | 图片 DPI 三级回退、alpha 通道兼容性处理不变 |
-| `user_args`（OCR_USER_ARGS） | ✅ 保留 | 用户自定义参数完整合并 |
-| `max_image_mpixels` | ✅ 保留 | 像素限制不变 |
+| `rotate_pages` / `rotate_pages_threshold` | ✅ 保留 | 自动旋转 |
+| `image_dpi` / alpha 移除 | ✅ 保留 | 图片 DPI 三级回退、alpha 通道处理 |
+| `max_image_mpixels` | ✅ 保留 | 像素限制 |
 
-因此 safe_fallback 的"安全"含义是：**切换到最保守的 OCR 模式（force_ocr 强制对所有页面跑 OCR，不管有没有已有文本层），而不是减少参数**。第一次失败通常是由于 REDO/AUTO 模式下 ocrmypdf 的文本层检测出问题，强制 force_ocr 绕过这些检测。
+---
+
+#### safe_fallback 小结
+
+"安全"的真正含义是：
+1. **强制 `force_ocr=True`**，绕过 AUTO/REDO/OFF 模式下的文本层检测，对所有页面强制 OCR
+2. **跳过 `skip_text` / `redo_ocr` 参数**（通过 if-elif 链排他性）
+3. **保守保留 mode 相关的兼容性限制**（clean_final 降级、deskew 禁用等逻辑仍按原 mode 判断，避免触发 ocrmypdf 参数冲突）
+4. **不简化任何其他参数**（clean/deskew/rotate/pages/user_args 全部保留原配置）
+5. user_args 仍可覆盖所有参数
 
 ### 3.2 Tika + Gotenberg — `src/paperless/parsers/tika.py`
 
